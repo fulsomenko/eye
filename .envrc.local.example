@@ -1,0 +1,12 @@
+# Copy to .envrc.local (git-ignored) and run: direnv allow
+
+# v4l2-ctl --list-devices
+export EYE_CAMERA=/dev/video0
+# v4l2-ctl -d /dev/video2 --list-formats-ext
+export EYE_IR_CAMERA=/dev/video2
+# hyprctl monitors
+export EYE_OUTPUT=eDP-1
+
+export RUST_LOG=eye=debug
+
+export KANBAN_FILE=$HOME/notes/eye/eye.sqlite

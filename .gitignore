@@ -1,0 +1,24 @@
+/target
+**/*.rs.bk
+*.pdb
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.direnv
+.claude/
+.DS_Store
+
+result
+result-*
+
+.env
+.env.local
+.envrc.local
+
+*.log
+
+# Captured face frames and calibration sessions
+/recordings
