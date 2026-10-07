@@ -16,4 +16,7 @@ pub mod observation;
 pub mod session;
 pub mod stage;
 
+pub use camera::{CameraId, CameraInfo, Illumination, PixelFormat};
 pub use error::CoreError;
+pub use frame::{Frame, FrameHeader, FrameSet};
+pub use time::Timestamp;
