@@ -48,4 +48,13 @@ pub enum CoreError {
     EmptyRig,
     #[error("3x3 covariance must be finite, symmetric and positive semi-definite, got {0:?}")]
     InvalidCovariance3(Matrix3<f64>),
+    #[error("{width}x{height} gray image needs {expected} bytes, got {actual}")]
+    ImageSize {
+        width: u32,
+        height: u32,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("pixel format {0:?} is not 8-bit gray")]
+    NotGray(PixelFormat),
 }

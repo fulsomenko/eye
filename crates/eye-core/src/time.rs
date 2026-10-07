@@ -27,6 +27,13 @@ impl Timestamp {
             other.0 - self.0
         }
     }
+
+    /// Current `CLOCK_MONOTONIC` time, the clock V4L2 buffer timestamps use.
+    pub fn now() -> Self {
+        let now = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
+            .expect("CLOCK_MONOTONIC is always available on Linux");
+        Self(Duration::from(now))
+    }
 }
 
 impl From<u64> for Timestamp {
@@ -85,5 +92,13 @@ mod tests {
         fn test_nanos_roundtrip_preserves_value(n: u64) {
             prop_assert_eq!(Timestamp::from_nanos(n).as_nanos(), n);
         }
+    }
+
+    #[test]
+    fn test_now_is_nondecreasing_and_nonzero() {
+        let a = Timestamp::now();
+        let b = Timestamp::now();
+        assert!(b >= a);
+        assert!(a.as_nanos() > 0);
     }
 }

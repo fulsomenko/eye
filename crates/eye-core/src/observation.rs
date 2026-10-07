@@ -4,6 +4,12 @@ use nalgebra::Point2;
 
 use crate::{CameraId, CoreError, Timestamp};
 
+/// [`FaceObservation::scheme`] of the IR bright-pupil detector: `landmarks` holds the two pupil
+/// centres, the subject's right eye first; there is no face mesh.
+pub const SCHEME_IR_PUPIL_PAIR: &str = "ir-pupil-pair";
+/// [`FaceObservation::scheme`] of the MediaPipe Face Landmarker (478 points, iris 468..=477).
+pub const SCHEME_MEDIAPIPE_478: &str = "mediapipe-478";
+
 /// A value with its isotropic 1-sigma uncertainty in the value's unit (px for image features;
 /// for an [`Ellipse2`] the sigma of its centre).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -322,6 +328,18 @@ mod tests {
         assert!(face.eye(Side::Right).is_some());
         assert!(face.eye(Side::Left).is_none());
         assert_eq!(Side::Left.opposite(), Side::Right);
+    }
+
+    #[test]
+    fn test_scheme_constants_are_distinct_layout_names() {
+        assert_eq!(SCHEME_IR_PUPIL_PAIR, "ir-pupil-pair");
+        assert_eq!(SCHEME_MEDIAPIPE_478, "mediapipe-478");
+        let face = FaceObservation {
+            scheme: SCHEME_MEDIAPIPE_478,
+            landmarks: Vec::new(),
+            eyes: Vec::new(),
+        };
+        assert_ne!(face.scheme, SCHEME_IR_PUPIL_PAIR);
     }
 
     #[test]
