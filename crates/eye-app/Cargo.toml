@@ -1,0 +1,30 @@
+[package]
+name = "eye-app"
+description = "The eye command-line application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "eye"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+eye-core.workspace = true
+eye.workspace = true
+eye-platform.workspace = true
+eye-overlay.workspace = true
+eye-bench.workspace = true
+
+[features]
+default = ["ir-classic", "mediapipe-ort"]
+ir-classic = ["eye/ir-classic"]
+mediapipe-ort = ["eye/mediapipe-ort"]
+mediapipe-tract = ["eye/mediapipe-tract"]
+
+[lints]
+workspace = true

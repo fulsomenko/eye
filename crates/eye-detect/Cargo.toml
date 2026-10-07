@@ -1,0 +1,22 @@
+[package]
+name = "eye-detect"
+description = "Frame to Observations detectors (IR bright pupil, MediaPipe via ort or tract)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+eye-core.workspace = true
+eye-geometry.workspace = true
+
+[features]
+default = ["ir-classic"]
+ir-classic = []
+mediapipe-ort = []
+mediapipe-tract = []
+
+[lints]
+workspace = true

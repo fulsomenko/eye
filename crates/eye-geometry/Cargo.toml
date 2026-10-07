@@ -1,0 +1,15 @@
+[package]
+name = "eye-geometry"
+description = "Camera, head-pose, eyeball and screen geometry for gaze estimation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+eye-core.workspace = true
+
+[lints]
+workspace = true

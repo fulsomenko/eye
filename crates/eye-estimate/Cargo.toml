@@ -1,0 +1,16 @@
+[package]
+name = "eye-estimate"
+description = "Observations to gaze rays (IR pupil, RGB landmarks, fused)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+eye-core.workspace = true
+eye-geometry.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,28 @@
+[package]
+name = "eye"
+description = "Gaze tracker facade: builds the pipeline from config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+eye-core.workspace = true
+eye-geometry.workspace = true
+eye-platform.workspace = true
+eye-capture.workspace = true
+eye-detect.workspace = true
+eye-estimate.workspace = true
+eye-calibration.workspace = true
+eye-filter.workspace = true
+
+[features]
+default = ["ir-classic"]
+ir-classic = ["eye-detect/ir-classic"]
+mediapipe-ort = ["eye-detect/mediapipe-ort"]
+mediapipe-tract = ["eye-detect/mediapipe-tract"]
+
+[lints]
+workspace = true

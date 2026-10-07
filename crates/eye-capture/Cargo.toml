@@ -1,0 +1,15 @@
+[package]
+name = "eye-capture"
+description = "Camera frame sources, frame pairing, recording and replay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+eye-core.workspace = true
+
+[lints]
+workspace = true
