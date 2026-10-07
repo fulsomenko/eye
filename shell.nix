@@ -27,6 +27,7 @@ pkgs.mkShell {
     cargo-nextest
     cargo-llvm-cov
     bacon
+    jq
   ] ++ lib.optionals stdenv.hostPlatform.isLinux [
     v4l-utils
     ffmpeg-headless

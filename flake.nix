@@ -43,6 +43,11 @@
           inherit eye;
         };
 
+        checks = import ./nix/checks.nix {
+          inherit pkgs rustToolchain eye;
+          src = self;
+        };
+
         formatter = pkgs.alejandra;
       }
     );
