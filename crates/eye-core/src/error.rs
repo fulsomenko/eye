@@ -1,4 +1,6 @@
-use crate::{CameraId, PixelFormat};
+use nalgebra::{Matrix2, Matrix3};
+
+use crate::{CameraId, OutputId, PixelFormat};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum CoreError {
@@ -28,4 +30,22 @@ pub enum CoreError {
         semi_b: f64,
         angle: f64,
     },
+    #[error("covariance must be finite, symmetric and positive semi-definite, got {0:?}")]
+    InvalidCovariance(Matrix2<f64>),
+    #[error("gaze value is not finite or out of range: {0}")]
+    InvalidGaze(&'static str),
+    #[error("camera model {camera}: {reason}")]
+    InvalidCameraModel {
+        camera: CameraId,
+        reason: &'static str,
+    },
+    #[error("screen model {output}: {reason}")]
+    InvalidScreen {
+        output: OutputId,
+        reason: &'static str,
+    },
+    #[error("rig has no camera")]
+    EmptyRig,
+    #[error("3x3 covariance must be finite, symmetric and positive semi-definite, got {0:?}")]
+    InvalidCovariance3(Matrix3<f64>),
 }
