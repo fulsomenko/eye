@@ -7,6 +7,13 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+build = "build.rs"
+
+[lib]
+name = "eye_app"
+path = "src/lib.rs"
 
 [[bin]]
 name = "eye"
@@ -14,11 +21,33 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-eye-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+crossbeam-channel.workspace = true
 eye.workspace = true
-eye-platform.workspace = true
-eye-overlay.workspace = true
 eye-bench.workspace = true
+eye-calibration.workspace = true
+eye-capture.workspace = true
+eye-core.workspace = true
+eye-detect.workspace = true
+eye-geometry.workspace = true
+eye-overlay.workspace = true
+eye-platform.workspace = true
+nalgebra.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+signal-hook.workspace = true
+tempfile.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+eye-bench = { workspace = true, features = ["testing"] }
+nix = { workspace = true, features = ["signal"] }
+predicates.workspace = true
+tempfile.workspace = true
 
 [features]
 default = ["ir-classic", "mediapipe-ort"]

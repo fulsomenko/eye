@@ -18,7 +18,7 @@ in
 
     nativeBuildInputs = [pkgs.pkg-config rustPlatform.bindgenHook makeWrapper];
 
-    cargoBuildFlags = ["--package" "eye-app"];
+    cargoBuildFlags = ["--package" "eye-app" "--package" "eye-lab"];
     doCheck = false;
 
     preBuild = lib.optionalString (gitRev != null) ''
@@ -26,7 +26,9 @@ in
     '';
 
     postInstall = ''
-      wrapProgram $out/bin/eye --set-default ORT_DYLIB_PATH ${onnxruntime}/lib/libonnxruntime.so
+      for bin in eye eye-lab; do
+        wrapProgram $out/bin/$bin --set-default ORT_DYLIB_PATH ${onnxruntime}/lib/libonnxruntime.so
+      done
     '';
 
     meta = {

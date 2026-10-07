@@ -7,10 +7,29 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
-eye-core.workspace = true
 eye.workspace = true
+eye-calibration.workspace = true
+eye-capture.workspace = true
+eye-core.workspace = true
+eye-geometry.workspace = true
+nalgebra.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+approx.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+
+[features]
+testing = []
 
 [lints]
 workspace = true
