@@ -33,14 +33,17 @@
           src = self;
           gitRev = self.rev or null;
         };
+
+        models = pkgs.callPackage ./nix/models.nix {};
       in {
         devShells.default = import ./shell.nix {
-          inherit pkgs rustToolchain;
+          inherit pkgs rustToolchain models;
         };
 
         packages = {
           default = eye;
           inherit eye;
+          mediapipe-models = models;
         };
 
         checks = import ./nix/checks.nix {
