@@ -11,4 +11,5 @@ params = { reopens = 10, frames = 30, rgb_cycle = false, expect_reopen = "persis
 test = "emitter_persistence"
 label = "e1 row 2: rgb start/stop"
 mode = { streams = "dual", emitter = "on" }
-params = { reopens = 10, frames = 30, rgb_cycle = true, expect_reopen = "report" }
+# E1 row 2: persist (root spec E1, 2026-10-08)
+params = { reopens = 10, frames = 30, rgb_cycle = true, expect_reopen = "persist" }

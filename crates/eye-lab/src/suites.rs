@@ -219,7 +219,7 @@ mod tests {
         );
         assert_eq!(
             e1_reopen[1].get("expect_reopen").unwrap().as_str(),
-            Some("report")
+            Some("persist")
         );
 
         let e1_autosuspend = step_params(E1_AUTOSUSPEND);
@@ -228,7 +228,7 @@ mod tests {
                 .get("expect_autosuspend")
                 .unwrap()
                 .as_str(),
-            Some("report")
+            Some("persist")
         );
     }
 

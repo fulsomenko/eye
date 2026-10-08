@@ -5,5 +5,7 @@ description = "E1: emitter byte across USB runtime autosuspend (row 3)"
 test = "emitter_persistence"
 label = "e1 row 3: autosuspend"
 mode = { streams = "ir", emitter = "on" }
-params = { reopens = 1, frames = 30, rgb_cycle = false, autosuspend_wait_s = 330.0, expect_autosuspend = "report" }
-timeout_s = 420.0
+# E1 row 3: persist (root spec E1, 2026-10-08)
+# USB autosuspend_delay_ms is 2000 on the Dell (E1 row 3, 2026-10-08)
+params = { reopens = 1, frames = 30, rgb_cycle = false, autosuspend_wait_s = 10.0, expect_autosuspend = "persist" }
+timeout_s = 60.0
