@@ -10,9 +10,10 @@ use eye_core::image::GrayView;
 use eye_core::observation::SCHEME_IR_PUPIL_PAIR;
 use eye_core::stage::{Detector, StageError};
 use eye_core::{
-    CameraId, EyeObservation, FaceObservation, Frame, FrameSet, Illumination, Observations,
-    PixelFormat, Side,
+    CameraId, Ellipse2, EyeObservation, FaceObservation, Frame, FrameSet, Illumination, Measured,
+    Observations, PixelFormat, Side,
 };
+use nalgebra::Point2;
 
 use crate::DetectError;
 use crate::image::saturating_diff;
@@ -33,6 +34,13 @@ pub struct IrClassicOptions {
     pub max_pair_tilt_deg: f64,
     pub edge_rays: usize,
     pub max_candidates: usize,
+    pub glints: bool,
+    /// Search window half-width, in units of the pupil radius `sqrt(semi_major * semi_minor)`.
+    pub glint_search_radius: f64,
+    /// Lit levels the glint peak must exceed the pupil plateau by (E2: observed 15 to 60).
+    pub glint_min_excess: f64,
+    /// 1-sigma glint position noise in px (E2: 0.7 px pupil-glint vector std / sqrt(2)).
+    pub glint_sigma_px: f64,
 }
 
 impl Default for IrClassicOptions {
@@ -50,9 +58,15 @@ impl Default for IrClassicOptions {
             max_pair_tilt_deg: 30.0,
             edge_rays: 16,
             max_candidates: 64,
+            glints: true,
+            glint_search_radius: 2.0,
+            glint_min_excess: 15.0,
+            glint_sigma_px: 0.5,
         }
     }
 }
+
+type PupilAndGlint = (Measured<Ellipse2>, Option<Measured<Point2<f64>>>);
 
 #[derive(Debug)]
 pub struct IrClassicDetector {
@@ -91,20 +105,48 @@ impl IrClassicDetector {
         let Some((i, j)) = pupil::select_pair(&cands, &self.options) else {
             return Ok(None);
         };
-        let pupil_i = pupil::pupil_from_candidate(diff, &cands[i], &self.options)?;
-        let pupil_j = pupil::pupil_from_candidate(diff, &cands[j], &self.options)?;
+        let (pupil_i, glint_i) = self.pupil_and_glint(lit, diff, &cands[i])?;
+        let (pupil_j, glint_j) = self.pupil_and_glint(lit, diff, &cands[j])?;
 
         let (right, left) = if pupil_i.value().center().x <= pupil_j.value().center().x {
-            (pupil_i, pupil_j)
+            ((pupil_i, glint_i), (pupil_j, glint_j))
         } else {
-            (pupil_j, pupil_i)
+            ((pupil_j, glint_j), (pupil_i, glint_i))
         };
 
         let mut right_eye = EyeObservation::new(Side::Right);
-        right_eye.pupil = Some(right);
+        right_eye.pupil = Some(right.0);
+        right_eye.glints = right.1.into_iter().collect();
         let mut left_eye = EyeObservation::new(Side::Left);
-        left_eye.pupil = Some(left);
+        left_eye.pupil = Some(left.0);
+        left_eye.glints = left.1.into_iter().collect();
         Ok(Some([right_eye, left_eye]))
+    }
+
+    fn pupil_and_glint(
+        &self,
+        lit: GrayView<'_>,
+        diff: GrayView<'_>,
+        c: &blob::Candidate,
+    ) -> Result<PupilAndGlint, DetectError> {
+        let pupil = pupil::pupil_from_candidate(diff, c, &self.options)?;
+        if !self.options.glints {
+            return Ok((pupil, None));
+        }
+
+        let search = glint::GlintSearch {
+            lit,
+            pupil: pupil.value(),
+            options: &self.options,
+        };
+        let Some(found) = glint::find_glint(&search)? else {
+            return Ok((pupil, None));
+        };
+
+        let plateau_diff = glint::plateau_median(diff, pupil.value());
+        let masked = glint::mask_glint(diff, found.value(), plateau_diff)?;
+        let pupil = pupil::pupil_from_candidate(masked.view(), c, &self.options)?;
+        Ok((pupil, Some(found)))
     }
 
     fn paired_dark(&self, lit: &Frame) -> Option<&Frame> {
@@ -353,6 +395,177 @@ mod tests {
         assert_eq!(face.landmarks.len(), 2);
         assert_eq!(face.landmarks[0], right_center);
         assert_eq!(face.landmarks[1], left_center);
+    }
+
+    #[test]
+    fn test_masking_glint_removes_pupil_bias() {
+        let truth = Point2::new(290.3, 180.7);
+        let glint_point = truth + nalgebra::Vector2::new(1.3, 0.0);
+
+        let mut unmasked_scene = SyntheticIr::default_scene();
+        unmasked_scene.eyes[0].glint = Some((glint_point, 1.0, 255.0));
+        let (lit, dark) = unmasked_scene.render();
+
+        let options_unmasked = IrClassicOptions {
+            glints: false,
+            ..IrClassicOptions::default()
+        };
+        let without_mask = IrClassicDetector::new(options_unmasked)
+            .detect_pair(lit.view(), dark.view())
+            .unwrap()
+            .expect("face detected");
+        let unmasked_center = without_mask[0].pupil.unwrap().value().center();
+
+        let with_mask = IrClassicDetector::new(IrClassicOptions::default())
+            .detect_pair(lit.view(), dark.view())
+            .unwrap()
+            .expect("face detected");
+        let masked_center = with_mask[0].pupil.unwrap().value().center();
+
+        assert!((masked_center - truth).norm() <= 0.05);
+        assert!((masked_center - truth).norm() < (unmasked_center - truth).norm());
+    }
+
+    #[test]
+    fn test_detect_pair_populates_glints_for_both_eyes() {
+        let mut det: Box<dyn Detector> =
+            Box::new(IrClassicDetector::from_config(&toml::Table::new(), &nominal_rig()).unwrap());
+
+        let mut scene = SyntheticIr::default_scene();
+        let offset = nalgebra::Vector2::new(0.7, -0.4);
+        let right_truth = scene.eyes[0].pupil_center;
+        let left_truth = scene.eyes[1].pupil_center;
+        scene.eyes[0].glint = Some((right_truth + offset, 0.6, 255.0));
+        scene.eyes[1].glint = Some((left_truth + offset, 0.6, 255.0));
+        let (lit, dark) = scene.render();
+
+        let dark_frames = FrameSet::single(ir_frame(Illumination::IrDark, 0, 0, &dark));
+        det.detect(&dark_frames).unwrap();
+        let lit_frames = FrameSet::single(ir_frame(Illumination::IrLit, 68_000_000, 1, &lit));
+        let out = det.detect(&lit_frames).unwrap();
+        let face = out[0].face.as_ref().expect("face detected");
+
+        let right = &face.eyes[0];
+        assert_eq!(right.side, Side::Right);
+        assert_eq!(right.glints.len(), 1);
+        assert!((*right.glints[0].value() - (right_truth + offset)).norm() <= 0.1);
+        assert!((right.pupil.unwrap().value().center() - right_truth).norm() <= 0.05);
+
+        let left = &face.eyes[1];
+        assert_eq!(left.side, Side::Left);
+        assert_eq!(left.glints.len(), 1);
+        assert!((*left.glints[0].value() - (left_truth + offset)).norm() <= 0.1);
+        assert!((left.pupil.unwrap().value().center() - left_truth).norm() <= 0.05);
+    }
+
+    #[test]
+    fn test_glints_disabled_leaves_vec_empty() {
+        let mut scene = SyntheticIr::default_scene();
+        let glint_point = scene.eyes[0].pupil_center + nalgebra::Vector2::new(0.7, -0.4);
+        scene.eyes[0].glint = Some((glint_point, 0.6, 255.0));
+        let (lit, dark) = scene.render();
+
+        let options = IrClassicOptions {
+            glints: false,
+            ..IrClassicOptions::default()
+        };
+        let eyes = IrClassicDetector::new(options)
+            .detect_pair(lit.view(), dark.view())
+            .unwrap()
+            .expect("face detected");
+        for eye in &eyes {
+            assert!(eye.glints.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_from_config_rejects_unknown_option_still() {
+        let mut table = toml::Table::new();
+        table.insert("not_a_real_option".into(), 1.into());
+        let err = IrClassicDetector::from_config(&table, &nominal_rig()).unwrap_err();
+        assert!(matches!(err, StageError::Config(_)));
+
+        let mut table = toml::Table::new();
+        table.insert("glint_min_excess".into(), 20.0.into());
+        let detector = IrClassicDetector::from_config(&table, &nominal_rig()).unwrap();
+        assert_eq!(detector.options.glint_min_excess, 20.0);
+    }
+
+    #[test]
+    #[ignore = "needs EYE_RECORDING"]
+    fn test_recording_glint_rate_and_jitter() {
+        let dir = std::env::var("EYE_RECORDING").expect("EYE_RECORDING must be set");
+        let index_path = std::path::Path::new(&dir).join("index.jsonl");
+        let index = std::fs::read_to_string(&index_path).expect("index.jsonl readable");
+
+        let mut detector = IrClassicDetector::new(IrClassicOptions::default());
+        let mut lit_count = 0u64;
+        // Indexed by side: [Right, Left].
+        let mut glint_counts = [0u64; 2];
+        let mut vectors: [Vec<(f64, f64)>; 2] = [Vec::new(), Vec::new()];
+
+        for line in index.lines() {
+            let illumination = match json_string_field(line, "illumination") {
+                Some("ir_lit") => Illumination::IrLit,
+                Some("ir_dark") => Illumination::IrDark,
+                _ => continue,
+            };
+            let seq = json_number_field(line, "seq").unwrap_or(0);
+            let ts_ns = json_number_field(line, "timestamp").unwrap_or(0);
+            let path = std::path::Path::new(&dir).join(format!("frames/ir/{seq:08}.pgm"));
+            let pixels = read_pgm(&path);
+            let frame = ir_frame(illumination, ts_ns, seq, &pixels);
+
+            let frames = FrameSet::single(frame.clone());
+            let out = detector.detect_frames(&frames).unwrap();
+
+            if illumination == Illumination::IrDark {
+                continue;
+            }
+
+            lit_count += 1;
+            if let Some(face) = out.first().and_then(|obs| obs.face.as_ref()) {
+                for eye in &face.eyes {
+                    let side = match eye.side {
+                        Side::Right => 0,
+                        Side::Left => 1,
+                    };
+                    if let (Some(pupil), Some(glint)) = (eye.pupil, eye.glints.first().copied()) {
+                        glint_counts[side] += 1;
+                        let v = *glint.value() - pupil.value().center();
+                        vectors[side].push((v.x, v.y));
+                    }
+                }
+            }
+        }
+
+        for (side, name) in [(0, "right"), (1, "left")] {
+            let rate = if lit_count > 0 {
+                100.0 * glint_counts[side] as f64 / lit_count as f64
+            } else {
+                0.0
+            };
+            let n = vectors[side].len().max(1) as f64;
+            let mean_x = vectors[side].iter().map(|v| v.0).sum::<f64>() / n;
+            let mean_y = vectors[side].iter().map(|v| v.1).sum::<f64>() / n;
+            let std_x = (vectors[side]
+                .iter()
+                .map(|v| (v.0 - mean_x).powi(2))
+                .sum::<f64>()
+                / n)
+                .sqrt();
+            let std_y = (vectors[side]
+                .iter()
+                .map(|v| (v.1 - mean_y).powi(2))
+                .sum::<f64>()
+                / n)
+                .sqrt();
+            println!(
+                "{name} eye glint detection rate: {}/{lit_count} ({rate:.1}%)",
+                glint_counts[side]
+            );
+            println!("{name} eye pupil-glint vector std: x={std_x:.3} y={std_y:.3}");
+        }
     }
 
     #[test]

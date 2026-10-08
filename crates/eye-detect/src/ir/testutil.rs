@@ -15,6 +15,8 @@ pub(crate) struct SyntheticEye {
     pub pupil_radius: f64,
     pub iris_radius: f64,
     pub pupil_level: u8,
+    /// `(center, sigma px, peak)`; rendered into the lit frame only.
+    pub glint: Option<(Point2<f64>, f64, f64)>,
 }
 
 impl SyntheticEye {
@@ -24,6 +26,7 @@ impl SyntheticEye {
             pupil_radius: 3.0,
             iris_radius: 6.0,
             pupil_level: 220,
+            glint: None,
         }
     }
 }
@@ -85,6 +88,9 @@ impl SyntheticIr {
                 eye.pupil_radius,
                 f64::from(eye.pupil_level),
             );
+            if let Some((center, sigma, peak)) = eye.glint {
+                composite_glint(&mut lit, w, h, center, sigma, peak);
+            }
         }
         for &(center, radius, level) in &self.specular {
             composite_disc(&mut lit, w, h, center, radius, f64::from(level));
@@ -148,6 +154,37 @@ fn composite_disc(buf: &mut [f64], w: u32, h: u32, center: Point2<f64>, radius: 
                 let idx = y as usize * w as usize + x as usize;
                 buf[idx] = buf[idx] * (1.0 - cov) + level * cov;
             }
+        }
+    }
+}
+
+fn glint_coverage(x: u32, y: u32, center: Point2<f64>, sigma: f64) -> f64 {
+    let mut sum = 0.0;
+    for ky in 0..SUPERSAMPLE {
+        for kx in 0..SUPERSAMPLE {
+            let sx = x as f64 + (kx as f64 + 0.5) / f64::from(SUPERSAMPLE);
+            let sy = y as f64 + (ky as f64 + 0.5) / f64::from(SUPERSAMPLE);
+            let dx = sx - center.x;
+            let dy = sy - center.y;
+            sum += (-(dx * dx + dy * dy) / (2.0 * sigma * sigma)).exp();
+        }
+    }
+    sum / f64::from(SUPERSAMPLE * SUPERSAMPLE)
+}
+
+fn composite_glint(buf: &mut [f64], w: u32, h: u32, center: Point2<f64>, sigma: f64, peak: f64) {
+    let margin = (4.0 * sigma).ceil() as i64 + 1;
+    let cx = center.x.floor() as i64;
+    let cy = center.y.floor() as i64;
+    let x0 = (cx - margin).max(0);
+    let x1 = (cx + margin).min(i64::from(w) - 1);
+    let y0 = (cy - margin).max(0);
+    let y1 = (cy + margin).min(i64::from(h) - 1);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let g = glint_coverage(x as u32, y as u32, center, sigma);
+            let idx = y as usize * w as usize + x as usize;
+            buf[idx] += (peak - buf[idx]) * g;
         }
     }
 }
