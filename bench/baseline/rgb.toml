@@ -1,0 +1,14 @@
+[[camera]]
+id = "rgb"
+device = "/dev/video0"
+format = "mjpeg"
+size = [1280, 720]
+
+[detect]
+rgb = "mediapipe-ort"
+
+[estimate]
+kind = "landmark"
+
+[filter]
+kind = "one-euro"

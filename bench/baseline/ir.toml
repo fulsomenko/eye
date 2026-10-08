@@ -1,0 +1,15 @@
+[[camera]]
+id = "ir"
+device = "/dev/video2"
+format = "gray"
+size = [640, 360]
+emitter = "msxu"
+
+[detect]
+ir = "ir-classic"
+
+[estimate]
+kind = "ir-pupil"
+
+[filter]
+kind = "one-euro"

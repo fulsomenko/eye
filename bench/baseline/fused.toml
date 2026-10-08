@@ -1,0 +1,22 @@
+[[camera]]
+id = "rgb"
+device = "/dev/video0"
+format = "mjpeg"
+size = [1280, 720]
+
+[[camera]]
+id = "ir"
+device = "/dev/video2"
+format = "gray"
+size = [640, 360]
+emitter = "msxu"
+
+[detect]
+rgb = "mediapipe-ort"
+ir = "ir-classic"
+
+[estimate]
+kind = "fused"
+
+[filter]
+kind = "one-euro"
