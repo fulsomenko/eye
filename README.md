@@ -9,9 +9,8 @@ Pre-alpha. The pipeline is under construction.
 ## Development
 
 ```sh
-direnv allow        # or: nix develop
-cargo nextest run --workspace
-nix build
+cargo build
+cargo test
 ```
 
 ## Hardware
