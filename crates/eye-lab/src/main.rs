@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
 
-fn main() {
-    println!("eye-lab {}", env!("CARGO_PKG_VERSION"));
+fn main() -> std::process::ExitCode {
+    eye_lab::cli::main()
 }

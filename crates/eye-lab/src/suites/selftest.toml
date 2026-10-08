@@ -1,0 +1,13 @@
+name = "selftest"
+description = "Harness self-check, no hardware"
+
+[[step]]
+test = "selftest-check"
+params = { value = 42.0, min = 40.0 }
+
+[[step]]
+test = "selftest-skip"
+params = { reason = "demonstrates a skipped step" }
+
+[[step]]
+test = "selftest-subject"

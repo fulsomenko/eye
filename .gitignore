@@ -22,3 +22,4 @@ result-*
 
 # Captured face frames and calibration sessions
 /recordings
+/lab-reports
