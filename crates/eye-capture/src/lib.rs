@@ -14,3 +14,7 @@ pub mod v4l2;
 pub use error::CaptureError;
 pub use source::FrameSource;
 pub use v4l2::{CaptureFormat, V4l2Config, V4l2Options, V4l2Source};
+pub use {
+    illumination::{IlluminationTagger, TaggedSource, TaggerConfig, TaggerState, mean_brightness},
+    uvc_meta::{IlluminationMeta, MetaRecord, UvcMetaStream, frame_illumination},
+};
