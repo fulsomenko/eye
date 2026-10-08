@@ -1,5 +1,7 @@
 use std::{fmt, path::PathBuf};
 
+use eye_core::stage::StageError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StageKind {
     Detector,
@@ -51,6 +53,27 @@ pub enum ConfigError {
     ZeroChannelCapacity,
     #[error("[output] {0}")]
     InvalidOutput(&'static str),
+    #[error("unknown {kind} {name:?}; available: {}", available.join(", "))]
+    UnknownStage {
+        kind: StageKind,
+        name: String,
+        available: Vec<&'static str>,
+    },
+    #[error("{kind} {name:?} is not compiled in; rebuild with `--features {feature}`")]
+    NotCompiled {
+        kind: StageKind,
+        name: String,
+        feature: &'static str,
+    },
+    #[error("building {kind} {name:?}: {source}")]
+    Stage {
+        kind: StageKind,
+        name: String,
+        #[source]
+        source: StageError,
+    },
+    #[error("{kind} {name:?} registered twice")]
+    DuplicateRegistration { kind: StageKind, name: &'static str },
 }
 
 #[cfg(test)]
