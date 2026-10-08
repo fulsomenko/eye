@@ -10,6 +10,8 @@ use eye_core::{CameraId, CameraInfo, Illumination, PixelFormat, Timestamp};
 
 pub use eye_core::session::{TargetClock, TargetRecord};
 pub use id::SessionId;
+pub use reader::Recording;
+pub use replay::{Pacing, PacingOption, ReplayOptions, ReplaySource};
 pub use writer::SessionWriter;
 
 pub const FORMAT_VERSION: u32 = 1;
