@@ -24,4 +24,4 @@ Developed on a Dell Latitude 7420 with an IR (Windows Hello) camera, under Hyprl
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE.md](LICENSE.md) for the licence and contribution terms, and [LICENSE](LICENSE) for the canonical text.
+Licensed under the Apache License, Version 2.0, see [LICENSE.md](LICENSE.md).
