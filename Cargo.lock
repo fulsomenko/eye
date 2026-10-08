@@ -705,7 +705,6 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "crossbeam-channel",
- "eye-calibration",
  "eye-core",
  "nalgebra",
  "nix",

@@ -30,14 +30,7 @@ impl Default for ProtocolConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TargetTiming {
-    /// Eye still travelling; samples ignored.
-    pub settle: Duration,
-    /// Samples are taken.
-    pub window: Duration,
-    pub dwell: Duration,
-}
+pub use eye_core::session::TargetTiming;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Target {

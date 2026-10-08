@@ -3,8 +3,8 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use eye_calibration::protocol::TargetTiming;
 use eye_core::session::TargetClock;
+use eye_core::session::TargetTiming;
 use eye_core::{OutputId, Timestamp};
 use nalgebra::Point2;
 

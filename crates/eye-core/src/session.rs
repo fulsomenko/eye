@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use crate::OutputId;
@@ -79,4 +81,13 @@ mod tests {
         let shown_ns = ts.as_nanos();
         assert_eq!(Timestamp::from_nanos(shown_ns), ts);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TargetTiming {
+    /// Eye still travelling; samples ignored.
+    pub settle: Duration,
+    /// Samples are taken.
+    pub window: Duration,
+    pub dwell: Duration,
 }
