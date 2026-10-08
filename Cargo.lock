@@ -677,16 +677,17 @@ dependencies = [
 name = "eye-lab"
 version = "0.1.0"
 dependencies = [
- "assert_cmd",
+ "approx",
  "clap",
  "crossbeam-channel",
  "eye",
  "eye-bench",
+ "eye-calibration",
  "eye-capture",
  "eye-core",
  "eye-platform",
+ "nalgebra",
  "nix",
- "predicates",
  "serde",
  "serde_json",
  "signal-hook",

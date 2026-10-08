@@ -15,4 +15,5 @@ pub mod sequence;
 pub mod signals;
 pub mod stats;
 pub mod suites;
-pub mod testkit;
+#[cfg(test)]
+mod testkit;

@@ -19,9 +19,11 @@ clap.workspace = true
 crossbeam-channel.workspace = true
 eye.workspace = true
 eye-bench.workspace = true
+eye-calibration.workspace = true
 eye-capture.workspace = true
 eye-core.workspace = true
 eye-platform.workspace = true
+nalgebra.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
@@ -31,9 +33,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-assert_cmd.workspace = true
+approx.workspace = true
 nix = { workspace = true, features = ["signal"] }
-predicates.workspace = true
 tempfile.workspace = true
 
 [features]
