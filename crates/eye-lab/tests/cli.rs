@@ -305,6 +305,26 @@ fn test_cli_help_shows_subcommand_and_arg_descriptions() {
 }
 
 #[test]
+fn test_cli_modes_json_is_an_array() {
+    let result = bin().args(["modes", "--json"]).output().unwrap();
+    assert_eq!(result.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(value.is_array(), "{stdout}");
+}
+
+#[test]
+fn test_cli_unknown_camera_node_exits_2() {
+    let result = bin()
+        .args(["run", "--suite", "selftest", "--rgb", "/dev/eye-lab-none"])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("/dev/eye-lab-none"), "{stderr}");
+}
+
+#[test]
 fn test_cli_grace_s_zero_error_names_valid_range() {
     let result = bin()
         .args(["run", "--suite", "selftest", "--grace-s", "0"])

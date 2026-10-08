@@ -1,24 +1,29 @@
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
-use eye_capture::{CaptureError, FrameSource, IlluminationMeta};
+use eye_capture::{CaptureError, FrameSource, IlluminationMeta, MetaRecord};
 use eye_core::{CameraId, CameraInfo, Frame, FrameHeader, Illumination, PixelFormat, Timestamp};
-use eye_platform::{CameraDevice, EmitterError};
+use eye_platform::{
+    CameraDevice, CameraKind, EmitterError, ExtensionUnit, FormatInfo, FrameSizeInfo,
+    MsxuIrEmitter, UsbIdentity, XuError, XuOpener, XuQuery, XuTransport, emitter::MSXU_GUID,
+    find_face_auth_control,
+};
 
 use crate::{
     case::{Needs, ParamError, RunOptions, TestCase, TestCtx, TestError, TestOutput, TestRegistry},
     mode::{
         ActiveMode, EmitterSetting, LabEmitter, Mode, ModeError, ModeHost, ModeSession, Role,
-        StreamTarget,
+        StreamTarget, Teardown,
     },
+    modes::{CameraSelection, LiveHost, opener::Opener},
     runner::PlannedStep,
     sequence::{EmitterSel, ModeSpec, StreamsSel},
 };
@@ -330,10 +335,19 @@ fn build_needs_rgb(_: &toml::Table) -> Result<Box<dyn TestCase>, ParamError> {
     })))
 }
 
+fn build_read_emitter(_: &toml::Table) -> Result<Box<dyn TestCase>, ParamError> {
+    Ok(Box::new(ReadEmitterCase))
+}
+
 fn testkit_registry() -> TestRegistry {
     let mut r = TestRegistry::builtin();
     r.register("needs-ir", "testkit: needs ir", build_needs_ir);
     r.register("needs-rgb", "testkit: needs rgb", build_needs_rgb);
+    r.register(
+        "read-emitter",
+        "testkit: reads the emitter mode",
+        build_read_emitter,
+    );
     r
 }
 
@@ -393,5 +407,276 @@ pub(crate) fn planned_with_timeout(
     PlannedStep {
         timeout,
         ..planned(test, params, mode)
+    }
+}
+
+/// XuTransport over shared state; behaves like the IR MSXU control in EYE-2: unit 4 selector 6,
+/// len 9, info 0x03, max [1,3,3,0,..], def [1,3,1,0,..]. Other unit/selector -> NotFound.
+/// A buffer of the wrong length -> Ioctl EINVAL. SetCur with `fail_set` -> Ioctl EIO.
+#[derive(Debug, Clone)]
+pub(crate) struct SharedFakeXu(pub Arc<Mutex<FakeXuState>>);
+
+#[derive(Debug)]
+pub(crate) struct FakeXuState {
+    pub cur: [u8; 9],
+    pub writes: Vec<[u8; 9]>,
+    pub ignore_writes: bool,
+    pub fail_set: bool,
+}
+
+impl SharedFakeXu {
+    pub(crate) fn with_mode(mode: u8) -> Self {
+        Self(Arc::new(Mutex::new(FakeXuState {
+            cur: [1, 3, mode, 0, 0, 0, 0, 0, 0],
+            writes: Vec::new(),
+            ignore_writes: false,
+            fail_set: false,
+        })))
+    }
+
+    pub(crate) fn mode(&self) -> u8 {
+        self.0.lock().unwrap().cur[2]
+    }
+}
+
+impl XuTransport for SharedFakeXu {
+    fn query(
+        &self,
+        unit: u8,
+        selector: u8,
+        query: XuQuery,
+        data: &mut [u8],
+    ) -> Result<(), XuError> {
+        if (unit, selector) != (4, 6) {
+            return Err(XuError::NotFound { unit, selector });
+        }
+        let ioctl = |errno| XuError::Ioctl {
+            unit,
+            selector,
+            query,
+            errno,
+        };
+        let mut s = self.0.lock().unwrap();
+        match query {
+            XuQuery::GetLen if data.len() == 2 => data.copy_from_slice(&9u16.to_le_bytes()),
+            XuQuery::GetInfo if data.len() == 1 => data[0] = 0x03,
+            XuQuery::GetCur if data.len() == 9 => data.copy_from_slice(&s.cur),
+            XuQuery::GetMax if data.len() == 9 => {
+                data.copy_from_slice(&[1, 3, 3, 0, 0, 0, 0, 0, 0])
+            }
+            XuQuery::GetDef if data.len() == 9 => {
+                data.copy_from_slice(&[1, 3, 1, 0, 0, 0, 0, 0, 0])
+            }
+            XuQuery::GetMin | XuQuery::GetRes if data.len() == 9 => data.fill(0),
+            XuQuery::SetCur if data.len() == 9 => {
+                if s.fail_set {
+                    return Err(ioctl(nix::errno::Errno::EIO));
+                }
+                let mut w = [0u8; 9];
+                w.copy_from_slice(data);
+                s.writes.push(w);
+                if !s.ignore_writes {
+                    s.cur = w;
+                }
+            }
+            _ => return Err(ioctl(nix::errno::Errno::EINVAL)),
+        }
+        Ok(())
+    }
+}
+
+/// Opener over SharedFakeXu plus scripted sources and metadata streams.
+pub(crate) struct FakeOpener {
+    pub xu: SharedFakeXu,
+    /// Emitter opens (open_emitter calls and guard re-opens), shared with the guard's opener closure.
+    pub opens: Arc<AtomicUsize>,
+    pub sources: Mutex<HashMap<Role, VecDeque<Box<dyn FrameSource>>>>,
+    pub prepared_meta: Mutex<Vec<PathBuf>>,
+    pub meta: Mutex<VecDeque<Box<dyn IlluminationMeta>>>,
+}
+
+impl fmt::Debug for FakeOpener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FakeOpener")
+    }
+}
+
+impl FakeOpener {
+    pub(crate) fn new(xu: SharedFakeXu) -> Self {
+        Self {
+            xu,
+            opens: Arc::new(AtomicUsize::new(0)),
+            sources: Mutex::new(HashMap::new()),
+            prepared_meta: Mutex::new(Vec::new()),
+            meta: Mutex::new(VecDeque::new()),
+        }
+    }
+}
+
+impl Opener for FakeOpener {
+    fn open_source(
+        &self,
+        role: Role,
+        _target: &StreamTarget,
+    ) -> Result<Box<dyn FrameSource>, CaptureError> {
+        let mut sources = self.sources.lock().unwrap();
+        sources
+            .get_mut(&role)
+            .and_then(VecDeque::pop_front)
+            .ok_or(CaptureError::EndOfStream)
+    }
+
+    fn open_emitter(&self, camera: &CameraDevice) -> Result<Box<dyn LabEmitter>, EmitterError> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        let control = find_face_auth_control(&camera.extension_units).ok_or_else(|| {
+            EmitterError::NoControl {
+                node: camera.node.clone(),
+            }
+        })?;
+        Ok(Box::new(MsxuIrEmitter::with_transport(
+            self.xu.clone(),
+            control,
+        )?))
+    }
+
+    fn guard_emitter(&self, camera: &CameraDevice, mode: u8) -> Result<Teardown, EmitterError> {
+        let control = find_face_auth_control(&camera.extension_units).ok_or_else(|| {
+            EmitterError::NoControl {
+                node: camera.node.clone(),
+            }
+        })?;
+        let (xu, opens) = (self.xu.clone(), Arc::clone(&self.opens));
+        let open: XuOpener<SharedFakeXu> = Box::new(move |_: &Path| {
+            opens.fetch_add(1, Ordering::SeqCst);
+            Ok(xu.clone())
+        });
+        Ok(Box::new(eye_platform::EmitterGuard::with_opener(
+            camera.node.clone(),
+            control,
+            mode,
+            open,
+        )?))
+    }
+
+    fn prepare_meta(&self, node: &Path) -> Result<[u8; 4], XuError> {
+        self.prepared_meta.lock().unwrap().push(node.to_path_buf());
+        Ok(eye_platform::META_FORMAT_UVCM)
+    }
+
+    fn open_meta(&self, _node: &Path) -> Result<Box<dyn IlluminationMeta>, CaptureError> {
+        self.meta
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or(CaptureError::EndOfStream)
+    }
+}
+
+/// A scripted `IlluminationMeta` with no records; used only to prove `open_meta` returns `Some`.
+#[derive(Debug)]
+pub(crate) struct FakeMetaStream;
+
+impl IlluminationMeta for FakeMetaStream {
+    fn next_record(&mut self) -> Result<MetaRecord, CaptureError> {
+        Err(CaptureError::EndOfStream)
+    }
+}
+
+/// `/dev/video0` (Rgb, MJPG 1280x720/960x540/848x480/640x480/640x360 @30 + YUYV 640x480@30, usb interface 0, no XUs,
+/// metadata_node /dev/video1) and `/dev/video2` (Ir, GREY 640x360@30, usb interface 2,
+/// XU { interface: 2, unit_id: 4, guid: MSXU_GUID, num_controls: 16, selectors: vec![6, 9] }, metadata_node /dev/video3);
+/// both with `usb.sysfs_device` = `/sys/devices/pci0000:00/0000:00:14.0/usb3/3-6`, vendor 0x0c45, product 0x672c.
+pub(crate) fn dell_cameras() -> Vec<CameraDevice> {
+    let sysfs_device = PathBuf::from("/sys/devices/pci0000:00/0000:00:14.0/usb3/3-6");
+    let usb = |interface: u8| UsbIdentity {
+        vendor_id: 0x0c45,
+        product_id: 0x672c,
+        interface,
+        sysfs_device: sysfs_device.clone(),
+    };
+    let size = |width: u32, height: u32| FrameSizeInfo {
+        width,
+        height,
+        fps: vec![30.0],
+    };
+    let rgb = CameraDevice {
+        node: PathBuf::from("/dev/video0"),
+        card: "Dell RGB".to_owned(),
+        driver: "uvcvideo".to_owned(),
+        bus: "usb-0000:00:14.0-6".to_owned(),
+        kind: CameraKind::Rgb,
+        formats: vec![
+            FormatInfo {
+                fourcc: "MJPG".to_owned(),
+                sizes: vec![
+                    size(1280, 720),
+                    size(960, 540),
+                    size(848, 480),
+                    size(640, 480),
+                    size(640, 360),
+                ],
+            },
+            FormatInfo {
+                fourcc: "YUYV".to_owned(),
+                sizes: vec![size(640, 480)],
+            },
+        ],
+        usb: Some(usb(0)),
+        extension_units: vec![],
+        metadata_node: Some(PathBuf::from("/dev/video1")),
+    };
+    let ir = CameraDevice {
+        node: PathBuf::from("/dev/video2"),
+        card: "Dell IR".to_owned(),
+        driver: "uvcvideo".to_owned(),
+        bus: "usb-0000:00:14.0-6".to_owned(),
+        kind: CameraKind::Ir,
+        formats: vec![FormatInfo {
+            fourcc: "GREY".to_owned(),
+            sizes: vec![size(640, 360)],
+        }],
+        usb: Some(usb(2)),
+        extension_units: vec![ExtensionUnit {
+            interface: 2,
+            unit_id: 4,
+            guid: MSXU_GUID,
+            num_controls: 16,
+            selectors: vec![6, 9],
+        }],
+        metadata_node: Some(PathBuf::from("/dev/video3")),
+    };
+    vec![rgb, ir]
+}
+
+pub(crate) fn fake_live_host(opener: Arc<FakeOpener>) -> LiveHost {
+    LiveHost::new(dell_cameras(), &CameraSelection::default(), opener)
+        .expect("fixture cameras resolve")
+}
+
+/// Test-only case (needs `emitter`): one measurement `Measurement::info("mode", f64::from(ctx.session().emitter()?.read_mode()?), "")`.
+#[derive(Debug)]
+pub(crate) struct ReadEmitterCase;
+
+impl TestCase for ReadEmitterCase {
+    fn name(&self) -> &'static str {
+        "read-emitter"
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            emitter: true,
+            ..Needs::default()
+        }
+    }
+
+    fn default_timeout(&self) -> Duration {
+        Duration::from_secs(10)
+    }
+
+    fn run(&self, ctx: &TestCtx) -> Result<TestOutput, TestError> {
+        let mut out = TestOutput::default();
+        let mode = ctx.session().emitter()?.read_mode()?;
+        out.push(crate::case::Measurement::info("mode", f64::from(mode), ""));
+        Ok(out)
     }
 }

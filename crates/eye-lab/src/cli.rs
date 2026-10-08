@@ -9,9 +9,12 @@ use std::{
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+use eye::config::EnvOverrides;
+
 use crate::{
     case::{RunOptions, TestRegistry},
-    mode::{ModeHost, NullHost},
+    mode::ModeHost,
+    modes::{CameraSelection, LiveHost},
     report::{self, Report},
     runner,
     sequence::{LoadError, MAX_TIMEOUT_S, Sequence},
@@ -37,12 +40,35 @@ pub enum Command {
     ListTests,
     /// List the built-in suites
     Suites,
+    /// Print the camera mode matrix, the emitter byte and the metadata node
+    Modes(ModesArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct CameraArgs {
+    /// RGB video node (default: $EYE_CAMERA, else the first RGB camera)
+    #[arg(long, value_name = "PATH")]
+    pub rgb: Option<PathBuf>,
+    /// IR video node (default: $EYE_IR_CAMERA, else the first IR camera)
+    #[arg(long, value_name = "PATH")]
+    pub ir: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ModesArgs {
+    #[command(flatten)]
+    pub cameras: CameraArgs,
+    /// Machine-readable output (the matrix rows only)
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
     #[command(flatten)]
     pub source: SequenceSource,
+    #[command(flatten)]
+    pub cameras: CameraArgs,
     /// Skip every test that needs a person in front of the camera
     #[arg(long)]
     pub no_subject: bool,
@@ -134,7 +160,56 @@ fn run_main() -> u8 {
             0
         }
         Command::Run(args) => run_command(args),
+        Command::Modes(args) => modes_command(args),
     }
+}
+
+fn build_host(cameras: &CameraArgs) -> Result<LiveHost, u8> {
+    let selection = CameraSelection::resolve(
+        cameras.rgb.clone(),
+        cameras.ir.clone(),
+        &EnvOverrides::from_process_env(),
+    );
+    LiveHost::probe(&selection).map_err(|e| {
+        eprintln!("eye-lab: {e}");
+        2
+    })
+}
+
+fn modes_command(args: ModesArgs) -> u8 {
+    let host = match build_host(&args.cameras) {
+        Ok(host) => host,
+        Err(code) => return code,
+    };
+
+    if args.json {
+        match serde_json::to_string_pretty(&host.matrix()) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("eye-lab: {e}");
+                return 2;
+            }
+        }
+    } else {
+        println!("STREAMS EMITTER RGB                IR                 RUNNABLE");
+        for row in host.matrix() {
+            let rgb = row.rgb.as_deref().unwrap_or("-");
+            let ir = row.ir.as_deref().unwrap_or("-");
+            let runnable = match (row.runnable, &row.note) {
+                (true, _) => "yes".to_owned(),
+                (false, Some(note)) => format!("no: {note}"),
+                (false, None) => "no".to_owned(),
+            };
+            println!(
+                "{:<7} {:<7} {:<18} {:<18} {}",
+                row.streams, row.emitter, rgb, ir, runnable
+            );
+        }
+        println!();
+        println!("{}", host.emitter_status());
+        println!("{}", host.metadata_status());
+    }
+    0
 }
 
 fn run_command(args: RunArgs) -> u8 {
@@ -161,7 +236,10 @@ fn run_command(args: RunArgs) -> u8 {
         return 2;
     }
 
-    let mut host: Box<dyn ModeHost> = Box::new(NullHost);
+    let mut host: Box<dyn ModeHost> = match build_host(&args.cameras) {
+        Ok(host) => Box::new(host),
+        Err(code) => return code,
+    };
 
     println!("running {name} ({planned_len} steps)");
 

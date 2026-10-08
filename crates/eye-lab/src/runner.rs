@@ -908,6 +908,99 @@ mod tests {
     }
 
     #[test]
+    fn test_runner_sets_emitter_during_step_and_restores_after() {
+        use crate::testkit::{FakeOpener, SharedFakeXu, fake_live_host};
+
+        let opener = Arc::new(FakeOpener::new(SharedFakeXu::with_mode(1)));
+        let mut host = fake_live_host(Arc::clone(&opener));
+        let options = fake_run_options();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let steps = vec![planned(
+            "read-emitter",
+            "",
+            "streams = \"ir\", emitter = \"on\"",
+        )];
+        let mut buf = Vec::new();
+        let out = run(&steps, &mut host, &options, &cancel, &mut buf);
+        assert_eq!(out.results[0].verdict, Verdict::Pass);
+        assert_eq!(
+            out.results[0].measurements[0].value,
+            f64::from(eye_platform::emitter::MODE_ON_DEFAULT)
+        );
+        assert_eq!(opener.xu.mode(), 0x01);
+    }
+
+    #[test]
+    fn test_runner_restores_emitter_after_panicking_step() {
+        use crate::testkit::{FakeOpener, SharedFakeXu, fake_live_host};
+
+        let opener = Arc::new(FakeOpener::new(SharedFakeXu::with_mode(1)));
+        let mut host = fake_live_host(Arc::clone(&opener));
+        let options = fake_run_options();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let steps = vec![planned("selftest-panic", "", "emitter = \"on\"")];
+        let mut buf = Vec::new();
+        let out = run(&steps, &mut host, &options, &cancel, &mut buf);
+        assert_eq!(out.results[0].verdict, Verdict::Error);
+        assert_eq!(opener.xu.mode(), 0x01);
+    }
+
+    #[test]
+    fn test_runner_restores_emitter_after_hung_step() {
+        use crate::testkit::{FakeOpener, SharedFakeXu, fake_live_host, planned_with_timeout};
+
+        let opener = Arc::new(FakeOpener::new(SharedFakeXu::with_mode(1)));
+        let mut host = fake_live_host(Arc::clone(&opener));
+        let options = fake_run_options();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let steps = vec![planned_with_timeout(
+            "selftest-sleep",
+            "seconds = 3.0, ignore_cancel = true",
+            "streams = \"ir\", emitter = \"on\"",
+            Duration::from_millis(100),
+        )];
+        let mut buf = Vec::new();
+        let start = Instant::now();
+        let out = run(&steps, &mut host, &options, &cancel, &mut buf);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            out.aborted,
+            Some(Abort::Hung {
+                step: "selftest-sleep".to_owned()
+            })
+        );
+        assert_eq!(opener.xu.mode(), 0x01);
+    }
+
+    #[test]
+    fn test_runner_emitter_each_runs_off_then_on() {
+        use crate::testkit::{FakeOpener, SharedFakeXu, fake_live_host};
+
+        let opener = Arc::new(FakeOpener::new(SharedFakeXu::with_mode(1)));
+        let mut host = fake_live_host(Arc::clone(&opener));
+        let options = fake_run_options();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let steps = vec![planned(
+            "read-emitter",
+            "",
+            "streams = \"ir\", emitter = \"*\"",
+        )];
+        let mut buf = Vec::new();
+        let out = run(&steps, &mut host, &options, &cancel, &mut buf);
+        assert_eq!(out.results.len(), 2);
+        let values: Vec<f64> = out
+            .results
+            .iter()
+            .map(|r| r.measurements[0].value)
+            .collect();
+        assert_eq!(
+            values,
+            [1.0, f64::from(eye_platform::emitter::MODE_ON_DEFAULT)]
+        );
+        assert_eq!(opener.xu.mode(), 0x01);
+    }
+
+    #[test]
     fn test_null_host_rejects_streams() {
         use crate::mode::{ModeError, NullHost};
 
