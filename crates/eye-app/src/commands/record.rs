@@ -14,7 +14,7 @@ use eye_capture::session::{
 use eye_core::session::TargetRecord;
 use eye_core::{CameraInfo, Frame, Rig, ScreenModel, Timestamp};
 use eye_geometry::screen::px_logical_to_mm;
-use eye_overlay::targets::{TargetDisplay, TargetEvent, TargetShown, TargetSpec};
+use eye_overlay::targets::{FeedbackSender, TargetDisplay, TargetEvent, TargetShown, TargetSpec};
 use eye_platform::EmitterGuard;
 
 use crate::capture::{Capture, CaptureMsg};
@@ -177,6 +177,37 @@ pub enum PumpEnd {
     Interrupted,
 }
 
+/// Hooks `pump` drives alongside the frame/target recording. All methods default to no-ops.
+pub trait PumpObserver {
+    /// Whether this observer wants `record_targets` to connect the overlay's feedback channel
+    /// and call `attach_feedback` with the sender before pumping.
+    fn wants_feedback(&self) -> bool {
+        false
+    }
+
+    fn attach_feedback(&mut self, _sender: FeedbackSender) {}
+
+    /// Called once `record_session` has resolved the rig and opened the camera sources, before
+    /// any frame is pumped, so an observer that needs them (e.g. to build a `Pipeline`) can set
+    /// itself up.
+    fn prepare(&mut self, _rig: &Rig, _cameras: &[CameraInfo]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn on_frame(&mut self, _frame: &Frame) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn on_shown(&mut self, _shown: &TargetShown) {}
+
+    fn on_hidden(&mut self, _index: usize, _at: Timestamp) {}
+}
+
+#[derive(Debug, Default)]
+pub struct NoopObserver;
+
+impl PumpObserver for NoopObserver {}
+
 pub fn pump(
     frames: &Receiver<CaptureMsg>,
     targets: &Receiver<TargetEvent>,
@@ -184,22 +215,28 @@ pub fn pump(
     shutdown: &Receiver<()>,
     to_record: &dyn Fn(&TargetShown, Option<Timestamp>) -> TargetRecord,
     sink: &mut dyn RecordSink,
+    observer: &mut dyn PumpObserver,
 ) -> anyhow::Result<PumpEnd> {
     let mut pending: Option<TargetShown> = None;
     let end = loop {
         crossbeam_channel::select! {
             recv(frames) -> msg => match msg {
-                Ok(CaptureMsg::Frame(frame)) => sink.frame(&frame)?,
+                Ok(CaptureMsg::Frame(frame)) => {
+                    sink.frame(&frame)?;
+                    observer.on_frame(&frame)?;
+                }
                 Ok(CaptureMsg::Failed { camera, error }) => anyhow::bail!("camera {camera} failed: {error}"),
                 Err(_) => anyhow::bail!("all capture threads stopped"),
             },
             recv(targets) -> event => match event {
                 Ok(TargetEvent::Shown(shown)) => {
+                    observer.on_shown(&shown);
                     if let Some(prev) = pending.replace(shown) {
                         sink.target(&to_record(&prev, None))?;
                     }
                 }
                 Ok(TargetEvent::Hidden { index, at, .. }) => {
+                    observer.on_hidden(index, at);
                     if pending.as_ref().is_some_and(|s| s.index == index)
                         && let Some(shown) = pending.take()
                     {
@@ -269,6 +306,7 @@ fn record_targets(
     shutdown: &Receiver<()>,
     to_record: &dyn Fn(&TargetShown, Option<Timestamp>) -> TargetRecord,
     sink: &mut dyn RecordSink,
+    observer: &mut dyn PumpObserver,
 ) -> anyhow::Result<PumpEnd> {
     let output = active_rig.screen().output.clone();
     let specs: Vec<TargetSpec> = protocol
@@ -276,7 +314,14 @@ fn record_targets(
         .into_iter()
         .map(TargetSpec::from)
         .collect();
-    let display = TargetDisplay::spawn(&output, protocol.lead_in(), specs)?;
+    let display = if observer.wants_feedback() {
+        let (display, feedback) =
+            TargetDisplay::spawn_with_feedback(&output, protocol.lead_in(), specs)?;
+        observer.attach_feedback(feedback);
+        display
+    } else {
+        TargetDisplay::spawn(&output, protocol.lead_in(), specs)?
+    };
     let end = pump(
         capture.frames(),
         display.events(),
@@ -284,6 +329,7 @@ fn record_targets(
         shutdown,
         to_record,
         sink,
+        observer,
     )?;
     if end == PumpEnd::Finished {
         capture.write_for(Duration::from_millis(250), sink)?;
@@ -300,6 +346,7 @@ pub fn record_session(
     location: &SessionLocation,
     opts: &RecordOptions,
     shutdown: &Receiver<()>,
+    observer: &mut dyn PumpObserver,
 ) -> anyhow::Result<RecordSummary> {
     let protocol = opts.protocol.map(TargetProtocol::new).transpose()?;
     let probes = Probes::system();
@@ -317,6 +364,8 @@ pub fn record_session(
         .zip(&config.cameras)
         .map(|(s, c)| (s.camera().clone(), Some(c.device.clone())))
         .collect();
+    let camera_infos: Vec<CameraInfo> = cameras.iter().map(|(info, _)| info.clone()).collect();
+    observer.prepare(&active_rig, &camera_infos)?;
     let meta = session_meta(
         &location.id,
         &cameras,
@@ -337,7 +386,15 @@ pub fn record_session(
     let to_record =
         |s: &TargetShown, hidden: Option<Timestamp>| target_record(s, hidden, active_rig.screen());
     let end = match &protocol {
-        Some(p) => record_targets(p, &active_rig, &capture, shutdown, &to_record, &mut sink)?,
+        Some(p) => record_targets(
+            p,
+            &active_rig,
+            &capture,
+            shutdown,
+            &to_record,
+            &mut sink,
+            observer,
+        )?,
         None => {
             let deadline = opts
                 .duration
@@ -349,6 +406,7 @@ pub fn record_session(
                 shutdown,
                 &to_record,
                 &mut sink,
+                observer,
             )?
         }
     };
@@ -383,7 +441,7 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     let opts = RecordOptions::from_args(&args)?;
     let config = Config::load(ctx.config_path.as_deref())?;
     let shutdown_rx = shutdown::install()?;
-    let summary = record_session(&config, &location, &opts, &shutdown_rx)?;
+    let summary = record_session(&config, &location, &opts, &shutdown_rx, &mut NoopObserver)?;
 
     let frames = summary
         .frames
@@ -606,6 +664,7 @@ mod tests {
             &crossbeam_channel::never(),
             &to_record,
             &mut sink,
+            &mut NoopObserver,
         )
         .unwrap();
 
@@ -641,6 +700,7 @@ mod tests {
             &crossbeam_channel::never(),
             &to_record,
             &mut sink,
+            &mut NoopObserver,
         )
         .unwrap();
 
@@ -665,6 +725,7 @@ mod tests {
             &shutdown_rx,
             &to_record,
             &mut sink,
+            &mut NoopObserver,
         )
         .unwrap();
 
@@ -686,6 +747,7 @@ mod tests {
             &crossbeam_channel::never(),
             &to_record,
             &mut sink,
+            &mut NoopObserver,
         )
         .unwrap_err();
 
@@ -709,6 +771,7 @@ mod tests {
             &crossbeam_channel::never(),
             &to_record,
             &mut sink,
+            &mut NoopObserver,
         )
         .unwrap();
 
@@ -738,11 +801,52 @@ mod tests {
             &crossbeam_channel::never(),
             &to_record,
             &mut sink,
+            &mut NoopObserver,
         )
         .unwrap_err();
 
         assert_eq!(err.to_string(), "all capture threads stopped");
         assert_eq!(sink.frames.len(), 3);
+    }
+
+    #[derive(Default)]
+    struct CountingObserver {
+        seqs: Vec<u64>,
+    }
+
+    impl PumpObserver for CountingObserver {
+        fn on_frame(&mut self, frame: &Frame) -> anyhow::Result<()> {
+            self.seqs.push(frame.header().seq);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_pump_calls_on_frame_for_every_frame() {
+        let (frames_tx, frames_rx) = crossbeam_channel::unbounded();
+        for seq in 0..3 {
+            frames_tx
+                .send(CaptureMsg::Frame(frame("ir", seq, seq)))
+                .unwrap();
+        }
+        drop(frames_tx);
+        let targets_rx = crossbeam_channel::never();
+
+        let mut sink = FakeSink::new();
+        let mut observer = CountingObserver::default();
+        let err = pump(
+            &frames_rx,
+            &targets_rx,
+            &crossbeam_channel::never(),
+            &crossbeam_channel::never(),
+            &to_record,
+            &mut sink,
+            &mut observer,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "all capture threads stopped");
+        assert_eq!(observer.seqs, vec![0, 1, 2]);
     }
 
     #[test]
@@ -764,6 +868,7 @@ mod tests {
             &crossbeam_channel::never(),
             &to_record,
             &mut sink,
+            &mut NoopObserver,
         )
         .unwrap_err();
 

@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 use eye_core::session::TargetClock;
 use eye_core::session::TargetTiming;
 use eye_core::{OutputId, Timestamp};
-use nalgebra::Point2;
+use nalgebra::{Matrix2, Point2};
 
 use crate::canvas::{Canvas, Rgba};
+use crate::ellipse::{K95, confidence_ellipse};
 use crate::error::OverlayError;
 use crate::handle::OverlayHandle;
 use crate::scene::{PresentedAt, Scene, Schedule};
@@ -59,6 +60,29 @@ pub enum TargetEvent {
     Finished,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Feedback {
+    pub px_logical: Point2<f64>,
+    pub cov_px: Matrix2<f64>,
+    /// `false` while drawn from the nominal (uncalibrated) mapping; `true` once a live refit applied.
+    pub calibrated: bool,
+    pub at: Timestamp,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedbackSender(crossbeam_channel::Sender<Feedback>);
+
+impl FeedbackSender {
+    pub fn new(sender: crossbeam_channel::Sender<Feedback>) -> Self {
+        Self(sender)
+    }
+
+    /// Never blocks (the channel is unbounded); a disconnected (closed) receiver is silently ignored.
+    pub fn send(&self, feedback: Feedback) {
+        let _ = self.0.send(feedback);
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TargetsError {
     #[error("no targets")]
@@ -90,8 +114,35 @@ impl TargetDisplay {
         lead_in: Duration,
         targets: Vec<TargetSpec>,
     ) -> Result<Self, TargetsError> {
+        let (display, _feedback) = Self::spawn_inner(output, lead_in, targets, false)?;
+        Ok(display)
+    }
+
+    /// Like `spawn`, but the returned `FeedbackSender` lets the caller push live `Feedback` for
+    /// the scene to draw under the current target.
+    pub fn spawn_with_feedback(
+        output: &OutputId,
+        lead_in: Duration,
+        targets: Vec<TargetSpec>,
+    ) -> Result<(Self, FeedbackSender), TargetsError> {
+        let (display, feedback) = Self::spawn_inner(output, lead_in, targets, true)?;
+        Ok((display, feedback.expect("requested with_feedback")))
+    }
+
+    fn spawn_inner(
+        output: &OutputId,
+        lead_in: Duration,
+        targets: Vec<TargetSpec>,
+        with_feedback: bool,
+    ) -> Result<(Self, Option<FeedbackSender>), TargetsError> {
         validate(&targets)?;
         let (events_tx, events) = crossbeam_channel::unbounded();
+        let (feedback_rx, feedback_tx) = if with_feedback {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            (Some(rx), Some(FeedbackSender::new(tx)))
+        } else {
+            (None, None)
+        };
         let failure = Arc::new(Mutex::new(None));
         let scene = TargetScene {
             output: output.clone(),
@@ -103,6 +154,8 @@ impl TargetDisplay {
             confirmed_at: None,
             events: events_tx,
             failure: Arc::clone(&failure),
+            feedback: feedback_rx,
+            latest_feedback: None,
         };
         let handle = spawn(
             SurfaceOptions {
@@ -111,11 +164,14 @@ impl TargetDisplay {
             },
             scene,
         )?;
-        Ok(Self {
-            events,
-            handle,
-            failure,
-        })
+        Ok((
+            Self {
+                events,
+                handle,
+                failure,
+            },
+            feedback_tx,
+        ))
     }
 
     /// Unbounded: the overlay thread never blocks on a slow reader. Disconnects when the overlay thread ends.
@@ -174,6 +230,8 @@ pub(crate) struct TargetScene {
     confirmed_at: Option<Instant>,
     events: crossbeam_channel::Sender<TargetEvent>,
     failure: Arc<Mutex<Option<TargetsError>>>,
+    feedback: Option<crossbeam_channel::Receiver<Feedback>>,
+    latest_feedback: Option<Feedback>,
 }
 
 impl TargetScene {
@@ -198,9 +256,14 @@ impl Scene for TargetScene {
             }
             self.lead_in = None;
         }
-        loop {
+        if let Some(rx) = &self.feedback {
+            for fb in rx.try_iter() {
+                self.latest_feedback = Some(fb);
+            }
+        }
+        let schedule = loop {
             let Some(t) = self.targets.get(self.current) else {
-                return Schedule::NextFrame;
+                break Schedule::NextFrame;
             };
             if let Some(confirmed) = self.confirmed_at
                 && now >= confirmed + t.timing.dwell
@@ -218,15 +281,22 @@ impl Scene for TargetScene {
                     });
                 return Schedule::Exit;
             }
+            if let Some(fb) = &self.latest_feedback {
+                draw_feedback(canvas, fb);
+            }
             let first = *self.first_frame.get_or_insert(now);
             let elapsed = now - first;
             draw_target(canvas, t.px_logical, elapsed, t.timing);
-            return match self.confirmed_at {
+            break match self.confirmed_at {
                 Some(c) if elapsed >= t.timing.settle + t.timing.window => {
                     Schedule::At(c + t.timing.dwell)
                 }
                 _ => Schedule::NextFrame,
             };
+        };
+        match (schedule, self.latest_feedback.is_some()) {
+            (Schedule::At(_), true) => Schedule::NextFrame,
+            _ => schedule,
         }
     }
 
@@ -284,6 +354,20 @@ const GREEN: Rgba = Rgba {
 };
 const COUNTDOWN_RADIUS: f64 = 16.0;
 const COUNTDOWN_WIDTH: f64 = 2.0;
+const FEEDBACK_UNCALIBRATED: Rgba = Rgba {
+    r: 160,
+    g: 160,
+    b: 160,
+    a: 255,
+};
+const FEEDBACK_CALIBRATED: Rgba = Rgba {
+    r: 64,
+    g: 128,
+    b: 240,
+    a: 255,
+};
+const FEEDBACK_RADIUS: f64 = 6.0;
+const FEEDBACK_ELLIPSE_WIDTH: f64 = 1.0;
 
 fn animation_len(dwell: Duration) -> Duration {
     Duration::from_millis(500).min(dwell / 2)
@@ -333,6 +417,26 @@ fn draw_target(c: &mut Canvas<'_>, p: Point2<f64>, elapsed: Duration, timing: Ta
     c.fill_circle(p, 3.0, color);
 }
 
+fn draw_feedback(c: &mut Canvas<'_>, fb: &Feedback) {
+    let color = if fb.calibrated {
+        FEEDBACK_CALIBRATED
+    } else {
+        FEEDBACK_UNCALIBRATED
+    };
+    let (w, h) = c.logical_size();
+    let max_axis = f64::from(w).hypot(f64::from(h));
+    if let Some(e) = confidence_ellipse(fb.px_logical, &fb.cov_px, K95, max_axis) {
+        c.stroke_ellipse(
+            e.center,
+            e.semi_axes,
+            e.angle,
+            FEEDBACK_ELLIPSE_WIDTH,
+            color,
+        );
+    }
+    c.fill_circle(fb.px_logical, FEEDBACK_RADIUS, color);
+}
+
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
@@ -355,6 +459,8 @@ mod tests {
             confirmed_at: None,
             events: tx,
             failure: Arc::new(Mutex::new(None)),
+            feedback: None,
+            latest_feedback: None,
         };
         (scene, rx)
     }
@@ -815,6 +921,88 @@ mod tests {
         let centroid_y = sum_y / sum_w;
         assert_abs_diff_eq!(centroid_x, cx, epsilon = 0.05);
         assert_abs_diff_eq!(centroid_y, cy, epsilon = 0.05);
+    }
+
+    #[test]
+    fn test_feedback_point_is_drawn_grey_then_blue() {
+        let timing = timing_for_fade_tests();
+        let targets = vec![TargetSpec {
+            px_logical: Point2::new(50.0, 50.0),
+            timing,
+        }];
+        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let (fb_tx, fb_rx) = crossbeam_channel::unbounded();
+        scene.feedback = Some(fb_rx);
+        let size = (200u32, 200u32);
+        let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
+        let t0 = Instant::now();
+
+        fb_tx
+            .send(Feedback {
+                px_logical: Point2::new(150.0, 50.0),
+                cov_px: Matrix2::identity() * 4.0,
+                calibrated: false,
+                at: Timestamp::from_nanos(1),
+            })
+            .unwrap();
+        render_into(&mut scene, &mut buf, size, t0);
+        assert_eq!(
+            bgra(&buf, size.0, 150, 50),
+            [
+                FEEDBACK_UNCALIBRATED.b,
+                FEEDBACK_UNCALIBRATED.g,
+                FEEDBACK_UNCALIBRATED.r,
+                FEEDBACK_UNCALIBRATED.a,
+            ]
+        );
+
+        fb_tx
+            .send(Feedback {
+                px_logical: Point2::new(150.0, 50.0),
+                cov_px: Matrix2::identity() * 4.0,
+                calibrated: true,
+                at: Timestamp::from_nanos(2),
+            })
+            .unwrap();
+        render_into(&mut scene, &mut buf, size, t0 + Duration::from_millis(10));
+        assert_eq!(
+            bgra(&buf, size.0, 150, 50),
+            [
+                FEEDBACK_CALIBRATED.b,
+                FEEDBACK_CALIBRATED.g,
+                FEEDBACK_CALIBRATED.r,
+                FEEDBACK_CALIBRATED.a,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_feedback_without_targets_is_ignored() {
+        let dwell = Duration::from_millis(100);
+        let targets = vec![TargetSpec::from((Point2::new(50.0, 50.0), dwell))];
+        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let (fb_tx, fb_rx) = crossbeam_channel::unbounded();
+        scene.feedback = Some(fb_rx);
+        let size = (200u32, 200u32);
+        let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
+        let t0 = Instant::now();
+
+        render_into(&mut scene, &mut buf, size, t0);
+        scene.on_presented(0, PresentedAt::Commit(Timestamp::from_nanos(1)), t0);
+
+        // Advance past the only target's dwell so no target is current any more.
+        let t_after = t0 + dwell + Duration::from_millis(10);
+        fb_tx
+            .send(Feedback {
+                px_logical: Point2::new(150.0, 50.0),
+                cov_px: Matrix2::identity() * 4.0,
+                calibrated: false,
+                at: Timestamp::from_nanos(2),
+            })
+            .unwrap();
+        let schedule = render_into(&mut scene, &mut buf, size, t_after);
+        assert_eq!(schedule, Schedule::NextFrame);
+        assert_eq!(bgra(&buf, size.0, 150, 50)[3], 0);
     }
 
     #[test]

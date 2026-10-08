@@ -2,19 +2,27 @@ use std::collections::BTreeSet;
 use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eye::config::Config;
+use eye::pipeline::{Pipeline, RayStep};
 use eye::registry::Registry;
 use eye_bench::calibration::{dot_session_fitter, fit_samples, loto, position_key};
 use eye_bench::metrics::{MetricParams, SessionMetrics, compute};
 use eye_bench::runner::replay_session;
 use eye_calibration::correction::UserProfile;
-use eye_calibration::protocol::ProtocolConfig;
+use eye_calibration::protocol::{ProtocolConfig, TargetProtocol, TargetTiming};
 use eye_calibration::store::ProfileStore;
-use eye_calibration::user_fit::{DotSessionFit, FitConfig, ProfileMeta};
+use eye_calibration::user_fit::{DotSessionFit, FitConfig, FitSample, ProfileMeta};
+use eye_core::{CameraInfo, Frame, Rig, Timestamp};
+use eye_geometry::screen::px_logical_to_mm;
+use eye_overlay::ellipse::{cov_mm_to_logical_px, logical_px_per_mm};
+use eye_overlay::targets::{Feedback, FeedbackSender, TargetShown};
+use nalgebra::Point2;
 
-use crate::commands::record::{RecordOptions, RecordSummary, SessionLocation, record_session};
+use crate::commands::record::{
+    PumpObserver, RecordOptions, RecordSummary, SessionLocation, record_session,
+};
 use crate::ctx::Ctx;
 use crate::shutdown;
 
@@ -34,6 +42,256 @@ pub struct Args {
     /// Fit from an existing recording instead of recording a new session
     #[arg(long, value_name = "DIR")]
     pub from: Option<PathBuf>,
+    /// Skip the live gaze feedback dot during recording (for weak machines)
+    #[arg(long)]
+    pub no_feedback: bool,
+}
+
+/// Whether `run` should drive a live `LiveFeedback` observer for this invocation: feedback makes
+/// no sense when fitting from an existing recording, since nothing is shown.
+pub fn wants_feedback(args: &Args) -> bool {
+    !args.no_feedback && args.from.is_none()
+}
+
+/// Target frame period at 30 fps; above this, `rays()` is falling behind and sets start getting skipped.
+const FRAME_PERIOD_30HZ: Duration = Duration::from_nanos(1_000_000_000 / 30);
+
+/// Drives a synchronous `Pipeline` alongside `pump`'s frame loop, refitting the profile after
+/// every completed target and feeding the result back to the target overlay as a `Feedback` point.
+#[derive(Debug)]
+pub struct LiveFeedback {
+    registry: Registry,
+    config: Config,
+    pipeline: Option<Pipeline>,
+    feedback: Option<FeedbackSender>,
+    timing: TargetTiming,
+    fit_cfg: FitConfig,
+    meta: ProfileMeta,
+    current: Option<(Timestamp, Point2<f64>)>,
+    samples: Vec<FitSample>,
+    completed: usize,
+    calibrated: bool,
+    frame_period: Duration,
+    last_rays_duration: Duration,
+    skip_next_set: bool,
+    #[cfg(test)]
+    forced_rays_duration: Option<Duration>,
+}
+
+impl LiveFeedback {
+    pub fn new(
+        registry: Registry,
+        config: Config,
+        timing: TargetTiming,
+        fit_cfg: FitConfig,
+        meta: ProfileMeta,
+    ) -> Self {
+        Self {
+            registry,
+            config,
+            pipeline: None,
+            feedback: None,
+            timing,
+            fit_cfg,
+            meta,
+            current: None,
+            samples: Vec::new(),
+            completed: 0,
+            calibrated: false,
+            frame_period: FRAME_PERIOD_30HZ,
+            last_rays_duration: Duration::ZERO,
+            skip_next_set: false,
+            #[cfg(test)]
+            forced_rays_duration: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_pipeline(
+        pipeline: Pipeline,
+        timing: TargetTiming,
+        fit_cfg: FitConfig,
+        meta: ProfileMeta,
+    ) -> Self {
+        Self {
+            registry: Registry::with_defaults(),
+            config: Config::builtin_default(),
+            pipeline: Some(pipeline),
+            feedback: None,
+            timing,
+            fit_cfg,
+            meta,
+            current: None,
+            samples: Vec::new(),
+            completed: 0,
+            calibrated: false,
+            frame_period: FRAME_PERIOD_30HZ,
+            last_rays_duration: Duration::ZERO,
+            skip_next_set: false,
+            forced_rays_duration: None,
+        }
+    }
+
+    pub fn is_calibrated(&self) -> bool {
+        self.calibrated
+    }
+
+    #[cfg(test)]
+    pub fn force_rays_duration(&mut self, duration: Duration) {
+        self.forced_rays_duration = Some(duration);
+    }
+
+    /// Alternates skipping once `last_rays_duration` exceeds `frame_period`; resets to never-skip
+    /// as soon as processing is caught up again.
+    fn should_skip_set(&mut self) -> bool {
+        if self.last_rays_duration <= self.frame_period {
+            self.skip_next_set = false;
+            return false;
+        }
+        let skip = self.skip_next_set;
+        self.skip_next_set = !skip;
+        skip
+    }
+
+    fn record_rays_duration(&mut self, started: Instant) {
+        #[cfg(test)]
+        if let Some(forced) = self.forced_rays_duration {
+            self.last_rays_duration = forced;
+            return;
+        }
+        self.last_rays_duration = started.elapsed();
+    }
+
+    fn process(&mut self, frame: &Frame) -> anyhow::Result<()> {
+        let pipeline = self
+            .pipeline
+            .as_mut()
+            .expect("prepare() builds the pipeline before any frame is pumped");
+        let Some(set) = pipeline.pair(frame.clone()) else {
+            return Ok(());
+        };
+        if self.should_skip_set() {
+            return Ok(());
+        }
+        let pipeline = self
+            .pipeline
+            .as_mut()
+            .expect("prepare() builds the pipeline before any frame is pumped");
+        let started = Instant::now();
+        let ray_step = pipeline.rays(&set)?;
+        self.record_rays_duration(started);
+        let RayStep::Rays(batch) = ray_step else {
+            return Ok(());
+        };
+        if let Some((onset, target_mm)) = self.current {
+            let elapsed =
+                Duration::from_nanos(batch.timestamp.as_nanos().saturating_sub(onset.as_nanos()));
+            if elapsed >= self.timing.settle && elapsed < self.timing.settle + self.timing.window {
+                self.samples.extend(batch.rays.iter().map(|ray| FitSample {
+                    ray: ray.clone(),
+                    target_mm,
+                }));
+            }
+        }
+        let pipeline = self
+            .pipeline
+            .as_mut()
+            .expect("prepare() builds the pipeline before any frame is pumped");
+        let screen = pipeline.rig().screen().clone();
+        let Some(point) = pipeline.finish(&batch) else {
+            return Ok(());
+        };
+        if let Some(sender) = &self.feedback {
+            let px_per_mm = logical_px_per_mm(&screen);
+            sender.send(Feedback {
+                px_logical: point.px_logical,
+                cov_px: cov_mm_to_logical_px(&point.cov_mm, &px_per_mm),
+                calibrated: self.calibrated,
+                at: point.timestamp,
+            });
+        }
+        Ok(())
+    }
+
+    fn refit(&mut self, target_index: usize) {
+        if self.completed < self.fit_cfg.min_targets_offset {
+            return;
+        }
+        let pipeline = self
+            .pipeline
+            .as_mut()
+            .expect("prepare() builds the pipeline before any target completes");
+        match DotSessionFit::fit_with(
+            &self.samples,
+            pipeline.rig(),
+            &self.fit_cfg,
+            self.meta.clone(),
+        ) {
+            Ok(outcome) => {
+                for report in &outcome.reports {
+                    tracing::info!(
+                        target_index,
+                        eye = ?report.key,
+                        residual_deg = report.rms_after_deg,
+                        "live calibration refit"
+                    );
+                }
+                pipeline.set_correction(Some(Box::new(outcome.profile)));
+                self.calibrated = true;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target_index,
+                    %error,
+                    "live calibration refit failed; keeping the previous correction"
+                );
+            }
+        }
+    }
+}
+
+impl PumpObserver for LiveFeedback {
+    fn wants_feedback(&self) -> bool {
+        true
+    }
+
+    fn attach_feedback(&mut self, sender: FeedbackSender) {
+        self.feedback = Some(sender);
+    }
+
+    fn prepare(&mut self, rig: &Rig, cameras: &[CameraInfo]) -> anyhow::Result<()> {
+        if self.pipeline.is_none() {
+            self.pipeline = Some(Pipeline::from_config(
+                &self.registry,
+                &self.config,
+                rig.clone(),
+                cameras,
+                None,
+            )?);
+        }
+        Ok(())
+    }
+
+    fn on_frame(&mut self, frame: &Frame) -> anyhow::Result<()> {
+        self.process(frame)
+    }
+
+    fn on_shown(&mut self, shown: &TargetShown) {
+        let screen = self
+            .pipeline
+            .as_ref()
+            .expect("prepare() builds the pipeline before any target is shown")
+            .rig()
+            .screen();
+        let target_mm = px_logical_to_mm(screen, &shown.px_logical);
+        self.current = Some((shown.shown_at, target_mm));
+    }
+
+    fn on_hidden(&mut self, index: usize, _at: Timestamp) {
+        self.current = None;
+        self.completed += 1;
+        self.refit(index);
+    }
 }
 
 pub fn parse_calibration_targets(s: &str) -> Result<u32, String> {
@@ -216,24 +474,43 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         args.keep,
         std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
     )?;
+    let meta = ProfileMeta {
+        name: args.profile.clone(),
+        created_unix_s: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        estimator: config.estimate.kind.clone(),
+    };
     if let Some(location) = recording.location() {
         let shutdown_rx = shutdown::install()?;
+        let live_protocol = protocol_for(args.targets, args.dwell_ms);
         let opts = RecordOptions {
-            protocol: Some(protocol_for(args.targets, args.dwell_ms)),
+            protocol: Some(live_protocol),
             duration: None,
         };
-        let summary: RecordSummary = record_session(&config, location, &opts, &shutdown_rx)?;
+        let summary: RecordSummary = if wants_feedback(&args) {
+            let timing = TargetProtocol::new(live_protocol)?.timing();
+            let mut live = LiveFeedback::new(
+                Registry::with_defaults(),
+                config.clone(),
+                timing,
+                FitConfig::default(),
+                meta.clone(),
+            );
+            record_session(&config, location, &opts, &shutdown_rx, &mut live)?
+        } else {
+            record_session(
+                &config,
+                location,
+                &opts,
+                &shutdown_rx,
+                &mut crate::commands::record::NoopObserver,
+            )?
+        };
         anyhow::ensure!(
             !summary.interrupted,
             "calibration interrupted; nothing saved"
         );
     }
     tracing::info!("fitting...");
-    let meta = ProfileMeta {
-        name: args.profile.clone(),
-        created_unix_s: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-        estimator: config.estimate.kind.clone(),
-    };
     let protocol = fit_protocol(&args);
     let result = fit_recording(
         &recording.session_dir(),
@@ -255,14 +532,21 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use clap::{CommandFactory, Parser, error::ErrorKind};
     use eye_bench::testing::{
-        FOUR_BY_FOUR_CENTRES, SyntheticSession, fake_registry, kappa_ray_config,
+        FOUR_BY_FOUR_CENTRES, SyntheticSession, fake_registry, kappa_ray_config, synthetic_rig,
         write_synthetic_session,
     };
+    use eye_core::session::TargetClock;
+    use eye_core::{CameraId, FrameHeader, Illumination, OutputId, PixelFormat};
+    use eye_overlay::targets::TargetEvent;
 
     use super::*;
+    use crate::capture::CaptureMsg;
     use crate::cli::Cli;
+    use crate::commands::record::{RecordSink, pump, target_record};
 
     #[test]
     fn test_args_defaults() {
@@ -312,6 +596,7 @@ mod tests {
             profile: "default".to_string(),
             keep: false,
             from: None,
+            no_feedback: false,
         };
         assert_eq!(fit_protocol(&args), protocol_for(16, Some(5000)));
 
@@ -321,6 +606,7 @@ mod tests {
             profile: "default".to_string(),
             keep: false,
             from: Some(PathBuf::from("d")),
+            no_feedback: false,
         };
         assert_eq!(fit_protocol(&from_args), ProtocolConfig::default());
     }
@@ -521,6 +807,320 @@ mod tests {
         assert_eq!(
             summary_line(&no_expected),
             "9 targets, 2140 samples; expected accuracy (leave-one-target-out): n/a"
+        );
+    }
+
+    #[test]
+    fn test_no_feedback_flag_skips_pipeline() {
+        let cli = Cli::try_parse_from(["eye", "calibrate", "--no-feedback"]).expect("parses");
+        let crate::cli::Command::Calibrate(args) = cli.command else {
+            panic!("expected calibrate subcommand");
+        };
+        assert!(args.no_feedback);
+        assert!(!wants_feedback(&args));
+
+        let cli = Cli::try_parse_from(["eye", "calibrate"]).expect("parses");
+        let crate::cli::Command::Calibrate(args) = cli.command else {
+            panic!("expected calibrate subcommand");
+        };
+        assert!(!args.no_feedback);
+        assert!(wants_feedback(&args));
+
+        let args = Args {
+            targets: 9,
+            dwell_ms: None,
+            profile: "default".to_string(),
+            keep: false,
+            from: Some(PathBuf::from("d")),
+            no_feedback: false,
+        };
+        assert!(!wants_feedback(&args), "a --from fit shows nothing live");
+    }
+
+    struct NullSink;
+
+    impl RecordSink for NullSink {
+        fn frame(&mut self, _frame: &Frame) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn target(&mut self, _record: &eye_core::session::TargetRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn frame_at(seq: u64, t_ns: u64, code: u8) -> Frame {
+        Frame::new(
+            FrameHeader {
+                camera: CameraId::from("ir"),
+                seq,
+                timestamp: Timestamp::from_nanos(t_ns),
+                width: 8,
+                height: 8,
+                format: PixelFormat::Gray8,
+                illumination: Illumination::Unknown,
+            },
+            Arc::from(vec![code; 64]),
+        )
+        .expect("valid frame")
+    }
+
+    fn shown_event(index: usize, at_ns: u64, px: (f64, f64)) -> TargetEvent {
+        TargetEvent::Shown(TargetShown {
+            index,
+            output: OutputId::from("eDP-1"),
+            px_logical: Point2::new(px.0, px.1),
+            shown_at: Timestamp::from_nanos(at_ns),
+            clock: TargetClock::Commit,
+        })
+    }
+
+    fn hidden_event(index: usize, at_ns: u64) -> TargetEvent {
+        TargetEvent::Hidden {
+            index,
+            at: Timestamp::from_nanos(at_ns),
+            clock: TargetClock::Commit,
+        }
+    }
+
+    enum LiveMsg {
+        Frame(CaptureMsg),
+        Target(TargetEvent),
+    }
+
+    /// A `Shown`/frames.../`Hidden` sequence for each target in order: `frames_per_target` frames
+    /// spaced through the window, coded for `test-target-code` (pixel = index + 1), in a single
+    /// chronological stream (`run_live_session` delivers it to `pump`'s two channels one message
+    /// at a time, so `select!` cannot reorder a target event ahead of or behind its frames).
+    fn live_session(
+        targets_px: &[(f64, f64)],
+        timing: TargetTiming,
+        frames_per_target: u64,
+    ) -> Vec<LiveMsg> {
+        let dwell_ns = timing.dwell.as_nanos() as u64;
+        let settle_ns = timing.settle.as_nanos() as u64;
+        let window_ns = timing.window.as_nanos() as u64;
+        let step_ns = (window_ns / frames_per_target.max(1)).max(1);
+        let mut out = Vec::new();
+        let mut seq = 0u64;
+        for (k, &px) in targets_px.iter().enumerate() {
+            let onset_ns = k as u64 * dwell_ns;
+            out.push(LiveMsg::Target(shown_event(k, onset_ns, px)));
+            for i in 0..frames_per_target {
+                let t = onset_ns + settle_ns + i * step_ns;
+                out.push(LiveMsg::Frame(CaptureMsg::Frame(frame_at(
+                    seq,
+                    t,
+                    (k + 1) as u8,
+                ))));
+                seq += 1;
+            }
+            out.push(LiveMsg::Target(hidden_event(k, onset_ns + dwell_ns)));
+        }
+        out.push(LiveMsg::Target(TargetEvent::Finished));
+        out
+    }
+
+    fn run_live_session(
+        live: &mut LiveFeedback,
+        messages: Vec<LiveMsg>,
+    ) -> crossbeam_channel::Receiver<Feedback> {
+        let mut sink = NullSink;
+        run_live_session_with_sink(live, messages, &mut sink)
+    }
+
+    fn run_live_session_with_sink(
+        live: &mut LiveFeedback,
+        messages: Vec<LiveMsg>,
+        sink: &mut dyn RecordSink,
+    ) -> crossbeam_channel::Receiver<Feedback> {
+        let (fb_tx, fb_rx) = crossbeam_channel::unbounded();
+        live.attach_feedback(FeedbackSender::new(fb_tx));
+
+        let (frames_tx, frames_rx) = crossbeam_channel::bounded::<CaptureMsg>(0);
+        let (targets_tx, targets_rx) = crossbeam_channel::bounded::<TargetEvent>(0);
+        let sender = std::thread::spawn(move || {
+            for msg in messages {
+                match msg {
+                    LiveMsg::Frame(frame) => frames_tx.send(frame).unwrap(),
+                    LiveMsg::Target(event) => targets_tx.send(event).unwrap(),
+                }
+            }
+        });
+
+        let screen = synthetic_rig().screen().clone();
+        let to_record =
+            move |s: &TargetShown, hidden: Option<Timestamp>| target_record(s, hidden, &screen);
+        let end = pump(
+            &frames_rx,
+            &targets_rx,
+            &crossbeam_channel::never(),
+            &crossbeam_channel::never(),
+            &to_record,
+            sink,
+            live,
+        )
+        .expect("pump finishes");
+        sender.join().unwrap();
+        assert_eq!(end, crate::commands::record::PumpEnd::Finished);
+        fb_rx
+    }
+
+    fn px_error(fb: &Feedback, target_px: Point2<f64>) -> f64 {
+        (fb.px_logical - target_px).norm()
+    }
+
+    #[test]
+    fn test_refit_after_min_targets_applies_correction() {
+        let three = FOUR_BY_FOUR_CENTRES[..3].to_vec();
+        let targets_px: Vec<(f64, f64)> = three.iter().chain(three.iter()).copied().collect();
+        let config = kappa_ray_config(&targets_px, [3.0, -1.0], None);
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let timing = TargetProtocol::new(ProtocolConfig::default())
+            .unwrap()
+            .timing();
+        let fit_cfg = FitConfig::default();
+        let mut live =
+            LiveFeedback::with_pipeline(pipeline, timing, fit_cfg, ProfileMeta::default());
+
+        let frames_per_target = (fit_cfg.min_samples_per_target * 2) as u64;
+        let messages = live_session(&targets_px, timing, frames_per_target);
+        let fb_rx = run_live_session(&mut live, messages);
+
+        let feedback: Vec<Feedback> = fb_rx.try_iter().collect();
+        assert!(!feedback.is_empty());
+        assert!(live.is_calibrated());
+
+        let dwell_ns = timing.dwell.as_nanos() as u64;
+        let mut before_errors = Vec::new();
+        let mut after_errors = Vec::new();
+        for fb in &feedback {
+            let index = (fb.at.as_nanos() / dwell_ns) as usize;
+            let target_px = Point2::new(targets_px[index].0, targets_px[index].1);
+            let error = px_error(fb, target_px);
+            assert_eq!(
+                fb.calibrated,
+                index >= fit_cfg.min_targets_offset,
+                "feedback for target {index} has calibrated={} but min_targets_offset={}",
+                fb.calibrated,
+                fit_cfg.min_targets_offset
+            );
+            if fb.calibrated {
+                after_errors.push(error);
+            } else {
+                before_errors.push(error);
+            }
+        }
+        assert!(!before_errors.is_empty(), "expected uncalibrated feedback");
+        assert!(!after_errors.is_empty(), "expected calibrated feedback");
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        assert!(
+            mean(&after_errors) < mean(&before_errors),
+            "calibrated mean {} not below uncalibrated mean {}",
+            mean(&after_errors),
+            mean(&before_errors)
+        );
+    }
+
+    #[test]
+    fn test_refit_failure_keeps_previous_correction() {
+        let targets_px = FOUR_BY_FOUR_CENTRES[..3].to_vec();
+        let config = kappa_ray_config(&targets_px, [3.0, -1.0], None);
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let timing = TargetProtocol::new(ProtocolConfig::default())
+            .unwrap()
+            .timing();
+        let fit_cfg = FitConfig::default();
+        let mut live =
+            LiveFeedback::with_pipeline(pipeline, timing, fit_cfg, ProfileMeta::default());
+
+        let frames_per_target = (fit_cfg.min_samples_per_target * 2) as u64;
+        let messages = live_session(&targets_px, timing, frames_per_target);
+        let fb_rx = run_live_session(&mut live, messages);
+        assert!(live.is_calibrated(), "setup: expected a successful refit");
+        fb_rx.try_iter().for_each(drop);
+
+        let probe = frame_at(90_000, 90_000_000_000, 1);
+        live.process(&probe).expect("process succeeds");
+        let before = fb_rx.try_recv().expect("feedback for the probe frame");
+        assert!(before.calibrated);
+
+        live.samples.clear();
+        live.refit(99);
+        assert!(
+            live.is_calibrated(),
+            "a failed refit must not clear an existing correction"
+        );
+
+        live.process(&probe).expect("process succeeds");
+        let after = fb_rx
+            .try_recv()
+            .expect("feedback for the repeated probe frame");
+        assert!(after.calibrated);
+        assert_eq!(
+            after.px_logical, before.px_logical,
+            "the correction changed even though the refit failed"
+        );
+        assert_eq!(after.cov_px, before.cov_px);
+    }
+
+    struct CountingSink {
+        frames: usize,
+    }
+
+    impl RecordSink for CountingSink {
+        fn frame(&mut self, _frame: &Frame) -> anyhow::Result<()> {
+            self.frames += 1;
+            Ok(())
+        }
+
+        fn target(&mut self, _record: &eye_core::session::TargetRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_slow_rays_skips_sets_but_sink_still_sees_every_frame() {
+        let targets_px = FOUR_BY_FOUR_CENTRES[..1].to_vec();
+        let config = kappa_ray_config(&targets_px, [3.0, -1.0], None);
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let timing = TargetProtocol::new(ProtocolConfig::default())
+            .unwrap()
+            .timing();
+        let fit_cfg = FitConfig::default();
+        let mut live =
+            LiveFeedback::with_pipeline(pipeline, timing, fit_cfg, ProfileMeta::default());
+        live.force_rays_duration(Duration::from_millis(100));
+
+        let frames_per_target = 6u64;
+        let messages = live_session(&targets_px, timing, frames_per_target);
+        let frame_count = messages
+            .iter()
+            .filter(|m| matches!(m, LiveMsg::Frame(_)))
+            .count();
+
+        let mut sink = CountingSink { frames: 0 };
+        let fb_rx = run_live_session_with_sink(&mut live, messages, &mut sink);
+
+        assert_eq!(
+            sink.frames, frame_count,
+            "every frame must still reach the RecordSink regardless of processing skips"
+        );
+        let feedback: Vec<Feedback> = fb_rx.try_iter().collect();
+        assert!(
+            feedback.len() < frame_count,
+            "a slow observer must skip processing some sets ({} feedback for {} frames)",
+            feedback.len(),
+            frame_count
         );
     }
 }
