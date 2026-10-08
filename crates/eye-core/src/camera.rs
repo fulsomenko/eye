@@ -35,6 +35,17 @@ pub enum Illumination {
     Unknown,
 }
 
+impl Illumination {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ambient => "ambient",
+            Self::IrLit => "ir_lit",
+            Self::IrDark => "ir_dark",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CameraInfo {
     pub id: CameraId,
@@ -74,6 +85,21 @@ mod tests {
         );
         let parsed: Illumination = serde_json::from_str("\"ir_dark\"").unwrap();
         assert_eq!(parsed, Illumination::IrDark);
+    }
+
+    #[test]
+    fn test_illumination_as_str_equals_serde_name() {
+        for value in [
+            Illumination::Ambient,
+            Illumination::IrLit,
+            Illumination::IrDark,
+            Illumination::Unknown,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&value).unwrap(),
+                format!("\"{}\"", value.as_str())
+            );
+        }
     }
 
     #[test]

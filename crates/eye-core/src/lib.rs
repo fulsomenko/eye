@@ -12,6 +12,7 @@ mod time;
 
 pub mod grid;
 pub mod image;
+pub mod log;
 pub mod observation;
 pub mod session;
 pub mod stage;
