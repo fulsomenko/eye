@@ -322,6 +322,7 @@ impl TestRegistry {
     pub fn builtin() -> Self {
         let mut r = Self::empty();
         crate::selftest::register(&mut r);
+        crate::hw::register(&mut r);
         r
     }
 
@@ -389,5 +390,48 @@ mod tests {
             Err(TestError::TimedOut(d)) => assert_eq!(d, Duration::from_secs(30)),
             other => panic!("expected TimedOut, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_hw_cases_registered_with_needs() {
+        let r = TestRegistry::builtin();
+        for name in [
+            "opens",
+            "measured_fps",
+            "monotonic_timestamps",
+            "frame_format",
+            "ir_alternation",
+            "emitter_toggle",
+            "dual_sync",
+        ] {
+            assert!(r.get(name).is_some(), "missing {name}");
+        }
+
+        let empty = toml::Table::new();
+        let opens = (r.get("opens").unwrap().factory)(&empty).unwrap();
+        assert!(opens.needs().any_stream);
+
+        let ir_alternation = (r.get("ir_alternation").unwrap().factory)(&empty).unwrap();
+        assert!(ir_alternation.needs().ir);
+
+        let emitter_toggle = (r.get("emitter_toggle").unwrap().factory)(&empty).unwrap();
+        assert_eq!(
+            emitter_toggle.needs(),
+            Needs {
+                ir: true,
+                emitter: true,
+                ..Needs::default()
+            }
+        );
+
+        let dual_sync = (r.get("dual_sync").unwrap().factory)(&empty).unwrap();
+        assert_eq!(
+            dual_sync.needs(),
+            Needs {
+                rgb: true,
+                ir: true,
+                ..Needs::default()
+            }
+        );
     }
 }

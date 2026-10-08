@@ -160,6 +160,12 @@ impl FakeSession {
             .push_back(s);
         self
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_meta(self, m: Box<dyn IlluminationMeta>) -> Self {
+        self.meta.lock().unwrap().push_back(m);
+        self
+    }
 }
 
 impl ModeSession for FakeSession {
@@ -337,6 +343,164 @@ fn build_needs_rgb(_: &toml::Table) -> Result<Box<dyn TestCase>, ParamError> {
 
 fn build_read_emitter(_: &toml::Table) -> Result<Box<dyn TestCase>, ParamError> {
     Ok(Box::new(ReadEmitterCase))
+}
+
+#[allow(dead_code)]
+pub(crate) const P: u64 = 33_333_333;
+
+/// 64x36 Gray8 frames, seq `start_seq + k`, timestamp `start_ns + k * period_ns`, gray value `value(seq)`.
+pub(crate) fn synth_gray(
+    camera: &str,
+    n: usize,
+    start_seq: u64,
+    start_ns: u64,
+    period_ns: u64,
+    value: impl Fn(u64) -> u8,
+) -> Vec<Frame> {
+    (0..n as u64)
+        .map(|k| {
+            let seq = start_seq + k;
+            gray_frame(camera, seq, start_ns + k * period_ns, 64, 36, value(seq))
+        })
+        .collect()
+}
+
+/// MJPG frames (`FF D8 00 00 FF D9`) at the given timestamps, seqs from 0.
+pub(crate) fn mjpeg_at(camera: &str, t_ns: &[u64], width: u32, height: u32) -> Vec<Frame> {
+    t_ns.iter()
+        .enumerate()
+        .map(|(seq, &t)| mjpeg_frame(camera, seq as u64, t, width, height))
+        .collect()
+}
+
+pub(crate) fn synth_mjpeg(
+    camera: &str,
+    n: usize,
+    start_seq: u64,
+    start_ns: u64,
+    period_ns: u64,
+) -> Vec<Frame> {
+    (0..n as u64)
+        .map(|k| mjpeg_frame(camera, start_seq + k, start_ns + k * period_ns, 64, 36))
+        .collect()
+}
+
+/// `FakeSource` with `camera_info` from the first frame.
+pub(crate) fn boxed(frames: Vec<Frame>) -> Box<dyn FrameSource> {
+    let info = frames
+        .first()
+        .map(|f| {
+            let h = f.header();
+            camera_info(h.camera.as_str(), h.format, h.width, h.height)
+        })
+        .unwrap_or_else(|| camera_info("none", PixelFormat::Gray8, 1, 1));
+    Box::new(FakeSource {
+        info,
+        frames: frames.into(),
+    })
+}
+
+/// Rewrites each frame's timestamp to `Timestamp::now() - age` when it is handed out.
+#[derive(Debug)]
+pub(crate) struct LiveStampedSource {
+    pub inner: FakeSource,
+    pub age: Duration,
+}
+
+impl FrameSource for LiveStampedSource {
+    fn camera(&self) -> &CameraInfo {
+        self.inner.camera()
+    }
+
+    fn next_frame(&mut self) -> Result<Frame, CaptureError> {
+        let frame = self.inner.next_frame()?;
+        let (mut header, data) = frame.into_parts();
+        header.timestamp = Timestamp(Timestamp::now().0.saturating_sub(self.age));
+        Frame::new(header, data).map_err(|e| CaptureError::Io {
+            camera: self.inner.info.id.to_string(),
+            source: std::io::Error::other(e.to_string()),
+        })
+    }
+}
+
+/// Endless (until `remaining` hits 0) 64x36 IR source that alternates 0/46 (odd seqs lit) while
+/// `mode >= 2`, else constant 3; 66_666_666 ns period (15 fps).
+#[derive(Debug)]
+pub(crate) struct EmitterAwareSource {
+    pub mode: Arc<AtomicU8>,
+    pub seq: u64,
+    pub remaining: usize,
+}
+
+impl FrameSource for EmitterAwareSource {
+    fn camera(&self) -> &CameraInfo {
+        unreachable!("EmitterAwareSource.camera() is unused by the cases that consume it")
+    }
+
+    fn next_frame(&mut self) -> Result<Frame, CaptureError> {
+        if self.remaining == 0 {
+            return Err(CaptureError::EndOfStream);
+        }
+        self.remaining -= 1;
+        let seq = self.seq;
+        self.seq += 1;
+        let on = self.mode.load(Ordering::SeqCst) >= 2;
+        let value = if on {
+            if seq % 2 == 1 { 46 } else { 0 }
+        } else {
+            3
+        };
+        Ok(gray_frame("ir", seq, seq * 66_666_666, 64, 36, value))
+    }
+}
+
+/// Metadata stream that pops scripted records, then `Err(CaptureError::EndOfStream)`.
+#[derive(Debug)]
+pub(crate) struct FakeMeta {
+    pub records: VecDeque<MetaRecord>,
+}
+
+impl IlluminationMeta for FakeMeta {
+    fn next_record(&mut self) -> Result<MetaRecord, CaptureError> {
+        self.records.pop_front().ok_or(CaptureError::EndOfStream)
+    }
+}
+
+fn target(s: &str) -> StreamTarget {
+    StreamTarget {
+        node: PathBuf::from(if s == RGB_TARGET {
+            "/dev/video0"
+        } else {
+            "/dev/video2"
+        }),
+        format: s.parse().expect("valid testkit target"),
+    }
+}
+
+/// rgb `RGB_TARGET` on `/dev/video0`.
+pub(crate) fn mode_rgb() -> Mode {
+    Mode {
+        emitter: EmitterSetting::Keep,
+        rgb: Some(target(RGB_TARGET)),
+        ir: None,
+    }
+}
+
+/// ir `IR_TARGET` on `/dev/video2`.
+pub(crate) fn mode_ir(emitter: EmitterSetting) -> Mode {
+    Mode {
+        emitter,
+        rgb: None,
+        ir: Some(target(IR_TARGET)),
+    }
+}
+
+pub(crate) fn mode_dual(emitter: EmitterSetting) -> Mode {
+    Mode {
+        emitter,
+        rgb: Some(target(RGB_TARGET)),
+        ir: Some(target(IR_TARGET)),
+    }
 }
 
 fn testkit_registry() -> TestRegistry {
