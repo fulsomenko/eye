@@ -1,1 +1,671 @@
+use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
+use eye_core::{CameraId, CameraInfo, Frame, FrameHeader, Illumination, PixelFormat, Timestamp};
+use v4l::{
+    Device, Format, FourCC,
+    buffer::Flags,
+    io::traits::CaptureStream,
+    video::{Capture, capture::Parameters},
+};
+
+use crate::{CaptureError, source::FrameSource};
+
+fn default_fps() -> u32 {
+    30
+}
+
+fn default_buffers() -> u32 {
+    4
+}
+
+fn default_timeout_ms() -> u64 {
+    500
+}
+
+#[derive(Debug, Clone)]
+pub struct V4l2Config {
+    pub id: CameraId,
+    pub device: PathBuf,
+    pub format: PixelFormat,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub buffers: u32,
+    pub timeout: Duration,
+}
+
+impl V4l2Config {
+    /// fps 30, buffers 4, timeout 500 ms.
+    pub fn new(
+        id: CameraId,
+        device: PathBuf,
+        format: PixelFormat,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        Self {
+            id,
+            device,
+            format,
+            width,
+            height,
+            fps: default_fps(),
+            buffers: default_buffers(),
+            timeout: Duration::from_millis(default_timeout_ms()),
+        }
+    }
+}
+
+pub struct V4l2Source {
+    info: CameraInfo,
+    path: PathBuf,
+    stride: u32,
+    timeout: Duration,
+    stream: v4l::io::mmap::Stream<'static>,
+    seq: SeqWidener,
+}
+
+impl std::fmt::Debug for V4l2Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("V4l2Source")
+            .field("info", &self.info)
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl V4l2Source {
+    pub fn open(config: V4l2Config) -> Result<Self, CaptureError> {
+        let V4l2Config {
+            id,
+            device,
+            format,
+            width,
+            height,
+            fps,
+            buffers,
+            timeout,
+        } = config;
+
+        let fourcc = fourcc_for(format).ok_or_else(|| CaptureError::UnsupportedFormat {
+            path: device.clone(),
+            format: format!("{format:?}"),
+        })?;
+
+        let dev = Device::with_path(&device).map_err(|source| CaptureError::Open {
+            path: device.clone(),
+            source,
+        })?;
+
+        let requested = Format::new(width, height, fourcc);
+        let actual =
+            Capture::set_format(&dev, &requested).map_err(|source| CaptureError::Open {
+                path: device.clone(),
+                source,
+            })?;
+        if actual.width != width || actual.height != height || actual.fourcc != fourcc {
+            return Err(CaptureError::FormatRejected {
+                path: device,
+                requested: format!("{width}x{height} {fourcc}"),
+                actual: format!("{}x{} {}", actual.width, actual.height, actual.fourcc),
+            });
+        }
+
+        let params = Capture::set_params(&dev, &Parameters::with_fps(fps)).map_err(|source| {
+            CaptureError::Open {
+                path: device.clone(),
+                source,
+            }
+        })?;
+        let frame_interval = Duration::from_secs_f64(
+            f64::from(params.interval.numerator) / f64::from(params.interval.denominator),
+        );
+
+        let mut stream: v4l::io::mmap::Stream<'static> =
+            v4l::io::mmap::Stream::with_buffers(&dev, v4l::buffer::Type::VideoCapture, buffers)
+                .map_err(|source| CaptureError::Open {
+                    path: device.clone(),
+                    source,
+                })?;
+        stream.set_timeout(timeout);
+
+        let stride = if actual.stride == 0 {
+            width
+        } else {
+            actual.stride
+        };
+
+        Ok(Self {
+            info: CameraInfo {
+                id,
+                width,
+                height,
+                format,
+                frame_interval,
+            },
+            path: device,
+            stride,
+            timeout,
+            stream,
+            seq: SeqWidener::default(),
+        })
+    }
+
+    /// Typed camera constructor (R3: frame sources are not registered). `options` is the
+    /// `[[camera]]` table minus `id`/`source`/`emitter`.
+    pub fn from_config(id: CameraId, options: &toml::Table) -> Result<Self, CaptureError> {
+        Self::open(V4l2Options::parse(&id, options)?.into_config(id))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V4l2Options {
+    pub device: PathBuf,
+    pub format: CaptureFormat,
+    pub size: [u32; 2],
+    #[serde(default = "default_fps")]
+    pub fps: u32,
+    #[serde(default = "default_buffers")]
+    pub buffers: u32,
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureFormat {
+    Mjpeg,
+    Gray,
+}
+
+impl V4l2Options {
+    pub fn parse(id: &CameraId, options: &toml::Table) -> Result<Self, CaptureError> {
+        options
+            .clone()
+            .try_into()
+            .map_err(|e: toml::de::Error| CaptureError::Config {
+                camera: id.to_string(),
+                reason: e.to_string(),
+            })
+    }
+
+    pub fn into_config(self, id: CameraId) -> V4l2Config {
+        let format = match self.format {
+            CaptureFormat::Mjpeg => PixelFormat::Mjpeg,
+            CaptureFormat::Gray => PixelFormat::Gray8,
+        };
+        V4l2Config {
+            id,
+            device: self.device,
+            format,
+            width: self.size[0],
+            height: self.size[1],
+            fps: self.fps,
+            buffers: self.buffers,
+            timeout: Duration::from_millis(self.timeout_ms),
+        }
+    }
+}
+
+impl FrameSource for V4l2Source {
+    fn camera(&self) -> &CameraInfo {
+        &self.info
+    }
+
+    fn next_frame(&mut self) -> Result<Frame, CaptureError> {
+        const ENODEV: i32 = 19;
+        let camera = self.info.id.to_string();
+        loop {
+            let (buf, meta) = match CaptureStream::next(&mut self.stream) {
+                Ok(next) => next,
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    return Err(CaptureError::Timeout {
+                        camera,
+                        timeout: self.timeout,
+                    });
+                }
+                Err(e) if e.raw_os_error() == Some(ENODEV) => {
+                    return Err(CaptureError::Disconnected { camera });
+                }
+                Err(source) => return Err(CaptureError::Io { camera, source }),
+            };
+            check_clock(meta.flags).map_err(|flags| CaptureError::NotMonotonic {
+                camera: camera.clone(),
+                flags,
+            })?;
+            if meta.flags.contains(Flags::ERROR) {
+                tracing::warn!(%camera, sequence = meta.sequence, "driver flagged a corrupt buffer");
+                continue;
+            }
+            let used = (meta.bytesused as usize).min(buf.len());
+            let payload = match self.info.format {
+                PixelFormat::Mjpeg => mjpeg_payload(buf, used),
+                _ => gray_payload(buf, used, self.info.width, self.info.height, self.stride),
+            };
+            let Some(data) = payload else {
+                tracing::warn!(%camera, sequence = meta.sequence, used, "dropping short or invalid frame");
+                continue;
+            };
+            let header = FrameHeader {
+                camera: self.info.id.clone(),
+                seq: self.seq.widen(meta.sequence),
+                timestamp: to_timestamp(meta.timestamp),
+                width: self.info.width,
+                height: self.info.height,
+                format: self.info.format,
+                illumination: match self.info.format {
+                    PixelFormat::Mjpeg => Illumination::Ambient,
+                    _ => Illumination::Unknown,
+                },
+            };
+            return Ok(Frame::new(header, data)?);
+        }
+    }
+}
+
+pub(crate) fn fourcc_for(format: PixelFormat) -> Option<FourCC> {
+    match format {
+        PixelFormat::Gray8 => Some(FourCC::new(b"GREY")),
+        PixelFormat::Mjpeg => Some(FourCC::new(b"MJPG")),
+        PixelFormat::Rgb8 => None,
+    }
+}
+
+pub(crate) fn check_clock(flags: v4l::buffer::Flags) -> Result<(), u32> {
+    if flags.bits() & Flags::TIMESTAMP_MASK.bits() == Flags::TIMESTAMP_MONOTONIC.bits() {
+        Ok(())
+    } else {
+        Err(flags.bits())
+    }
+}
+
+pub(crate) fn to_timestamp(ts: v4l::Timestamp) -> Timestamp {
+    Timestamp(Duration::from(ts))
+}
+
+pub(crate) fn gray_payload(
+    buf: &[u8],
+    used: usize,
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Option<Arc<[u8]>> {
+    let (w, h, s) = (width as usize, height as usize, stride as usize);
+    if h == 0 || s < w || used < s * (h - 1) + w {
+        return None;
+    }
+    if s == w {
+        return Some(Arc::from(&buf[..w * h]));
+    }
+    let mut packed = Vec::with_capacity(w * h);
+    for row in buf[..used].chunks(s).take(h) {
+        packed.extend_from_slice(&row[..w]);
+    }
+    Some(packed.into())
+}
+
+pub(crate) fn mjpeg_payload(buf: &[u8], used: usize) -> Option<Arc<[u8]>> {
+    let b = buf.get(..used)?;
+    b.starts_with(&[0xFF, 0xD8]).then(|| Arc::from(b))
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SeqWidener {
+    last: Option<u32>,
+    high: u64,
+}
+
+impl SeqWidener {
+    pub fn widen(&mut self, seq: u32) -> u64 {
+        if let Some(last) = self.last
+            && seq < last
+            && last - seq > u32::MAX / 2
+        {
+            self.high += 1 << 32;
+        }
+        self.last = Some(seq);
+        self.high | u64::from(seq)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn test_v4l_timestamp_converts_to_duration() {
+        assert_eq!(
+            to_timestamp(v4l::Timestamp::new(5, 250_000)),
+            Timestamp(Duration::from_micros(5_250_000))
+        );
+    }
+
+    #[test]
+    fn test_monotonic_timestamp_flags_are_accepted() {
+        assert!(check_clock(Flags::from(0x0001_2001)).is_ok());
+    }
+
+    #[test]
+    fn test_unknown_timestamp_type_is_rejected() {
+        assert_eq!(check_clock(Flags::from(0x0000_0001)), Err(1));
+    }
+
+    #[test]
+    fn test_copy_timestamp_type_is_rejected() {
+        assert_eq!(check_clock(Flags::from(0x4000)), Err(0x4000));
+    }
+
+    #[test]
+    fn test_sequence_widening_crosses_u32_wrap() {
+        let mut widener = SeqWidener::default();
+        assert_eq!(widener.widen(0xFFFF_FFFE), 4_294_967_294);
+        assert_eq!(widener.widen(0xFFFF_FFFF), 4_294_967_295);
+        assert_eq!(widener.widen(0), 4_294_967_296);
+        assert_eq!(widener.widen(1), 4_294_967_297);
+    }
+
+    #[test]
+    fn test_sequence_gap_is_preserved() {
+        let mut widener = SeqWidener::default();
+        assert_eq!(widener.widen(10), 10);
+        assert_eq!(widener.widen(12), 12);
+        assert_eq!(widener.widen(13), 13);
+    }
+
+    #[test]
+    fn test_gray_payload_copies_exact_image_from_larger_buffer() {
+        let len = 640 * 360 + 4096;
+        let buf: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let used = 640 * 360;
+        let payload = gray_payload(&buf, used, 640, 360, 640).unwrap();
+        assert_eq!(payload.len(), 230_400);
+        assert_eq!(&*payload, &buf[..230_400]);
+    }
+
+    #[test]
+    fn test_gray_payload_repacks_padded_stride() {
+        let buf: [u8; 18] = [1, 1, 1, 1, 9, 9, 2, 2, 2, 2, 9, 9, 3, 3, 3, 3, 9, 9];
+        let payload = gray_payload(&buf, 18, 4, 3, 6).unwrap();
+        assert_eq!(&*payload, &[1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]);
+
+        let payload = gray_payload(&buf, 16, 4, 3, 6);
+        assert!(payload.is_some());
+    }
+
+    #[test]
+    fn test_short_gray_frame_is_dropped() {
+        let buf = vec![0u8; 640 * 360];
+        let used = 640 * 359;
+        assert!(gray_payload(&buf, used, 640, 360, 640).is_none());
+    }
+
+    #[test]
+    fn test_mjpeg_payload_truncates_to_bytesused() {
+        let buf: [u8; 13] = [
+            0xFF, 0xD8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xFF, 0xD9, 0x00, 0x00, 0x00,
+        ];
+        let payload = mjpeg_payload(&buf, 10).unwrap();
+        assert_eq!(&*payload, &buf[..10]);
+    }
+
+    #[test]
+    fn test_mjpeg_without_soi_is_dropped() {
+        let buf: [u8; 4] = [0x00, 0x00, 0xFF, 0xD9];
+        assert!(mjpeg_payload(&buf, 4).is_none());
+        assert!(mjpeg_payload(&buf, 0).is_none());
+    }
+
+    #[test]
+    fn test_options_parse_root_example_camera() {
+        let toml_str = r#"
+            device = "/dev/video2"
+            format = "gray"
+            size = [640, 360]
+        "#;
+        let table: toml::Table = toml_str.parse().unwrap();
+        let options: V4l2Options = table.try_into().unwrap();
+        assert_eq!(options.fps, 30);
+        assert_eq!(options.buffers, 4);
+        assert_eq!(options.timeout_ms, 500);
+
+        let config = options.into_config(CameraId::from("ir"));
+        assert_eq!(config.format, PixelFormat::Gray8);
+        assert_eq!(config.width, 640);
+        assert_eq!(config.height, 360);
+        assert_eq!(config.timeout, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn test_options_reject_unknown_key() {
+        let toml_str = r#"
+            device = "/dev/video2"
+            format = "gray"
+            size = [640, 360]
+            exposure = 3
+        "#;
+        let table: toml::Table = toml_str.parse().unwrap();
+        let result = V4l2Source::from_config(CameraId::from("ir"), &table);
+        assert!(matches!(result, Err(CaptureError::Config { ref camera, .. }) if camera == "ir"));
+    }
+
+    #[test]
+    fn test_fourcc_mapping() {
+        assert_eq!(fourcc_for(PixelFormat::Gray8), Some(FourCC::new(b"GREY")));
+        assert_eq!(fourcc_for(PixelFormat::Mjpeg), Some(FourCC::new(b"MJPG")));
+        assert_eq!(fourcc_for(PixelFormat::Rgb8), None);
+    }
+
+    #[test]
+    fn test_open_rejects_rgb8_before_touching_device() {
+        let config = V4l2Config::new(
+            CameraId::from("rgb"),
+            PathBuf::from("/nonexistent"),
+            PixelFormat::Rgb8,
+            640,
+            360,
+        );
+        let result = V4l2Source::open(config);
+        assert!(matches!(
+            result,
+            Err(CaptureError::UnsupportedFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn test_open_missing_device_is_open_error() {
+        let config = V4l2Config::new(
+            CameraId::from("ir"),
+            PathBuf::from("/dev/video-does-not-exist"),
+            PixelFormat::Gray8,
+            640,
+            360,
+        );
+        let result = V4l2Source::open(config);
+        assert!(matches!(
+            result,
+            Err(CaptureError::Open { ref path, .. }) if path == Path::new("/dev/video-does-not-exist")
+        ));
+    }
+
+    #[test]
+    fn test_v4l2_source_is_send() {
+        fn f<T: Send>() {}
+        f::<V4l2Source>();
+    }
+
+    #[test]
+    #[ignore = "needs hardware"]
+    fn test_ir_node_streams_gray_640x360() {
+        let config = V4l2Config::new(
+            CameraId::from("ir"),
+            PathBuf::from("/dev/video2"),
+            PixelFormat::Gray8,
+            640,
+            360,
+        );
+        let mut source = V4l2Source::open(config).unwrap();
+        let mut timestamps = Vec::new();
+        for _ in 0..30 {
+            let frame = source.next_frame().unwrap();
+            assert_eq!(frame.data().len(), 230_400);
+            assert_eq!(frame.header().format, PixelFormat::Gray8);
+            assert_eq!(frame.header().illumination, Illumination::Unknown);
+            timestamps.push(frame.header().timestamp);
+        }
+        let interval = source.camera().frame_interval;
+        assert!((interval.as_secs_f64() - 0.033_333).abs() < 0.001);
+    }
+
+    #[test]
+    #[ignore = "needs hardware"]
+    fn test_rgb_node_streams_mjpeg_1280x720() {
+        let config = V4l2Config::new(
+            CameraId::from("rgb"),
+            PathBuf::from("/dev/video0"),
+            PixelFormat::Mjpeg,
+            1280,
+            720,
+        );
+        let mut source = V4l2Source::open(config).unwrap();
+        let mut timestamps = Vec::new();
+        for _ in 0..30 {
+            let frame = source.next_frame().unwrap();
+            assert!(frame.data().starts_with(&[0xFF, 0xD8]));
+            timestamps.push(frame.header().timestamp);
+        }
+        let median = median_delta_ms(&timestamps);
+        assert!((30.0..=36.0).contains(&median), "median delta {median} ms");
+    }
+
+    #[test]
+    #[ignore = "needs hardware"]
+    fn test_buffer_timestamps_are_monotonic() {
+        let config = V4l2Config::new(
+            CameraId::from("ir"),
+            PathBuf::from("/dev/video2"),
+            PixelFormat::Gray8,
+            640,
+            360,
+        );
+        let mut source = V4l2Source::open(config).unwrap();
+        let mut timestamps = Vec::new();
+        for _ in 0..30 {
+            let frame = source.next_frame().unwrap();
+            timestamps.push(frame.header().timestamp);
+        }
+        for w in timestamps.windows(2) {
+            assert!(w[1] > w[0]);
+        }
+        let median = median_delta_ms(&timestamps);
+        println!("median IR delta: {median} ms");
+        assert!((60.0..=72.0).contains(&median), "median delta {median} ms");
+    }
+
+    #[test]
+    #[ignore = "needs hardware"]
+    fn test_sequence_is_consecutive_under_light_load() {
+        let config = V4l2Config::new(
+            CameraId::from("ir"),
+            PathBuf::from("/dev/video2"),
+            PixelFormat::Gray8,
+            640,
+            360,
+        );
+        let mut source = V4l2Source::open(config).unwrap();
+        let mut seqs = Vec::new();
+        for _ in 0..60 {
+            let frame = source.next_frame().unwrap();
+            seqs.push(frame.header().seq);
+        }
+        let consecutive = seqs.windows(2).filter(|w| w[1] - w[0] == 1).count();
+        assert!(
+            consecutive >= 58,
+            "only {consecutive} of 59 deltas were consecutive"
+        );
+    }
+
+    struct SetOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+
+    impl Drop for SetOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs hardware"]
+    fn test_rgb_and_ir_stream_simultaneously() {
+        let (ir_started_tx, ir_started_rx) = std::sync::mpsc::channel::<()>();
+        let rgb_done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let ir = scope.spawn(|| {
+                let ir_started_tx = ir_started_tx;
+                let config = V4l2Config::new(
+                    CameraId::from("ir"),
+                    PathBuf::from("/dev/video2"),
+                    PixelFormat::Gray8,
+                    640,
+                    360,
+                );
+                let mut source = V4l2Source::open(config).unwrap();
+                let mut timestamps = Vec::new();
+                timestamps.push(source.next_frame().unwrap().header().timestamp);
+                ir_started_tx.send(()).unwrap();
+                for _ in 0..19 {
+                    timestamps.push(source.next_frame().unwrap().header().timestamp);
+                }
+                // Keep dequeuing after our 20 frames: if IR stops streaming
+                // before RGB's 20 frames arrive, RGB's rate is no longer
+                // measured under contention.
+                while !rgb_done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = source.next_frame();
+                }
+                median_delta_ms(&timestamps)
+            });
+            if ir_started_rx.recv().is_err() {
+                panic!("IR thread exited before streaming started");
+            }
+            let rgb = scope.spawn(|| {
+                let _done = SetOnDrop(&rgb_done);
+                let config = V4l2Config::new(
+                    CameraId::from("rgb"),
+                    PathBuf::from("/dev/video0"),
+                    PixelFormat::Mjpeg,
+                    1280,
+                    720,
+                );
+                let mut source = V4l2Source::open(config).unwrap();
+                let mut timestamps = Vec::new();
+                for _ in 0..20 {
+                    timestamps.push(source.next_frame().unwrap().header().timestamp);
+                }
+                median_delta_ms(&timestamps)
+            });
+
+            let rgb_median = rgb.join().unwrap();
+            let ir_median = ir.join().unwrap();
+            println!("rgb median: {rgb_median} ms, ir median: {ir_median} ms");
+            assert!(
+                (120.0..=145.0).contains(&rgb_median),
+                "rgb median {rgb_median} ms"
+            );
+            assert!(
+                (60.0..=72.0).contains(&ir_median),
+                "ir median {ir_median} ms"
+            );
+        });
+    }
+
+    #[cfg(test)]
+    fn median_delta_ms(timestamps: &[Timestamp]) -> f64 {
+        let mut deltas: Vec<f64> = timestamps
+            .windows(2)
+            .map(|w| w[1].nanos_since(w[0]) as f64 / 1_000_000.0)
+            .collect();
+        deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        deltas[deltas.len() / 2]
+    }
+}

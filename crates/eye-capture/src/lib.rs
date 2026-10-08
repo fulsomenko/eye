@@ -12,3 +12,5 @@ pub mod uvc_meta;
 pub mod v4l2;
 
 pub use error::CaptureError;
+pub use source::FrameSource;
+pub use v4l2::{CaptureFormat, V4l2Config, V4l2Options, V4l2Source};
