@@ -31,6 +31,8 @@ pub enum Command {
     Record(commands::record::Args),
     /// Fit a user profile from a dot session
     Calibrate(commands::calibrate::Args),
+    /// Calibrate camera intrinsics or the IR/RGB stereo extrinsics from a checkerboard.
+    CalibrateCamera(commands::calibrate_camera::Args),
     /// Track gaze live and draw it on the desktop
     Run(commands::run::Args),
     /// Score pipeline configs against recordings
@@ -56,6 +58,7 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Emitter(a) => commands::emitter::run(&ctx, a),
         Command::Record(a) => commands::record::run(&ctx, a),
         Command::Calibrate(a) => commands::calibrate::run(&ctx, a),
+        Command::CalibrateCamera(a) => commands::calibrate_camera::run(&ctx, a),
         Command::Run(a) => commands::run::run(&ctx, a),
         Command::Bench(a) => commands::bench::run(&ctx, a),
     }
