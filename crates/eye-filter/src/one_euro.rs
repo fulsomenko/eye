@@ -1,6 +1,6 @@
 use eye_core::stage::{GazeFilter, StageError};
 use eye_core::{GazePoint, Rig, ScreenModel, Timestamp};
-use nalgebra::Vector2;
+use nalgebra::{Matrix2, Vector2};
 
 use crate::FilterError;
 use crate::point::{dt_seconds, with_position};
@@ -37,6 +37,7 @@ struct State {
     t: Timestamp,
     x: Vector2<f64>,
     dx: Vector2<f64>,
+    cov_lp: Matrix2<f64>,
 }
 
 fn alpha(cutoff: f64, dt: f64) -> f64 {
@@ -86,6 +87,7 @@ impl GazeFilter for OneEuroFilter {
                 t: point.timestamp,
                 x,
                 dx: Vector2::zeros(),
+                cov_lp: point.cov_mm,
             });
             return point;
         };
@@ -101,11 +103,13 @@ impl GazeFilter for OneEuroFilter {
         let dx = a_d * (x - prev.x) / dt + (1.0 - a_d) * prev.dx;
         let a = alpha(self.cfg.min_cutoff + self.cfg.beta * dx.norm(), dt);
         let xf = a * x + (1.0 - a) * prev.x;
-        let cov = point.cov_mm * (a / (2.0 - a));
+        let cov_lp = prev.cov_lp + (point.cov_mm - prev.cov_lp) * a;
+        let cov = cov_lp * (a / (2.0 - a));
         self.state = Some(State {
             t: point.timestamp,
             x: xf,
             dx,
+            cov_lp,
         });
         with_position(point, xf.into(), cov, &self.screen)
     }
@@ -173,6 +177,22 @@ mod tests {
 
     fn alpha30() -> f64 {
         1.0 / (1.0 + (1.0 / TAU) / (P30 as f64 * 1e-9))
+    }
+
+    fn pt_cov(t_ns: u64, x_mm: f64, y_mm: f64, cov_val: f64) -> GazePoint {
+        let screen = edp1();
+        let mm = Point2::new(x_mm, y_mm);
+        let cov_mm = Matrix2::identity() * cov_val;
+        let px_physical = mm_to_px_physical(&screen, &mm);
+        GazePoint {
+            timestamp: Timestamp::from_nanos(t_ns),
+            output: OutputId::new("eDP-1"),
+            mm,
+            px_physical,
+            px_logical: mm_to_px_logical(&screen, &mm),
+            cov_mm,
+            confidence: eye_geometry::screen::confidence_from_cov(&cov_mm),
+        }
     }
 
     fn filter(cfg: OneEuroConfig) -> OneEuroFilter {
@@ -379,5 +399,56 @@ mod tests {
                 epsilon = 1e-9
             );
         }
+    }
+
+    #[test]
+    fn test_one_euro_covariance_follows_lowpass() {
+        let cfg = OneEuroConfig {
+            beta: 0.0,
+            ..OneEuroConfig::default()
+        };
+        let mut f = filter(cfg);
+        f.apply(pt_cov(0, 0.0, 0.0, 100.0));
+        let out = f.apply(pt_cov(P30, 0.0, 0.0, 10000.0));
+        let a = alpha30();
+        let cov_lp = 100.0 + (10000.0 - 100.0) * a;
+        let expected = cov_lp * (a / (2.0 - a));
+        let naive = 10000.0 * (a / (2.0 - a));
+        assert!(
+            (expected - naive).abs() > 1.0,
+            "expected and naive should differ meaningfully: expected={expected}, naive={naive}"
+        );
+        approx::assert_abs_diff_eq!(out.cov_mm[(0, 0)], expected, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_one_euro_covariance_constant_input_unchanged() {
+        let cfg = OneEuroConfig {
+            beta: 0.0,
+            ..OneEuroConfig::default()
+        };
+        let mut f = filter(cfg);
+        f.apply(pt_cov(0, 0.0, 0.0, 100.0));
+        let out = f.apply(pt_cov(P30, 0.0, 0.0, 100.0));
+        let a = alpha30();
+        let expected = 100.0 * (a / (2.0 - a));
+        approx::assert_abs_diff_eq!(out.cov_mm[(0, 0)], expected, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_one_euro_covariance_resets_with_position() {
+        let cfg = OneEuroConfig {
+            beta: 0.0,
+            ..OneEuroConfig::default()
+        };
+        let mut f = filter(cfg);
+        f.apply(pt_cov(0, 0.0, 0.0, 100.0));
+        f.apply(pt_cov(P30, 0.0, 0.0, 10000.0));
+        f.reset();
+        f.apply(pt_cov(2 * P30, 0.0, 0.0, 500.0));
+        let out = f.apply(pt_cov(3 * P30, 0.0, 0.0, 500.0));
+        let a = alpha30();
+        let expected = 500.0 * (a / (2.0 - a));
+        approx::assert_abs_diff_eq!(out.cov_mm[(0, 0)], expected, epsilon = 1e-9);
     }
 }
