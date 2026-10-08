@@ -14,6 +14,9 @@ use crate::checkerboard::BoardObservation;
 use crate::error::CalibrationError;
 use crate::nominal::focal_prior;
 
+/// The two Dell Latitude 7420 webcam lens modules' published diagonal FOV, same as `identify_module`.
+const DELL_DIAG_FOV_DEG: [f64; 2] = [75.8, 87.0];
+
 #[cfg(test)]
 use eye_geometry::synth::SplitMix64;
 #[cfg(test)]
@@ -546,7 +549,7 @@ pub fn calibrate_intrinsics(
     let rms_px = (sq_sum / (2.0 * n_total as f64)).sqrt();
 
     let module = identify_module(&final_fit.intrinsics);
-    let prior = focal_prior(width, height);
+    let prior = focal_prior(width, height, &DELL_DIAG_FOV_DEG)?;
     let prior_z = (final_fit.intrinsics.fx - prior.f_px) / prior.sigma_px;
     if prior_z.abs() > 2.0 {
         tracing::warn!(
