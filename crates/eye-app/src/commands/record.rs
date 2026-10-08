@@ -805,6 +805,7 @@ mod tests {
             cameras: vec![],
             camera_error: None,
             emitters: vec![],
+            hardware_profile: None,
         }
     }
 

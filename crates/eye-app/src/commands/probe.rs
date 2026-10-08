@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use eye_platform::{
-    CameraDevice, CameraKind, CameraProbe, DisplayProbe, EmitterControl, IrEmitter, MsxuIrEmitter,
-    OutputInfo, ProbeError, SelectedDisplayProbe, SessionInfo, SessionType, V4l2CameraProbe,
-    find_face_auth_control, select_display_probe,
+    CameraDevice, CameraKind, CameraProbe, DisplayProbe, DmiInfo, EmitterControl, IrEmitter,
+    MsxuIrEmitter, OutputInfo, ProbeError, SelectedDisplayProbe, SessionInfo, SessionType,
+    V4l2CameraProbe, builtin_profiles, find_face_auth_control, match_profile, select_display_probe,
 };
 use serde::Serialize;
 
@@ -28,6 +28,7 @@ pub struct Probes {
     pub display: Result<(&'static str, Box<dyn DisplayProbe>), ProbeError>,
     pub cameras: Box<dyn CameraProbe>,
     pub open_emitter: OpenEmitter,
+    pub dmi: Result<DmiInfo, ProbeError>,
 }
 
 impl fmt::Debug for Probes {
@@ -55,6 +56,7 @@ impl Probes {
             open_emitter: Box::new(|camera: &CameraDevice| {
                 MsxuIrEmitter::discover(camera).map(|e| Box::new(e) as Box<dyn IrEmitter + Send>)
             }),
+            dmi: DmiInfo::read(),
         }
     }
 }
@@ -71,6 +73,13 @@ pub struct ProbeReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camera_error: Option<String>,
     pub emitters: Vec<EmitterStatus>,
+    pub hardware_profile: Option<HardwareProfileReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HardwareProfileReport {
+    pub id: String,
+    pub verified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -108,6 +117,16 @@ pub fn collect(probes: &Probes) -> ProbeReport {
             })
         })
         .collect();
+    let hardware_profile = probes
+        .dmi
+        .as_ref()
+        .ok()
+        .and_then(|dmi| match_profile(builtin_profiles(), dmi))
+        .map(|p| HardwareProfileReport {
+            id: p.id.clone(),
+            verified: p.verified,
+        });
+
     ProbeReport {
         session: probes.session.clone(),
         display_backend,
@@ -116,6 +135,7 @@ pub fn collect(probes: &Probes) -> ProbeReport {
         cameras,
         camera_error,
         emitters,
+        hardware_profile,
     }
 }
 
@@ -225,6 +245,16 @@ pub fn write_human(report: &ProbeReport, out: &mut impl Write) -> io::Result<()>
         writeln!(out, "{:<7}  {}  {}", "emitter", e.node.display(), e.state)?;
     }
 
+    match &report.hardware_profile {
+        Some(p) => writeln!(
+            out,
+            "hardware profile: {} ({})",
+            p.id,
+            if p.verified { "verified" } else { "unverified" }
+        )?,
+        None => writeln!(out, "hardware profile: none (generic prior)")?,
+    }
+
     Ok(())
 }
 
@@ -253,6 +283,13 @@ mod tests {
     use super::*;
     use crate::testing::{FakeCameras, FakeDisplay, FakeEmitter, edp1, latitude_cameras};
 
+    fn no_dmi() -> Result<DmiInfo, ProbeError> {
+        Err(ProbeError::Io {
+            path: PathBuf::from("/sys/class/dmi/id"),
+            source: io::Error::other("fake: no DMI"),
+        })
+    }
+
     fn fake_probes(
         display: Result<(&'static str, Box<dyn DisplayProbe>), ProbeError>,
         cameras: Option<Vec<CameraDevice>>,
@@ -263,6 +300,7 @@ mod tests {
             display,
             cameras: Box::new(FakeCameras(cameras)),
             open_emitter,
+            dmi: no_dmi(),
         }
     }
 
@@ -359,6 +397,10 @@ mod tests {
                 },
                 state: "off".to_string(),
             }],
+            hardware_profile: Some(HardwareProfileReport {
+                id: "dell-latitude-7420".to_string(),
+                verified: true,
+            }),
         }
     }
 
@@ -374,8 +416,19 @@ mod tests {
              output   eDP-1  3840x2160  scale 2  1920x1080 logical  310x170 mm  at 0,0  via hyprland\n\
              camera   /dev/video0  Integrated_Webcam_HD  rgb  0c45:672c  MJPG 1280x720@30 960x540@30 848x480@30 640x480@30 640x360@30, YUYV 640x480@30\n\
              camera   /dev/video2  Integrated_Webcam_HD  ir  0c45:672c  GREY 640x360@30  msxu unit 4 selector 6\n\
-             emitter  /dev/video2  off\n"
+             emitter  /dev/video2  off\n\
+             hardware profile: dell-latitude-7420 (verified)\n"
         );
+    }
+
+    #[test]
+    fn test_human_output_reports_no_profile() {
+        let mut report = golden_report();
+        report.hardware_profile = None;
+        let mut out = Vec::new();
+        write_human(&report, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.ends_with("hardware profile: none (generic prior)\n"));
     }
 
     #[test]
@@ -390,6 +443,15 @@ mod tests {
         assert_eq!(value["cameras"][1]["kind"], serde_json::json!("ir"));
         assert!(value.get("display_error").is_none());
         assert!(value.get("camera_error").is_none());
+        assert_eq!(
+            value["hardware_profile"],
+            serde_json::json!({"id": "dell-latitude-7420", "verified": true})
+        );
+
+        let mut no_profile = golden_report();
+        no_profile.hardware_profile = None;
+        let value = serde_json::to_value(&no_profile).unwrap();
+        assert_eq!(value["hardware_profile"], serde_json::Value::Null);
     }
 
     #[test]

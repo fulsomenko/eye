@@ -4,10 +4,10 @@ use nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion, Vector2, Vector3
 
 use crate::error::CalibrationError;
 
-/// Dell Latitude 7420 published diagonal FOV of its two webcam modules (2.7 mm module, 6 mm module).
-pub const DELL_DIAG_FOV_DEG: [f64; 2] = [75.8, 87.0];
 /// Lens centre above the top edge of the active area (thin-bezel lid).
 pub const DEFAULT_LENS_ABOVE_ACTIVE_AREA_MM: f64 = 7.0;
+/// Generic diagonal FOV band for a laptop webcam with no matched hardware profile.
+pub const GENERIC_DIAG_FOV_DEG: [f64; 2] = [60.0, 90.0];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FocalPrior {
@@ -15,23 +15,62 @@ pub struct FocalPrior {
     pub sigma_px: f64,
 }
 
-/// Midpoint of the two Dell modules' focal lengths at this stream size; sigma = half their difference.
-pub fn focal_prior(width: u32, height: u32) -> FocalPrior {
-    let [a, b] = DELL_DIAG_FOV_DEG
-        .map(|deg| Intrinsics::from_diagonal_fov(width, height, deg.to_radians()).fx);
-    FocalPrior {
-        f_px: (a + b) / 2.0,
-        sigma_px: (a - b).abs() / 2.0,
+/// Two or more candidates: midpoint of the min/max focal lengths at this stream size, sigma
+/// = half their difference. One candidate `v`: same formula over the band `v - 2 ..= v + 2`
+/// (published FOVs are rounded).
+pub fn focal_prior(
+    width: u32,
+    height: u32,
+    diag_fov_deg: &[f64],
+) -> Result<FocalPrior, CalibrationError> {
+    if diag_fov_deg.is_empty() || diag_fov_deg.iter().any(|d| !d.is_finite()) {
+        return Err(CalibrationError::Param {
+            name: "diag_fov_deg",
+            reason: format!("must be non-empty and finite, got {diag_fov_deg:?}"),
+        });
     }
+    let degs: Vec<f64> = if diag_fov_deg.len() == 1 {
+        vec![diag_fov_deg[0] - 2.0, diag_fov_deg[0] + 2.0]
+    } else {
+        diag_fov_deg.to_vec()
+    };
+    let (min, max) = degs
+        .iter()
+        .map(|deg| Intrinsics::from_diagonal_fov(width, height, deg.to_radians()).fx)
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), f| {
+            (min.min(f), max.max(f))
+        });
+    Ok(FocalPrior {
+        f_px: (min + max) / 2.0,
+        sigma_px: (max - min) / 2.0,
+    })
 }
 
-#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NominalRigConfig {
     #[serde(default)]
     pub screen_size_mm: Option<[f64; 2]>,
     #[serde(default, rename = "camera")]
     pub cameras: Vec<NominalCamera>,
+    #[serde(default = "NominalRigConfig::default_diag_fov_deg")]
+    pub default_diag_fov_deg: Vec<f64>,
+}
+
+impl Default for NominalRigConfig {
+    fn default() -> Self {
+        Self {
+            screen_size_mm: None,
+            cameras: Vec::new(),
+            default_diag_fov_deg: Self::default_diag_fov_deg(),
+        }
+    }
+}
+
+impl NominalRigConfig {
+    fn default_diag_fov_deg() -> Vec<f64> {
+        GENERIC_DIAG_FOV_DEG.to_vec()
+    }
 }
 
 impl NominalRigConfig {
@@ -52,6 +91,9 @@ pub struct NominalCamera {
     pub position_mm: Option<[f64; 3]>,
     #[serde(default)]
     pub focal_px: Option<f64>,
+    /// Overrides `NominalRigConfig::default_diag_fov_deg` for this camera.
+    #[serde(default)]
+    pub diag_fov_deg: Option<Vec<f64>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,7 +148,12 @@ pub fn nominal_rig(
                 }
                 f
             }
-            None => focal_prior(stream.width, stream.height).f_px,
+            None => {
+                let diag_fov_deg = config_camera
+                    .and_then(|c| c.diag_fov_deg.as_deref())
+                    .unwrap_or(&cfg.default_diag_fov_deg);
+                focal_prior(stream.width, stream.height, diag_fov_deg)?.f_px
+            }
         };
 
         let position = match config_camera.and_then(|c| c.position_mm) {
@@ -210,6 +257,15 @@ mod tests {
         ]
     }
 
+    const DELL_DIAG_FOV_DEG: [f64; 2] = [75.8, 87.0];
+
+    fn dell_cfg() -> NominalRigConfig {
+        NominalRigConfig {
+            default_diag_fov_deg: DELL_DIAG_FOV_DEG.to_vec(),
+            ..NominalRigConfig::default()
+        }
+    }
+
     #[test]
     fn test_focal_from_diag_fov_matches_dell_numbers() {
         let a = Intrinsics::from_diagonal_fov(1280, 720, 75.8f64.to_radians());
@@ -224,14 +280,14 @@ mod tests {
     }
 
     #[test]
-    fn test_focal_prior_covers_both_dell_modules() {
-        let rgb = focal_prior(1280, 720);
-        assert_relative_eq!(rgb.f_px, 858.523, epsilon = 1e-3);
-        assert_relative_eq!(rgb.sigma_px, 84.730, epsilon = 1e-3);
+    fn test_focal_prior_two_candidates_keeps_dell_numbers() {
+        let rgb = focal_prior(1280, 720, &DELL_DIAG_FOV_DEG).unwrap();
+        assert_relative_eq!(rgb.f_px, 858.5231, epsilon = 1e-4);
+        assert_relative_eq!(rgb.sigma_px, 84.7298, epsilon = 1e-4);
 
-        let ir = focal_prior(640, 360);
-        assert_relative_eq!(ir.f_px, 429.262, epsilon = 1e-3);
-        assert_relative_eq!(ir.sigma_px, 42.365, epsilon = 1e-3);
+        let ir = focal_prior(640, 360, &DELL_DIAG_FOV_DEG).unwrap();
+        assert_relative_eq!(ir.f_px, 429.2616, epsilon = 1e-4);
+        assert_relative_eq!(ir.sigma_px, 42.3649, epsilon = 1e-4);
 
         for (w, h, prior) in [(1280, 720, rgb), (640, 360, ir)] {
             for deg in DELL_DIAG_FOV_DEG {
@@ -245,8 +301,48 @@ mod tests {
     }
 
     #[test]
-    fn test_ir_intrinsics_from_prior() {
+    fn test_focal_prior_single_candidate_uses_band() {
+        let a = Intrinsics::from_diagonal_fov(1280, 720, 86f64.to_radians()).fx;
+        let b = Intrinsics::from_diagonal_fov(1280, 720, 90f64.to_radians()).fx;
+        let prior = focal_prior(1280, 720, &[88.0]).unwrap();
+        assert_relative_eq!(prior.f_px, (a + b) / 2.0, epsilon = 1e-9);
+        assert_relative_eq!(prior.sigma_px, (a - b).abs() / 2.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_default_config_uses_generic_prior() {
+        assert_eq!(
+            NominalRigConfig::from_table(None)
+                .unwrap()
+                .default_diag_fov_deg,
+            vec![60.0, 90.0]
+        );
+
+        let empty_table: toml::Table = "".parse().unwrap();
+        let cfg = NominalRigConfig::from_table(Some(&empty_table)).unwrap();
+        assert_eq!(cfg.default_diag_fov_deg, vec![60.0, 90.0]);
+
         let rig = nominal_rig(edp1(), &streams(), &NominalRigConfig::default()).unwrap();
+        let ir = rig.camera("ir").unwrap();
+        let expected = focal_prior(640, 360, &[60.0, 90.0]).unwrap();
+        assert_relative_eq!(ir.fx, expected.f_px, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_focal_prior_rejects_empty() {
+        let err = focal_prior(1280, 720, &[]).unwrap_err();
+        assert!(matches!(
+            err,
+            CalibrationError::Param {
+                name: "diag_fov_deg",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_ir_intrinsics_from_prior() {
+        let rig = nominal_rig(edp1(), &streams(), &dell_cfg()).unwrap();
         let ir = rig.camera("ir").unwrap();
         assert_relative_eq!(ir.fx, 429.262, epsilon = 1e-3);
         assert_relative_eq!(ir.fy, 429.262, epsilon = 1e-3);
@@ -263,12 +359,13 @@ mod tests {
     #[test]
     fn test_focal_override_wins() {
         let cfg = NominalRigConfig {
-            screen_size_mm: None,
             cameras: vec![NominalCamera {
                 id: "ir".into(),
                 position_mm: None,
                 focal_px: Some(455.0),
+                diag_fov_deg: None,
             }],
+            ..NominalRigConfig::default()
         };
         let rig = nominal_rig(edp1(), &streams(), &cfg).unwrap();
         let ir = rig.camera("ir").unwrap();
@@ -279,12 +376,13 @@ mod tests {
     #[test]
     fn test_invalid_focal_errors() {
         let cfg = NominalRigConfig {
-            screen_size_mm: None,
             cameras: vec![NominalCamera {
                 id: "ir".into(),
                 position_mm: None,
                 focal_px: Some(-1.0),
+                diag_fov_deg: None,
             }],
+            ..NominalRigConfig::default()
         };
         let err = nominal_rig(edp1(), &streams(), &cfg).unwrap_err();
         assert!(matches!(
@@ -323,7 +421,7 @@ mod tests {
 
         let cfg = NominalRigConfig {
             screen_size_mm: Some([0.0, 170.0]),
-            cameras: Vec::new(),
+            ..NominalRigConfig::default()
         };
         let err = nominal_rig(edp1(), &streams(), &cfg).unwrap_err();
         assert!(matches!(
@@ -371,12 +469,13 @@ mod tests {
     #[test]
     fn test_unknown_camera_in_config_errors() {
         let cfg = NominalRigConfig {
-            screen_size_mm: None,
             cameras: vec![NominalCamera {
                 id: "depth".into(),
                 position_mm: None,
                 focal_px: None,
+                diag_fov_deg: None,
             }],
+            ..NominalRigConfig::default()
         };
         let err = nominal_rig(edp1(), &streams(), &cfg).unwrap_err();
         assert!(matches!(err, CalibrationError::UnknownCamera(id) if id == "depth"));
@@ -417,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_point_in_front_of_screen_projects_into_nominal_camera() {
-        let rig = nominal_rig(edp1(), &streams(), &NominalRigConfig::default()).unwrap();
+        let rig = nominal_rig(edp1(), &streams(), &dell_cfg()).unwrap();
         let ir = rig.camera("ir").unwrap();
         let face_point = Point3::new(155.0, 85.0, -500.0);
         let p_cam = ir.screen_from_camera.inverse_transform_point(&face_point);

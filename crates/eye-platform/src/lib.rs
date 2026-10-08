@@ -5,12 +5,16 @@ pub mod camera;
 pub mod display;
 pub mod emitter;
 pub mod error;
+pub mod profile;
 pub mod session;
 pub mod uvc;
 
 pub use display::wayland::{SelectedDisplayProbe, WaylandDisplayProbe, select_display_probe};
 pub use display::{DisplayProbe, OutputInfo, Transform, hyprland::HyprlandDisplayProbe};
 pub use error::ProbeError;
+pub use profile::{
+    CameraProfile, CameraRole, DmiInfo, HardwareProfile, builtin_profiles, match_profile,
+};
 pub use session::{Compositor, SessionInfo, SessionType};
 
 pub use camera::{

@@ -4,11 +4,13 @@
 use std::path::PathBuf;
 
 use anyhow::Context as _;
-use eye::config::Config;
-use eye_calibration::nominal::{CameraStream, NominalRigConfig, nominal_rig};
+use eye::config::{CameraConfig, CameraFormat, Config};
+use eye_calibration::nominal::{CameraStream, NominalCamera, NominalRigConfig, nominal_rig};
 use eye_calibration::store::ProfileStore;
 use eye_core::Rig;
-use eye_platform::OutputInfo;
+use eye_platform::{
+    CameraRole, DmiInfo, HardwareProfile, OutputInfo, builtin_profiles, match_profile,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RigSource {
@@ -54,9 +56,62 @@ pub fn camera_streams(config: &Config) -> Vec<CameraStream> {
         .collect()
 }
 
-/// `config.rig` (the `[rig]` table, absent = empty) deserialized into `NominalRigConfig`.
+/// `config.rig` (the `[rig]` table, absent = empty) deserialized into `NominalRigConfig`,
+/// then each camera's `diag_fov_deg` filled from the matched hardware profile (by DMI) when
+/// the config did not already set it. Config always wins.
 pub fn nominal_rig_config(config: &Config) -> anyhow::Result<NominalRigConfig> {
-    NominalRigConfig::from_table(config.rig.as_ref()).context("[rig] section")
+    nominal_rig_config_for(config, DmiInfo::read().ok().as_ref())
+}
+
+/// `nominal_rig_config`, with the DMI info passed in rather than read from `/sys`.
+fn nominal_rig_config_for(
+    config: &Config,
+    dmi: Option<&DmiInfo>,
+) -> anyhow::Result<NominalRigConfig> {
+    let rig_config = NominalRigConfig::from_table(config.rig.as_ref()).context("[rig] section")?;
+    let profile = dmi.and_then(|dmi| match_profile(builtin_profiles(), dmi));
+    Ok(fill_fov_from_profile(rig_config, &config.cameras, profile))
+}
+
+/// Fills each camera's `diag_fov_deg` from `profile`'s camera of the same role (cameras whose
+/// `format = "gray"` are role `ir`, others `rgb`) when the config did not already set it.
+/// Config always wins; a camera with no matching role in the profile is left untouched.
+fn fill_fov_from_profile(
+    mut rig_config: NominalRigConfig,
+    cameras: &[CameraConfig],
+    profile: Option<&HardwareProfile>,
+) -> NominalRigConfig {
+    let Some(profile) = profile else {
+        return rig_config;
+    };
+
+    for camera_config in cameras {
+        let role = match camera_config.format {
+            CameraFormat::Gray => CameraRole::Ir,
+            CameraFormat::Mjpeg => CameraRole::Rgb,
+        };
+        let Some(camera_profile) = profile.cameras.iter().find(|c| c.role == role) else {
+            continue;
+        };
+        match rig_config
+            .cameras
+            .iter_mut()
+            .find(|c| c.id == camera_config.id.as_str())
+        {
+            Some(rig_camera) if rig_camera.diag_fov_deg.is_none() => {
+                rig_camera.diag_fov_deg = Some(camera_profile.diag_fov_deg.clone());
+            }
+            Some(_) => {}
+            None => rig_config.cameras.push(NominalCamera {
+                id: camera_config.id.to_string(),
+                position_mm: None,
+                focal_px: None,
+                diag_fov_deg: Some(camera_profile.diag_fov_deg.clone()),
+            }),
+        }
+    }
+
+    rig_config
 }
 
 /// The stored rig for `output` if the store has one, else `nominal_rig(output.screen_model()?, ..)`.
@@ -107,6 +162,53 @@ mod tests {
     fn config_with_toml(extra: &str) -> Config {
         let base = "estimate = \"fused\"\n[[camera]]\nid = \"rgb\"\ndevice = \"/dev/video0\"\nformat = \"mjpeg\"\nsize = [1280, 720]\n[detect]\nrgb = \"mediapipe-ort\"\n";
         Config::from_toml_str(&format!("{base}\n{extra}")).expect("parses")
+    }
+
+    fn ir_camera_config(rig_section: &str) -> Config {
+        Config::from_toml_str(&format!(
+            "estimate = \"fused\"\n[[camera]]\nid = \"ir\"\ndevice = \"/dev/video2\"\nformat = \"gray\"\nsize = [640, 360]\n[detect]\nir = \"ir-classic\"\n{rig_section}"
+        ))
+        .expect("parses")
+    }
+
+    fn dell_dmi() -> DmiInfo {
+        DmiInfo {
+            sys_vendor: "Dell Inc.".to_string(),
+            product_name: "Latitude 7420".to_string(),
+        }
+    }
+
+    fn unknown_dmi() -> DmiInfo {
+        DmiInfo {
+            sys_vendor: "LENOVO".to_string(),
+            product_name: "ThinkPad X1".to_string(),
+        }
+    }
+
+    fn ir_fov(rig_config: &NominalRigConfig) -> Option<Vec<f64>> {
+        rig_config
+            .cameras
+            .iter()
+            .find(|c| c.id == "ir")
+            .and_then(|c| c.diag_fov_deg.clone())
+    }
+
+    #[test]
+    fn test_nominal_rig_config_fills_fov_from_matched_profile() {
+        let config = ir_camera_config("");
+        let filled = nominal_rig_config_for(&config, Some(&dell_dmi())).expect("fills from Dell");
+        assert_eq!(ir_fov(&filled), Some(vec![75.8, 87.0]));
+
+        let config_with_override =
+            ir_camera_config("[rig]\n[[rig.camera]]\nid = \"ir\"\ndiag_fov_deg = [70.0]\n");
+        let filled_with_override = nominal_rig_config_for(&config_with_override, Some(&dell_dmi()))
+            .expect("keeps config override");
+        assert_eq!(ir_fov(&filled_with_override), Some(vec![70.0]));
+
+        let config_unknown = ir_camera_config("");
+        let filled_unknown = nominal_rig_config_for(&config_unknown, Some(&unknown_dmi()))
+            .expect("unknown DMI leaves fov unset");
+        assert_eq!(ir_fov(&filled_unknown), None);
     }
 
     #[test]

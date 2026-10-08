@@ -52,6 +52,38 @@ fn test_probe_json_with_fake_hyprland_socket() {
     assert!(value["cameras"].is_array());
 }
 
+fn fake_dmi_dir(sys_vendor: &str, product_name: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::write(dir.path().join("sys_vendor"), format!("{sys_vendor}\n")).expect("write sys_vendor");
+    fs::write(dir.path().join("product_name"), format!("{product_name}\n"))
+        .expect("write product_name");
+    dir
+}
+
+#[test]
+fn test_probe_json_reports_profile() {
+    let (_dir, runtime_dir) = fake_hyprland_runtime_dir();
+    let dmi_dir = fake_dmi_dir("Dell Inc.", "Latitude 7420");
+
+    let assert = cargo_bin_cmd!("eye")
+        .env_remove("EYE_CONFIG")
+        .env_remove("EYE_IR_CAMERA")
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("HYPRLAND_INSTANCE_SIGNATURE", "test-sig")
+        .env("WAYLAND_DISPLAY", "wayland-test")
+        .env("EYE_DMI_DIR", dmi_dir.path())
+        .args(["probe", "--json"])
+        .assert()
+        .success();
+
+    let stdout = assert.get_output().stdout.clone();
+    let value: serde_json::Value = serde_json::from_slice(&stdout).expect("stdout is valid JSON");
+    assert_eq!(
+        value["hardware_profile"],
+        serde_json::json!({"id": "dell-latitude-7420", "verified": true})
+    );
+}
+
 #[test]
 fn test_probe_output_flag_writes_file() {
     let (dir, runtime_dir) = fake_hyprland_runtime_dir();

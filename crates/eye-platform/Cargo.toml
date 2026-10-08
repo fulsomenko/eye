@@ -18,13 +18,13 @@ serde.workspace = true
 serde_json.workspace = true
 smithay-client-toolkit.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 tracing.workspace = true
 v4l.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
 proptest.workspace = true
-toml.workspace = true
 
 [lints]
 workspace = true

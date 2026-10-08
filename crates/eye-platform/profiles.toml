@@ -1,0 +1,25 @@
+[[profile]]
+id = "dell-latitude-7420"
+sys_vendor = "Dell Inc."
+product_match = "Latitude 7420"
+verified = true
+source = "Dell Latitude 7420 Setup and Specifications, camera; measured 2026-10-07 (EYE-2, R30)"
+[[profile.cameras]]
+role = "rgb"
+diag_fov_deg = [75.8, 87.0]
+nominal_fps = 30.0
+dual_stream_rgb_fps = 7.5
+[[profile.cameras]]
+role = "ir"
+diag_fov_deg = [75.8, 87.0]
+nominal_fps = 15.0
+
+[[profile]]
+id = "hp-zbook-fury-16-g10"
+sys_vendor = "HP"
+product_match = "ZBook Fury 16 G10"
+verified = false
+source = "HP ZBook Fury 16 G10 spec sheet: 5 MP with IR, 88 deg view"
+[[profile.cameras]]
+role = "rgb"
+diag_fov_deg = [88.0]
