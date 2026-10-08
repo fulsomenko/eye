@@ -1,6 +1,7 @@
 //! The overlay as an `eye_core::GazeSink`: spawns the layer-shell surface and
 //! feeds it gaze points.
 
+use eye_core::grid::Grid;
 use eye_core::{GazePoint, GazeSink, OutputId, ScreenModel, SinkError};
 use nalgebra::Vector2;
 
@@ -8,11 +9,13 @@ use crate::ellipse::logical_px_per_mm;
 use crate::error::OverlayError;
 use crate::handle::OverlayHandle;
 use crate::point::PointScene;
+use crate::region::RegionScene;
 use crate::surface::{SurfaceOptions, spawn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayMode {
     Point,
+    Region { cols: u32, rows: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,15 +45,22 @@ pub struct LayerShellOverlay {
 
 impl LayerShellOverlay {
     pub fn spawn(options: OverlayOptions) -> Result<Self, OverlayError> {
-        let OverlayMode::Point = options.mode;
-        let scene = PointScene::new(options.px_per_mm, options.color);
-        let handle = spawn(
-            SurfaceOptions {
-                output: Some(options.output.as_str().to_owned()),
-                namespace: "eye-overlay",
-            },
-            scene,
-        )?;
+        let surface = SurfaceOptions {
+            output: Some(options.output.as_str().to_owned()),
+            namespace: "eye-overlay",
+        };
+        let handle = match options.mode {
+            OverlayMode::Point => {
+                spawn(surface, PointScene::new(options.px_per_mm, options.color))?
+            }
+            OverlayMode::Region { cols, rows } => {
+                let grid = Grid::new(cols, rows).ok_or(OverlayError::InvalidGrid { cols, rows })?;
+                spawn(
+                    surface,
+                    RegionScene::new(grid, options.px_per_mm, options.color),
+                )?
+            }
+        };
         Ok(Self {
             handle,
             output: options.output,
@@ -154,6 +164,19 @@ mod tests {
     }
 
     #[test]
+    fn test_zero_grid_is_invalid() {
+        let options = OverlayOptions::new(
+            OutputId::from("eDP-1"),
+            OverlayMode::Region { cols: 0, rows: 4 },
+            &edp1(),
+        );
+        assert!(matches!(
+            LayerShellOverlay::spawn(options),
+            Err(OverlayError::InvalidGrid { cols: 0, rows: 4 })
+        ));
+    }
+
+    #[test]
     #[ignore = "needs wayland"]
     fn test_live_point_overlay_smoke() {
         use std::f64::consts::TAU;
@@ -184,6 +207,46 @@ mod tests {
                 px_physical: px_logical,
                 px_logical,
                 cov_mm: Matrix2::new(spread, 0.0, 0.0, spread),
+                confidence: 1.0,
+            };
+            overlay.push(&point).expect("push succeeds");
+            thread::sleep(Duration::from_millis(33));
+        }
+        thread::sleep(Duration::from_secs(1));
+        assert!(overlay.shutdown().is_ok());
+    }
+
+    #[test]
+    #[ignore = "needs wayland"]
+    fn test_live_region_overlay_smoke() {
+        use std::thread;
+        use std::time::Duration;
+
+        let output = std::env::var("EYE_OUTPUT").unwrap_or_else(|_| "eDP-1".to_string());
+        let screen = ScreenModel {
+            output: OutputId::from(output.as_str()),
+            size_mm: Vector2::new(310.0, 170.0),
+            size_px: (3840, 2160),
+            scale: 2.0,
+        };
+        let options = OverlayOptions::new(
+            OutputId::from(output.as_str()),
+            OverlayMode::Region { cols: 4, rows: 4 },
+            &screen,
+        );
+        let mut overlay = LayerShellOverlay::spawn(options).expect("spawn succeeds");
+
+        let (w, h) = (1920.0, 1080.0);
+        for i in 0..90 {
+            let x = (f64::from(i) / 90.0) * w;
+            let y = (f64::from(i) / 90.0) * h;
+            let point = GazePoint {
+                timestamp: Timestamp::now(),
+                output: OutputId::from(output.as_str()),
+                mm: Point2::new(0.0, 0.0),
+                px_physical: Point2::new(x, y),
+                px_logical: Point2::new(x, y),
+                cov_mm: Matrix2::new(10.0, 0.0, 0.0, 10.0),
                 confidence: 1.0,
             };
             overlay.push(&point).expect("push succeeds");
