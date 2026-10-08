@@ -21,12 +21,14 @@ use crate::EstimateError;
 use crate::ir_pupil::{IrPupilEstimator, IrPupilOptions};
 use crate::landmark::{LandmarkEstimator, LandmarkEye, LandmarkFrame, LandmarkOptions};
 use crate::options::parse_options;
+use crate::pccr::{PccrEstimator, PccrOptions};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum IrChainKind {
     #[default]
     Pupil,
+    Pccr,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,12 +60,14 @@ impl Default for FusedOptions {
 #[derive(Debug)]
 enum IrChain {
     Pupil(IrPupilEstimator),
+    Pccr(PccrEstimator),
 }
 
 impl IrChain {
     fn estimate(&mut self, obs: &[Observations], rig: &Rig) -> Result<Vec<GazeRay>, EstimateError> {
         match self {
             IrChain::Pupil(e) => e.estimate_rays(obs, rig),
+            IrChain::Pccr(e) => e.estimate_rays(obs, rig),
         }
     }
 }
@@ -94,6 +98,11 @@ impl FusedEstimator {
     pub fn new(options: FusedOptions) -> Self {
         let ir = match options.ir {
             IrChainKind::Pupil => IrChain::Pupil(IrPupilEstimator::new(options.ir_pupil.clone())),
+            IrChainKind::Pccr => IrChain::Pccr(PccrEstimator::new(PccrOptions {
+                ipd_mm: options.ir_pupil.ipd_mm,
+                apply_kappa: options.ir_pupil.apply_kappa,
+                ..PccrOptions::default()
+            })),
         };
         Self {
             landmark: LandmarkEstimator::new(options.landmark.clone()),

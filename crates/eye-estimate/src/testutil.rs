@@ -122,6 +122,90 @@ pub(crate) fn synthetic_ir_observation(
     synthetic_ir_observation_at(rig, centres, target_mm, sigma_px, seed)
 }
 
+/// `synthetic_ir_observation_at` geometry (pupils at `C + r_p * g`, `r_p = rotation_to_pupil_mm`)
+/// plus one glint per eye: `K = C + rotation_to_cornea_mm() * g`, `glint = K + cornea_radius_mm *
+/// normalize(o_ir - K)` (the corneal point whose normal points at the camera), projected into
+/// "ir", `N(0, glint_sigma_px)` noise, `Measured` sigma = `glint_sigma_px`. Eye centres
+/// `EYE_CENTRES + head_offset_mm`.
+pub(crate) fn synthetic_pccr_observation(
+    rig: &Rig,
+    target_mm: Point2<f64>,
+    head_offset_mm: Vector3<f64>,
+    pupil_sigma_px: f64,
+    glint_sigma_px: f64,
+    seed: u64,
+) -> Observations {
+    let cam = rig.camera("ir").expect("test rig has an ir camera");
+    let intrinsics = Intrinsics::from_camera_model(cam);
+    let params = EyeParams::default();
+    let r_p = params.rotation_to_pupil_mm;
+    let r_k = params.rotation_to_cornea_mm();
+    let target = Point3::new(target_mm.x, target_mm.y, 0.0);
+    let o_ir = Point3::from(cam.screen_from_camera.translation.vector);
+    let mut rng = SplitMix64::new(seed);
+
+    let centres = [
+        EYE_CENTRES[0] + head_offset_mm,
+        EYE_CENTRES[1] + head_offset_mm,
+    ];
+
+    let eyes = [Side::Right, Side::Left]
+        .into_iter()
+        .zip(centres)
+        .map(|(side, centre)| {
+            let g = (target - centre).normalize();
+            let pupil_screen = centre + g * r_p;
+            let pupil_cam = cam
+                .screen_from_camera
+                .inverse_transform_point(&pupil_screen);
+            let pupil_px = intrinsics
+                .project(&pupil_cam)
+                .expect("synthetic pupil projects in front of the camera");
+            let noisy_pupil = Point2::new(
+                pupil_px.x + pupil_sigma_px * rng.gaussian(),
+                pupil_px.y + pupil_sigma_px * rng.gaussian(),
+            );
+
+            let k = centre + g * r_k;
+            let glint_screen = k + (o_ir - k).normalize() * params.cornea_radius_mm;
+            let glint_cam = cam
+                .screen_from_camera
+                .inverse_transform_point(&glint_screen);
+            let glint_px = intrinsics
+                .project(&glint_cam)
+                .expect("synthetic glint projects in front of the camera");
+            let noisy_glint = Point2::new(
+                glint_px.x + glint_sigma_px * rng.gaussian(),
+                glint_px.y + glint_sigma_px * rng.gaussian(),
+            );
+
+            let mut eye = EyeObservation::new(side);
+            eye.pupil = Some(
+                Measured::new(
+                    Ellipse2::circle(noisy_pupil, 3.0).expect("synthetic pupil ellipse is valid"),
+                    pupil_sigma_px,
+                )
+                .expect("pupil_sigma_px is a valid Measured sigma"),
+            );
+            eye.glints = vec![
+                Measured::new(noisy_glint, glint_sigma_px)
+                    .expect("glint_sigma_px is a valid Measured sigma"),
+            ];
+            eye
+        })
+        .collect();
+
+    Observations {
+        camera: CameraId::new("ir"),
+        timestamp: Timestamp::from_nanos(0),
+        face: Some(FaceObservation {
+            scheme: SCHEME_IR_PUPIL_PAIR,
+            landmarks: Vec::new(),
+            eyes,
+        }),
+    }
+}
+
 /// Rotation centres [right, left] of the synthetic head: `screen_from_head * (scale *
 /// eyeball_centre_in_head(T(inner), T(outer), params))`.
 pub(crate) fn synthetic_eye_centres(
