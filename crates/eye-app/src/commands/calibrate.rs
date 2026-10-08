@@ -116,9 +116,10 @@ pub fn fit_recording(
     dir: &Path,
     config: &Config,
     registry: &Registry,
+    protocol: &ProtocolConfig,
     meta: ProfileMeta,
 ) -> anyhow::Result<FitResult> {
-    let mut replayed = replay_session(dir, config, registry, &ProtocolConfig::default())?;
+    let mut replayed = replay_session(dir, config, registry, protocol)?;
     let run = &replayed.run;
     let samples = fit_samples(
         &run.windows,
@@ -156,12 +157,29 @@ pub fn fit_recording(
     })
 }
 
+const INTERACTIVE_DWELL_MS: u64 = 2500;
+const INTERACTIVE_SETTLE_MS: u64 = 1000;
+const INTERACTIVE_WINDOW_MS: u64 = 1200;
+
 fn protocol_for(targets: u32, dwell_ms: Option<u64>) -> ProtocolConfig {
-    let default = ProtocolConfig::default();
+    let dwell_ms = dwell_ms.unwrap_or(INTERACTIVE_DWELL_MS);
+    let scale = dwell_ms as f64 / INTERACTIVE_DWELL_MS as f64;
+    let settle_ms = ((INTERACTIVE_SETTLE_MS as f64 * scale).round() as u64).max(1);
+    let window_ms = ((INTERACTIVE_WINDOW_MS as f64 * scale).round() as u64).max(1);
     ProtocolConfig {
         grid: if targets == 16 { [4, 4] } else { [3, 3] },
-        dwell_ms: dwell_ms.unwrap_or(default.dwell_ms),
-        ..default
+        dwell_ms,
+        settle_ms,
+        window_ms,
+        ..ProtocolConfig::default()
+    }
+}
+
+fn fit_protocol(args: &Args) -> ProtocolConfig {
+    if args.from.is_some() {
+        ProtocolConfig::default()
+    } else {
+        protocol_for(args.targets, args.dwell_ms)
     }
 }
 
@@ -216,10 +234,12 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         created_unix_s: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         estimator: config.estimate.kind.clone(),
     };
+    let protocol = fit_protocol(&args);
     let result = fit_recording(
         &recording.session_dir(),
         &config,
         &Registry::with_defaults(),
+        &protocol,
         meta,
     )?;
     let saved = match &ctx.output {
@@ -257,6 +277,22 @@ mod tests {
     }
 
     #[test]
+    fn test_calibrate_default_timing_is_2500_1000_1200() {
+        let protocol = protocol_for(9, None);
+        assert_eq!(protocol.dwell_ms, 2500);
+        assert_eq!(protocol.settle_ms, 1000);
+        assert_eq!(protocol.window_ms, 1200);
+    }
+
+    #[test]
+    fn test_calibrate_dwell_override_scales_settle_and_window() {
+        let protocol = protocol_for(9, Some(5000));
+        assert_eq!(protocol.dwell_ms, 5000);
+        assert_eq!(protocol.settle_ms, 2000);
+        assert_eq!(protocol.window_ms, 2400);
+    }
+
+    #[test]
     fn test_from_conflicts_with_keep_and_targets() {
         Cli::command().debug_assert();
 
@@ -266,6 +302,27 @@ mod tests {
         let err = Cli::try_parse_from(["eye", "calibrate", "--from", "d", "--targets", "16"])
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn test_calibrate_fits_with_the_recorded_protocol() {
+        let args = Args {
+            targets: 16,
+            dwell_ms: Some(5000),
+            profile: "default".to_string(),
+            keep: false,
+            from: None,
+        };
+        assert_eq!(fit_protocol(&args), protocol_for(16, Some(5000)));
+
+        let from_args = Args {
+            targets: 9,
+            dwell_ms: None,
+            profile: "default".to_string(),
+            keep: false,
+            from: Some(PathBuf::from("d")),
+        };
+        assert_eq!(fit_protocol(&from_args), ProtocolConfig::default());
     }
 
     #[test]
@@ -329,7 +386,14 @@ mod tests {
         let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
         let config = kappa_ray_config(&FOUR_BY_FOUR_CENTRES, [3.0, -1.0], None);
         let meta = ProfileMeta::default();
-        let result = fit_recording(&session_dir, &config, &fake_registry(), meta).unwrap();
+        let result = fit_recording(
+            &session_dir,
+            &config,
+            &fake_registry(),
+            &ProtocolConfig::default(),
+            meta,
+        )
+        .unwrap();
 
         assert_eq!(result.targets, 16);
         assert_eq!(result.samples, 384);
@@ -352,7 +416,14 @@ mod tests {
             created_unix_s: 1_791_409_623,
             estimator: "test-kappa-ray".to_string(),
         };
-        let result = fit_recording(&session_dir, &config, &fake_registry(), meta).unwrap();
+        let result = fit_recording(
+            &session_dir,
+            &config,
+            &fake_registry(),
+            &ProtocolConfig::default(),
+            meta,
+        )
+        .unwrap();
 
         assert_eq!(result.profile.name, "alice");
         assert_eq!(result.profile.created_unix_s, 1_791_409_623);
@@ -374,6 +445,7 @@ mod tests {
             &session_dir,
             &config,
             &fake_registry(),
+            &ProtocolConfig::default(),
             ProfileMeta::default(),
         )
         .unwrap_err();

@@ -31,6 +31,15 @@ impl Default for ProtocolConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TargetTiming {
+    /// Eye still travelling; samples ignored.
+    pub settle: Duration,
+    /// Samples are taken.
+    pub window: Duration,
+    pub dwell: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Target {
     pub index: u32,
     pub cell: (u32, u32),
@@ -154,15 +163,23 @@ impl TargetProtocol {
             .collect()
     }
 
+    pub fn timing(&self) -> TargetTiming {
+        TargetTiming {
+            settle: Duration::from_millis(self.cfg.settle_ms),
+            window: Duration::from_millis(self.cfg.window_ms),
+            dwell: Duration::from_millis(self.cfg.dwell_ms),
+        }
+    }
+
     pub fn display_sequence(
         &self,
         seed: u64,
         screen: &ScreenModel,
-    ) -> Vec<(Point2<f64>, Duration)> {
-        let dwell = Duration::from_millis(self.cfg.dwell_ms);
+    ) -> Vec<(Point2<f64>, TargetTiming)> {
+        let timing = self.timing();
         self.sequence(seed)
             .into_iter()
-            .map(|t| (self.target_px_logical(&t, screen), dwell))
+            .map(|t| (self.target_px_logical(&t, screen), timing))
             .collect()
     }
 
@@ -347,10 +364,27 @@ mod tests {
         let seq = proto.sequence(5);
         let disp = proto.display_sequence(5, &screen);
         assert_eq!(disp.len(), seq.len());
-        for (t, (px, dur)) in seq.iter().zip(disp.iter()) {
+        for (t, (px, timing)) in seq.iter().zip(disp.iter()) {
             assert_eq!(*px, proto.target_px_logical(t, &screen));
-            assert_eq!(*dur, Duration::from_millis(1500));
+            assert_eq!(*timing, proto.timing());
         }
+    }
+
+    #[test]
+    fn test_display_sequence_carries_timing() {
+        let proto = TargetProtocol::new(ProtocolConfig::default()).unwrap();
+        let screen = screen();
+        let timing = proto.timing();
+        for (_, t) in proto.display_sequence(7, &screen) {
+            assert_eq!(t, timing);
+        }
+    }
+
+    #[test]
+    fn test_timing_sums_within_dwell() {
+        let proto = TargetProtocol::new(ProtocolConfig::default()).unwrap();
+        let timing = proto.timing();
+        assert!(timing.settle + timing.window <= timing.dwell);
     }
 
     #[test]

@@ -101,6 +101,31 @@ impl<'a> Canvas<'a> {
         self.fill_ellipse(center, (radius, radius), 0.0, color);
     }
 
+    /// Strokes a circular arc of `radius` around `center`, from `start_rad` sweeping
+    /// `sweep_rad` (positive = clockwise in this y-down coordinate space).
+    pub fn stroke_arc(
+        &mut self,
+        center: Point2<f64>,
+        radius: f64,
+        start_rad: f64,
+        sweep_rad: f64,
+        width: f64,
+        color: Rgba,
+    ) {
+        let Some((path, ts)) = self.arc_path(center, radius, start_rad, sweep_rad) else {
+            return;
+        };
+        let stroke_px = width as f32 * self.scale as f32;
+        self.record(&path, ts, stroke_px);
+        let stroke = tiny_skia::Stroke {
+            width: width as f32,
+            line_cap: tiny_skia::LineCap::Round,
+            ..Default::default()
+        };
+        self.pixmap
+            .stroke_path(&path, &Self::paint(color), &stroke, ts, None);
+    }
+
     pub fn fill_rect(&mut self, rect: LogicalRect, color: Rgba) {
         let Some((path, ts)) = self.rect_path(rect) else {
             return;
@@ -171,6 +196,36 @@ impl<'a> Canvas<'a> {
         let path = PathBuilder::from_oval(rect)?;
         let ts = Transform::from_rotate_at(angle_rad.to_degrees() as f32, cx, cy)
             .post_scale(self.scale as f32, self.scale as f32);
+        Some((path, ts))
+    }
+
+    fn arc_path(
+        &self,
+        center: Point2<f64>,
+        radius: f64,
+        start_rad: f64,
+        sweep_rad: f64,
+    ) -> Option<(Path, Transform)> {
+        if radius <= 0.0 || sweep_rad == 0.0 {
+            return None;
+        }
+        const SEGMENTS_PER_TURN: f64 = 128.0;
+        let segments = ((sweep_rad.abs() / std::f64::consts::TAU) * SEGMENTS_PER_TURN)
+            .ceil()
+            .max(1.0) as usize;
+        let point_at = |t: f64| {
+            let a = start_rad + sweep_rad * t;
+            (center.x + radius * a.cos(), center.y + radius * a.sin())
+        };
+        let mut pb = PathBuilder::new();
+        let (x0, y0) = point_at(0.0);
+        pb.move_to(x0 as f32, y0 as f32);
+        for i in 1..=segments {
+            let (x, y) = point_at(i as f64 / segments as f64);
+            pb.line_to(x as f32, y as f32);
+        }
+        let path = pb.finish()?;
+        let ts = Transform::from_scale(self.scale as f32, self.scale as f32);
         Some((path, ts))
     }
 
@@ -302,6 +357,26 @@ mod tests {
         );
         assert!(bgra(&data, 40, 20, 26)[3] > 0);
         assert_eq!(bgra(&data, 40, 26, 20)[3], 0);
+    }
+
+    #[test]
+    fn test_canvas_stroke_arc_covers_only_the_swept_range() {
+        let mut data = vec![0u8; 60 * 60 * 4];
+        let mut canvas = Canvas::new(&mut data, (60, 60), 1).expect("valid buffer");
+        canvas.stroke_arc(
+            Point2::new(30.0, 30.0),
+            16.0,
+            -std::f64::consts::FRAC_PI_2,
+            std::f64::consts::FRAC_PI_2,
+            2.0,
+            red(),
+        );
+        // start (top) and end (right) of the quarter sweep.
+        assert!(bgra(&data, 60, 30, 14)[3] > 0);
+        assert!(bgra(&data, 60, 46, 30)[3] > 0);
+        // bottom and left were never swept.
+        assert_eq!(bgra(&data, 60, 30, 46)[3], 0);
+        assert_eq!(bgra(&data, 60, 14, 30)[3], 0);
     }
 
     proptest! {

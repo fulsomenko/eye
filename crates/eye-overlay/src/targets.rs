@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use eye_calibration::protocol::TargetTiming;
 use eye_core::session::TargetClock;
 use eye_core::{OutputId, Timestamp};
 use nalgebra::Point2;
@@ -13,15 +14,28 @@ use crate::handle::OverlayHandle;
 use crate::scene::{PresentedAt, Scene, Schedule};
 use crate::surface::{SurfaceOptions, spawn};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TargetSpec {
     pub px_logical: Point2<f64>,
-    pub dwell: Duration,
+    pub timing: TargetTiming,
+}
+
+impl From<(Point2<f64>, TargetTiming)> for TargetSpec {
+    fn from((px_logical, timing): (Point2<f64>, TargetTiming)) -> Self {
+        Self { px_logical, timing }
+    }
 }
 
 impl From<(Point2<f64>, Duration)> for TargetSpec {
     fn from((px_logical, dwell): (Point2<f64>, Duration)) -> Self {
-        Self { px_logical, dwell }
+        Self {
+            px_logical,
+            timing: TargetTiming {
+                settle: dwell * 2 / 5,
+                window: dwell * 3 / 5,
+                dwell,
+            },
+        }
     }
 }
 
@@ -142,7 +156,7 @@ pub(crate) fn validate(targets: &[TargetSpec]) -> Result<(), TargetsError> {
         return Err(TargetsError::Empty);
     }
     for (index, t) in targets.iter().enumerate() {
-        if !t.px_logical.x.is_finite() || !t.px_logical.y.is_finite() || t.dwell.is_zero() {
+        if !t.px_logical.x.is_finite() || !t.px_logical.y.is_finite() || t.timing.dwell.is_zero() {
             return Err(TargetsError::InvalidTarget { index });
         }
     }
@@ -189,7 +203,7 @@ impl Scene for TargetScene {
                 return Schedule::NextFrame;
             };
             if let Some(confirmed) = self.confirmed_at
-                && now >= confirmed + t.dwell
+                && now >= confirmed + t.timing.dwell
             {
                 self.advance();
                 continue;
@@ -206,9 +220,11 @@ impl Scene for TargetScene {
             }
             let first = *self.first_frame.get_or_insert(now);
             let elapsed = now - first;
-            draw_target(canvas, t.px_logical, ring_radius(elapsed, t.dwell));
+            draw_target(canvas, t.px_logical, elapsed, t.timing);
             return match self.confirmed_at {
-                Some(c) if elapsed >= animation_len(t.dwell) => Schedule::At(c + t.dwell),
+                Some(c) if elapsed >= t.timing.settle + t.timing.window => {
+                    Schedule::At(c + t.timing.dwell)
+                }
                 _ => Schedule::NextFrame,
             };
         }
@@ -254,6 +270,21 @@ impl Scene for TargetScene {
     }
 }
 
+const WHITE: Rgba = Rgba {
+    r: 255,
+    g: 255,
+    b: 255,
+    a: 255,
+};
+const GREEN: Rgba = Rgba {
+    r: 64,
+    g: 220,
+    b: 96,
+    a: 255,
+};
+const COUNTDOWN_RADIUS: f64 = 16.0;
+const COUNTDOWN_WIDTH: f64 = 2.0;
+
 fn animation_len(dwell: Duration) -> Duration {
     Duration::from_millis(500).min(dwell / 2)
 }
@@ -262,33 +293,44 @@ fn ring_radius(e: Duration, dwell: Duration) -> f64 {
     4.0 + 12.0 * (1.0 - e.as_secs_f64() / animation_len(dwell).as_secs_f64()).max(0.0)
 }
 
+fn lerp_channel(a: u8, b: u8, f: f64) -> u8 {
+    (f64::from(a) + (f64::from(b) - f64::from(a)) * f).round() as u8
+}
+
+fn phase_color(e: Duration, t: TargetTiming) -> Rgba {
+    let f = (e.saturating_sub(t.settle).as_secs_f64() / t.window.as_secs_f64()).clamp(0.0, 1.0);
+    Rgba {
+        r: lerp_channel(WHITE.r, GREEN.r, f),
+        g: lerp_channel(WHITE.g, GREEN.g, f),
+        b: lerp_channel(WHITE.b, GREEN.b, f),
+        a: 255,
+    }
+}
+
+fn countdown_sweep(e: Duration, settle: Duration) -> f64 {
+    (e.as_secs_f64() / settle.as_secs_f64()).clamp(0.0, 1.0) * std::f64::consts::TAU
+}
+
 fn in_bounds(p: Point2<f64>, (w, h): (u32, u32)) -> bool {
     p.x >= 0.0 && p.y >= 0.0 && p.x < f64::from(w) && p.y < f64::from(h)
 }
 
-fn draw_target(c: &mut Canvas<'_>, p: Point2<f64>, ring: f64) {
-    c.stroke_ellipse(
-        p,
-        (ring, ring),
-        0.0,
-        2.0,
-        Rgba {
-            r: 255,
-            g: 255,
-            b: 255,
-            a: 255,
-        },
-    );
-    c.fill_circle(
-        p,
-        3.0,
-        Rgba {
-            r: 255,
-            g: 255,
-            b: 255,
-            a: 255,
-        },
-    );
+fn draw_target(c: &mut Canvas<'_>, p: Point2<f64>, elapsed: Duration, timing: TargetTiming) {
+    let color = phase_color(elapsed, timing);
+    let sweep = countdown_sweep(elapsed, timing.settle);
+    if sweep > 0.0 {
+        c.stroke_arc(
+            p,
+            COUNTDOWN_RADIUS,
+            -std::f64::consts::FRAC_PI_2,
+            sweep,
+            COUNTDOWN_WIDTH,
+            color,
+        );
+    }
+    let ring = ring_radius(elapsed, timing.dwell);
+    c.stroke_ellipse(p, (ring, ring), 0.0, 2.0, color);
+    c.fill_circle(p, 3.0, color);
 }
 
 #[cfg(test)]
@@ -330,9 +372,20 @@ mod tests {
 
     #[test]
     fn test_scene_waits_dwell_then_advances() {
+        let timing = TargetTiming {
+            settle: Duration::from_millis(300),
+            window: Duration::from_millis(300),
+            dwell: Duration::from_secs(1),
+        };
         let targets = vec![
-            TargetSpec::from((Point2::new(50.0, 50.0), Duration::from_secs(1))),
-            TargetSpec::from((Point2::new(150.0, 50.0), Duration::from_secs(1))),
+            TargetSpec {
+                px_logical: Point2::new(50.0, 50.0),
+                timing,
+            },
+            TargetSpec {
+                px_logical: Point2::new(150.0, 50.0),
+                timing,
+            },
         ];
         let (mut scene, rx) = scene(targets, Duration::ZERO);
         let size = (200u32, 200u32);
@@ -411,9 +464,21 @@ mod tests {
             spec,
             TargetSpec {
                 px_logical: Point2::new(960.0, 540.0),
-                dwell: Duration::from_millis(1500),
+                timing: TargetTiming {
+                    settle: Duration::from_millis(600),
+                    window: Duration::from_millis(900),
+                    dwell: Duration::from_millis(1500),
+                },
             }
         );
+    }
+
+    #[test]
+    fn test_bare_dwell_maps_to_two_fifths_settle() {
+        let spec: TargetSpec = (Point2::new(0.0, 0.0), Duration::from_millis(1000)).into();
+        assert_eq!(spec.timing.settle, Duration::from_millis(400));
+        assert_eq!(spec.timing.window, Duration::from_millis(600));
+        assert_eq!(spec.timing.dwell, Duration::from_millis(1000));
     }
 
     #[test]
@@ -465,6 +530,102 @@ mod tests {
             4.0,
             epsilon = 1e-12
         );
+    }
+
+    fn timing_for_fade_tests() -> TargetTiming {
+        TargetTiming {
+            settle: Duration::from_millis(1000),
+            window: Duration::from_millis(600),
+            dwell: Duration::from_millis(2000),
+        }
+    }
+
+    #[test]
+    fn test_target_is_white_during_settle() {
+        let timing = timing_for_fade_tests();
+        let targets = vec![TargetSpec {
+            px_logical: Point2::new(50.0, 50.0),
+            timing,
+        }];
+        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let size = (200u32, 200u32);
+        let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
+        let t0 = Instant::now();
+
+        render_into(&mut scene, &mut buf, size, t0);
+        render_into(&mut scene, &mut buf, size, t0 + timing.settle / 2);
+        assert_eq!(bgra(&buf, size.0, 50, 50), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn test_target_fades_to_green_over_window() {
+        let timing = timing_for_fade_tests();
+        let targets = vec![TargetSpec {
+            px_logical: Point2::new(50.0, 50.0),
+            timing,
+        }];
+        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let size = (200u32, 200u32);
+        let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
+        let t0 = Instant::now();
+        render_into(&mut scene, &mut buf, size, t0);
+
+        let mid = timing.settle + timing.window / 2;
+        render_into(&mut scene, &mut buf, size, t0 + mid);
+        let px = bgra(&buf, size.0, 50, 50);
+        // midpoint of WHITE and GREEN
+        assert_abs_diff_eq!(f64::from(px[0]), 176.0, epsilon = 2.0);
+        assert_abs_diff_eq!(f64::from(px[1]), 238.0, epsilon = 2.0);
+        assert_abs_diff_eq!(f64::from(px[2]), 160.0, epsilon = 2.0);
+        assert_eq!(px[3], 255);
+
+        let after = timing.settle + timing.window;
+        render_into(&mut scene, &mut buf, size, t0 + after);
+        let px2 = bgra(&buf, size.0, 50, 50);
+        assert_eq!(px2, [GREEN.b, GREEN.g, GREEN.r, GREEN.a]);
+    }
+
+    #[test]
+    fn test_countdown_arc_sweeps_during_settle() {
+        let timing = timing_for_fade_tests();
+        let targets = vec![TargetSpec {
+            px_logical: Point2::new(50.0, 50.0),
+            timing,
+        }];
+        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let size = (200u32, 200u32);
+        let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
+        let t0 = Instant::now();
+        render_into(&mut scene, &mut buf, size, t0);
+
+        render_into(&mut scene, &mut buf, size, t0 + timing.settle / 4);
+        assert_eq!(bgra(&buf, size.0, 34, 50)[3], 0);
+
+        render_into(&mut scene, &mut buf, size, t0 + timing.settle * 3 / 4);
+        assert!(bgra(&buf, size.0, 34, 50)[3] > 0);
+    }
+
+    #[test]
+    fn test_schedule_is_next_frame_while_fading() {
+        let timing = timing_for_fade_tests();
+        let targets = vec![TargetSpec {
+            px_logical: Point2::new(50.0, 50.0),
+            timing,
+        }];
+        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let size = (200u32, 200u32);
+        let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
+        let t0 = Instant::now();
+        render_into(&mut scene, &mut buf, size, t0);
+        let _ = scene.on_presented(0, PresentedAt::Commit(Timestamp::from_nanos(1)), t0);
+
+        let schedule = render_into(
+            &mut scene,
+            &mut buf,
+            size,
+            t0 + timing.settle + timing.window / 2,
+        );
+        assert_eq!(schedule, Schedule::NextFrame);
     }
 
     #[test]

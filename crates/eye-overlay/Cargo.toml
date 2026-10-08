@@ -12,6 +12,7 @@ homepage.workspace = true
 
 [dependencies]
 crossbeam-channel.workspace = true
+eye-calibration.workspace = true
 eye-core.workspace = true
 nalgebra.workspace = true
 nix = { workspace = true, features = ["time"] }
