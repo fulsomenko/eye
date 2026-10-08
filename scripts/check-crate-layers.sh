@@ -3,7 +3,7 @@ set -euo pipefail
 
 declare -A layer=(
   [eye-core]=0
-  [eye-geometry]=1 [eye-platform]=1
+  [eye-geometry]=1 [eye-platform]=1 [eye-log]=1
   [eye-capture]=2 [eye-detect]=2 [eye-estimate]=2 [eye-calibration]=2 [eye-filter]=2 [eye-overlay]=2
   [eye]=3
   [eye-bench]=4
