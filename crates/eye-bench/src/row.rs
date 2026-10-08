@@ -6,13 +6,15 @@ use crate::metrics::SessionMetrics;
 #[serde(rename_all = "lowercase")]
 pub enum CalibrationMode {
     None,
+    Loto,
 }
 
 impl CalibrationMode {
-    /// The serialized name ("none").
+    /// The serialized name ("none", "loto").
     pub fn as_str(self) -> &'static str {
         match self {
             CalibrationMode::None => "none",
+            CalibrationMode::Loto => "loto",
         }
     }
 }

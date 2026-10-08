@@ -14,9 +14,10 @@ use eye_capture::session::{FORMAT_VERSION, RecordedCamera, SessionMeta, SessionW
 use eye_core::session::{TargetClock, TargetRecord};
 use eye_core::stage::{Detector, GazeEstimator, StageError};
 use eye_core::{
-    CameraId, CameraInfo, CameraModel, Frame, FrameHeader, FrameSet, GazeRay, Illumination,
-    Observations, OutputId, PixelFormat, Rig, ScreenModel, Timestamp,
+    CameraId, CameraInfo, CameraModel, FaceObservation, Frame, FrameHeader, FrameSet, GazeRay,
+    Illumination, Observations, OutputId, PixelFormat, Rig, ScreenModel, Timestamp,
 };
+use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
 use eye_geometry::screen::px_logical_to_mm;
 use nalgebra::{
     Isometry3, Matrix2, Matrix3, Point2, Point3, Translation3, Unit, UnitQuaternion, Vector2,
@@ -294,6 +295,140 @@ impl GazeEstimator for FixedRayEstimator {
     }
 }
 
+#[derive(Debug)]
+struct TargetCodeDetector;
+
+impl TargetCodeDetector {
+    fn from_config(options: &toml::Table) -> Result<Self, StageError> {
+        let NoOptions {} = options
+            .clone()
+            .try_into()
+            .map_err(|e: toml::de::Error| StageError::Config(e.to_string()))?;
+        Ok(Self)
+    }
+}
+
+impl Detector for TargetCodeDetector {
+    fn name(&self) -> &'static str {
+        "test-target-code"
+    }
+
+    fn accepts(&self, _format: PixelFormat, _illumination: Illumination) -> bool {
+        true
+    }
+
+    fn detect(&mut self, frames: &FrameSet) -> Result<Vec<Observations>, StageError> {
+        Ok(frames
+            .frames()
+            .iter()
+            .map(|f| {
+                let code = f.data().first().copied().unwrap_or(0);
+                Observations {
+                    camera: f.header().camera.clone(),
+                    timestamp: f.header().timestamp,
+                    face: Some(FaceObservation {
+                        scheme: "test",
+                        landmarks: vec![Point2::new(f64::from(code), 0.0)],
+                        eyes: Vec::new(),
+                    }),
+                }
+            })
+            .collect())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KappaOutlier {
+    index: usize,
+    offset_deg: [f64; 2],
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KappaRayOptions {
+    eye: [f64; 3],
+    targets_mm: Vec<[f64; 2]>,
+    offset_deg: [f64; 2],
+    #[serde(default)]
+    outlier: Option<KappaOutlier>,
+}
+
+#[derive(Debug)]
+struct KappaRayEstimator {
+    eye: Point3<f64>,
+    targets_mm: Vec<[f64; 2]>,
+    offset_deg: [f64; 2],
+    outlier: Option<KappaOutlier>,
+}
+
+impl KappaRayEstimator {
+    fn from_config(options: &toml::Table) -> Result<Self, StageError> {
+        let KappaRayOptions {
+            eye,
+            targets_mm,
+            offset_deg,
+            outlier,
+        } = options
+            .clone()
+            .try_into()
+            .map_err(|e: toml::de::Error| StageError::Config(e.to_string()))?;
+        if eye[2] >= 0.0 {
+            return Err(StageError::Config(
+                "eye must be in front of the screen (z < 0)".to_string(),
+            ));
+        }
+        Ok(Self {
+            eye: Point3::new(eye[0], eye[1], eye[2]),
+            targets_mm,
+            offset_deg,
+            outlier,
+        })
+    }
+}
+
+impl GazeEstimator for KappaRayEstimator {
+    fn name(&self) -> &'static str {
+        "test-kappa-ray"
+    }
+
+    fn estimate(&mut self, obs: &[Observations], _rig: &Rig) -> Result<Vec<GazeRay>, StageError> {
+        let Some(code) = obs
+            .iter()
+            .find_map(|o| o.face.as_ref())
+            .and_then(|face| face.landmarks.first())
+            .map(|p| p.x.round() as i64)
+        else {
+            return Ok(Vec::new());
+        };
+        if code <= 0 {
+            return Ok(Vec::new());
+        }
+        let idx = (code - 1) as usize;
+        let t = *self
+            .targets_mm
+            .get(idx)
+            .ok_or_else(|| StageError::Failed(format!("target index {idx} out of range")))?;
+        let off = match &self.outlier {
+            Some(o) if o.index == idx => o.offset_deg,
+            _ => self.offset_deg,
+        };
+        let base = yaw_pitch_from_direction(&Unit::new_normalize(
+            Point3::new(t[0], t[1], 0.0) - self.eye,
+        ));
+        let direction = direction_from_yaw_pitch(
+            &(base + Vector2::new(off[0].to_radians(), off[1].to_radians())),
+        );
+        Ok(vec![GazeRay {
+            side: None,
+            origin: self.eye,
+            direction,
+            origin_cov: Matrix3::zeros(),
+            angular_cov: Matrix2::identity() * 1e-6,
+        }])
+    }
+}
+
 pub fn register_fakes(registry: &mut Registry) -> Result<(), ConfigError> {
     registry.register_detector("test-null", |o, _rig| {
         Ok(Box::new(NullDetector::from_config(o)?))
@@ -301,7 +436,68 @@ pub fn register_fakes(registry: &mut Registry) -> Result<(), ConfigError> {
     registry.register_estimator("test-fixed-ray", |o, _rig| {
         Ok(Box::new(FixedRayEstimator::from_config(o)?))
     })?;
+    registry.register_detector("test-target-code", |o, _rig| {
+        Ok(Box::new(TargetCodeDetector::from_config(o)?))
+    })?;
+    registry.register_estimator("test-kappa-ray", |o, _rig| {
+        Ok(Box::new(KappaRayEstimator::from_config(o)?))
+    })?;
     Ok(())
+}
+
+/// `eye.toml` text: one camera "ir" (device "/dev/null", gray, 8x8), detector test-target-code,
+/// estimator test-kappa-ray (eye fixed at `[155.0, 85.0, -500.0]`), filter none.
+pub fn kappa_ray_toml(
+    targets_px: &[(f64, f64)],
+    offset_deg: [f64; 2],
+    outlier: Option<(usize, [f64; 2])>,
+) -> String {
+    let screen = synthetic_screen();
+    let targets_mm_str = targets_px
+        .iter()
+        .map(|&(x, y)| {
+            let mm = px_logical_to_mm(&screen, &Point2::new(x, y));
+            format!("[{:?}, {:?}]", mm.x, mm.y)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let outlier_line = match outlier {
+        Some((index, offset)) => format!(
+            "outlier = {{ index = {index}, offset_deg = [{:?}, {:?}] }}\n",
+            offset[0], offset[1]
+        ),
+        None => String::new(),
+    };
+    format!(
+        "[[camera]]\n\
+         id = \"ir\"\n\
+         device = \"/dev/null\"\n\
+         format = \"gray\"\n\
+         size = [8, 8]\n\
+         \n\
+         [detect]\n\
+         ir = \"test-target-code\"\n\
+         \n\
+         [estimate]\n\
+         kind = \"test-kappa-ray\"\n\
+         eye = [155.0, 85.0, -500.0]\n\
+         targets_mm = [{targets_mm_str}]\n\
+         offset_deg = [{:?}, {:?}]\n\
+         {outlier_line}\
+         \n\
+         [filter]\n\
+         kind = \"none\"\n",
+        offset_deg[0], offset_deg[1]
+    )
+}
+
+pub fn kappa_ray_config(
+    targets_px: &[(f64, f64)],
+    offset_deg: [f64; 2],
+    outlier: Option<(usize, [f64; 2])>,
+) -> Config {
+    Config::from_toml_str(&kappa_ray_toml(targets_px, offset_deg, outlier))
+        .expect("valid synthetic config")
 }
 
 /// `Registry::with_defaults()` (for the built-in "none" filter) plus `register_fakes`.

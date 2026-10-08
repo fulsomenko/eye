@@ -227,6 +227,10 @@ fn evaluate(
             ),
             Vec::new(),
         )),
+        CalibrationMode::Loto => {
+            crate::calibration::loto(replayed, &crate::calibration::dot_session_fitter)
+                .map(|o| (o.input, o.warnings))
+        }
     }
 }
 
@@ -418,7 +422,7 @@ mod tests {
     use crate::row::RowOutcome;
     use crate::testing::{
         FOUR_BY_FOUR_CENTRES, SyntheticSession, fake_registry, fixed_ray_config, fixed_ray_toml,
-        write_synthetic_session,
+        kappa_ray_toml, write_synthetic_session,
     };
 
     fn eye() -> Point3<f64> {
@@ -759,10 +763,11 @@ mod tests {
         let spec = SyntheticSession::default();
         let session_a = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
         let session_b = write_synthetic_session(dir.path(), "s2", &spec).unwrap();
-        let matrix = BenchMatrix::single(
+        let mut matrix = BenchMatrix::single(
             Some(dir.path().join("missing.toml")),
             vec![session_a, session_b],
         );
+        matrix.evaluation.calibration = vec![CalibrationMode::None];
         let report = run_matrix(&matrix, &fake_registry());
         let session_errors = report
             .rows
@@ -840,5 +845,50 @@ mod tests {
             Ok(_) => panic!("expected the registry to reject an origin behind the screen"),
         };
         assert!(err.to_string().contains("z < 0"));
+    }
+
+    #[test]
+    fn test_kappa_ray_estimator_rejects_eye_behind_screen() {
+        let bad_toml = kappa_ray_toml(&FOUR_BY_FOUR_CENTRES, [0.0, 0.0], None)
+            .replace("eye = [155.0, 85.0, -500.0]", "eye = [155.0, 85.0, 500.0]");
+        let bad_config = Config::from_toml_str(&bad_toml).expect("parses");
+        let registry = fake_registry();
+        let rig = crate::testing::synthetic_rig();
+        let err = match registry.estimator(&bad_config.estimate, &rig) {
+            Err(e) => e,
+            Ok(_) => panic!("expected the registry to reject an eye behind the screen"),
+        };
+        assert!(err.to_string().contains("z < 0"));
+    }
+
+    #[test]
+    fn test_default_evaluation_reports_none_and_loto() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let toml_path = dir.path().join("kappa.toml");
+        std::fs::write(
+            &toml_path,
+            kappa_ray_toml(&FOUR_BY_FOUR_CENTRES, [3.0, -1.0], None),
+        )
+        .unwrap();
+        let matrix = BenchMatrix::single(Some(toml_path), vec![session_dir]);
+
+        let report = run_matrix(&matrix, &fake_registry());
+        let session_rows: Vec<_> = report
+            .rows
+            .iter()
+            .filter(|r| r.kind == RowKind::Session)
+            .collect();
+        assert_eq!(session_rows.len(), 2);
+        assert_eq!(session_rows[0].calibration, CalibrationMode::None);
+        assert_eq!(session_rows[1].calibration, CalibrationMode::Loto);
+        for row in session_rows {
+            assert!(matches!(row.outcome, RowOutcome::Ok { .. }), "{row:?}");
+        }
     }
 }

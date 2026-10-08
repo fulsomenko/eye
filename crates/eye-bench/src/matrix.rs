@@ -39,7 +39,7 @@ pub struct Evaluation {
 impl Default for Evaluation {
     fn default() -> Self {
         Self {
-            calibration: vec![CalibrationMode::None],
+            calibration: vec![CalibrationMode::None, CalibrationMode::Loto],
             protocol: ProtocolConfig::default(),
             metrics: MetricParams::default(),
         }
