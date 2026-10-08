@@ -125,7 +125,7 @@ pub enum OutputMode {
     Region,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OutputConfig {
     /// Overlay backend; only "layer-shell" exists.
@@ -137,6 +137,11 @@ pub struct OutputConfig {
     pub grid: [u32; 2],
     /// Point-mode render-rate easing time constant; 0 disables easing. Ignored in region mode.
     pub easing_ms: u64,
+    /// Point-mode hide margin, in logical px either side of the canvas; see
+    /// `eye_overlay::point::HideRules`. Ignored in region mode.
+    pub hide_margin_px: f64,
+    /// Point-mode confidence threshold below which nothing is drawn. Ignored in region mode.
+    pub hide_below_confidence: f64,
 }
 
 impl Default for OutputConfig {
@@ -147,6 +152,8 @@ impl Default for OutputConfig {
             mode: OutputMode::Point,
             grid: [3, 3],
             easing_ms: 80,
+            hide_margin_px: 24.0,
+            hide_below_confidence: 0.2,
         }
     }
 }
@@ -310,6 +317,16 @@ impl Config {
         if self.output.grid[0] == 0 || self.output.grid[1] == 0 {
             return Err(ConfigError::InvalidOutput("grid must be at least 1x1"));
         }
+        if self.output.hide_margin_px < 0.0 {
+            return Err(ConfigError::InvalidOutput(
+                "hide_margin_px must be non-negative",
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.output.hide_below_confidence) {
+            return Err(ConfigError::InvalidOutput(
+                "hide_below_confidence must be between 0 and 1",
+            ));
+        }
 
         Ok(())
     }
@@ -399,6 +416,8 @@ mod tests {
                 mode: OutputMode::Point,
                 grid: [4, 4],
                 easing_ms: 80,
+                hide_margin_px: 24.0,
+                hide_below_confidence: 0.2,
             }
         );
         assert_eq!(config.rig, None);
@@ -509,6 +528,8 @@ mod tests {
                 mode: OutputMode::Point,
                 grid: [3, 3],
                 easing_ms: 80,
+                hide_margin_px: 24.0,
+                hide_below_confidence: 0.2,
             }
         );
     }
@@ -632,6 +653,36 @@ mod tests {
         assert!(matches!(
             err,
             ConfigError::InvalidOutput("grid must be at least 1x1")
+        ));
+    }
+
+    #[test]
+    fn test_output_hide_margin_must_be_non_negative() {
+        let toml_str = format!(
+            "{}\n[output]\nhide_margin_px = -1.0\n",
+            minimal_camera_and_estimate_with_detect()
+        );
+        let config = Config::from_toml_str(&toml_str).expect("parses");
+        let err = config.validate().expect_err("negative margin errors");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidOutput("hide_margin_px must be non-negative")
+        ));
+    }
+
+    #[test]
+    fn test_output_hide_below_confidence_must_be_in_unit_range() {
+        let toml_str = format!(
+            "{}\n[output]\nhide_below_confidence = 1.5\n",
+            minimal_camera_and_estimate_with_detect()
+        );
+        let config = Config::from_toml_str(&toml_str).expect("parses");
+        let err = config
+            .validate()
+            .expect_err("out of range confidence errors");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidOutput("hide_below_confidence must be between 0 and 1")
         ));
     }
 

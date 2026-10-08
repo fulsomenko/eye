@@ -35,6 +35,12 @@ pub struct Args {
     /// Overrides [output].easing_ms; 0 disables point-mode easing
     #[arg(long)]
     pub easing_ms: Option<u64>,
+    /// Overrides [output].hide_margin_px (point mode only)
+    #[arg(long)]
+    pub hide_margin_px: Option<f64>,
+    /// Overrides [output].hide_below_confidence (point mode only)
+    #[arg(long)]
+    pub hide_below_confidence: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -75,6 +81,12 @@ pub fn apply_output_overrides(output: &mut OutputConfig, args: &Args) -> anyhow:
     }
     if let Some(easing_ms) = args.easing_ms {
         output.easing_ms = easing_ms;
+    }
+    if let Some(hide_margin_px) = args.hide_margin_px {
+        output.hide_margin_px = hide_margin_px;
+    }
+    if let Some(hide_below_confidence) = args.hide_below_confidence {
+        output.hide_below_confidence = hide_below_confidence;
     }
     Ok(())
 }
@@ -236,6 +248,10 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         rig.screen(),
     );
     overlay_options.easing = eye_overlay::point::Easing::from_millis(config.output.easing_ms);
+    overlay_options.hide = eye_overlay::point::HideRules {
+        margin_px: config.output.hide_margin_px,
+        min_confidence: config.output.hide_below_confidence,
+    };
     let mut overlay = LayerShellOverlay::spawn(overlay_options)?;
     let tracker = Tracker::from_config(&config, rig, correction)?;
     let points = tracker.subscribe();
@@ -338,6 +354,8 @@ mod tests {
             no_profile: false,
             stats: false,
             easing_ms: None,
+            hide_margin_px: None,
+            hide_below_confidence: None,
         }
     }
 
@@ -361,6 +379,17 @@ mod tests {
         args.easing_ms = Some(0);
         apply_output_overrides(&mut output, &args).expect("overrides apply");
         assert_eq!(output.easing_ms, 0);
+    }
+
+    #[test]
+    fn test_output_overrides_apply_hide_margin_and_confidence() {
+        let mut output = OutputConfig::default();
+        let mut args = args_with(None, None);
+        args.hide_margin_px = Some(10.0);
+        args.hide_below_confidence = Some(0.5);
+        apply_output_overrides(&mut output, &args).expect("overrides apply");
+        assert_eq!(output.hide_margin_px, 10.0);
+        assert_eq!(output.hide_below_confidence, 0.5);
     }
 
     #[test]

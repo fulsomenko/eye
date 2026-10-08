@@ -45,6 +45,50 @@ impl Default for Easing {
     }
 }
 
+/// Thresholds for hiding the point entirely rather than fading it. `margin_px` also sets
+/// the hysteresis band: a point must cross back inside the canvas shrunk by `margin_px`
+/// to be shown again after leaving it grown by the same amount.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HideRules {
+    pub margin_px: f64,
+    pub min_confidence: f64,
+}
+
+impl Default for HideRules {
+    fn default() -> Self {
+        Self {
+            margin_px: 24.0,
+            min_confidence: 0.2,
+        }
+    }
+}
+
+/// `was_hidden` carries the hysteresis: inside the band between the grown and shrunk
+/// canvas, the previous state wins so a point hovering near the edge does not flicker.
+fn offscreen_hidden(
+    center: Point2<f64>,
+    size: (f64, f64),
+    margin_px: f64,
+    was_hidden: bool,
+) -> bool {
+    let (w, h) = size;
+    let outside_grown = center.x < -margin_px
+        || center.x >= w + margin_px
+        || center.y < -margin_px
+        || center.y >= h + margin_px;
+    let inside_shrunk = center.x >= margin_px
+        && center.x < w - margin_px
+        && center.y >= margin_px
+        && center.y < h - margin_px;
+    if outside_grown {
+        true
+    } else if inside_shrunk {
+        false
+    } else {
+        was_hidden
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct EasedEllipse {
     axes: (f64, f64),
@@ -66,6 +110,8 @@ pub struct PointScene {
     target: Option<Eased>,
     drawn: Option<Eased>,
     last_step: Option<Instant>,
+    hide: HideRules,
+    hidden_offscreen: bool,
 }
 
 impl PointScene {
@@ -82,7 +128,14 @@ impl PointScene {
             target: None,
             drawn: None,
             last_step: None,
+            hide: HideRules::default(),
+            hidden_offscreen: false,
         }
+    }
+
+    pub fn with_hide_rules(mut self, hide: HideRules) -> Self {
+        self.hide = hide;
+        self
     }
 
     fn rgba(&self, alpha: f64) -> Rgba {
@@ -163,10 +216,12 @@ impl Scene for PointScene {
         });
         if self.drawn.is_none() || stale || self.easing.disabled() {
             self.drawn = Some(target);
+        } else if self.drawn == self.target {
+            // Settled: no in-flight animation whose dt this would shorten.
+            self.last_step = Some(now);
         }
         self.target = Some(target);
         self.latest = Some((msg, now));
-        self.last_step = Some(now);
     }
 
     fn step(&mut self, now: Instant) -> bool {
@@ -196,10 +251,26 @@ impl Scene for PointScene {
             self.drawn = None;
             return Schedule::Idle;
         }
+        let (w, h) = canvas.logical_size();
+        let center = p.px_logical;
+        let confidence = p.confidence;
+        self.hidden_offscreen = offscreen_hidden(
+            center,
+            (f64::from(w), f64::from(h)),
+            self.hide.margin_px,
+            self.hidden_offscreen,
+        );
+        if self.hidden_offscreen {
+            self.target = None;
+            self.drawn = None;
+            return Schedule::Idle;
+        }
+        if confidence < self.hide.min_confidence {
+            return Schedule::Idle;
+        }
         let Some(drawn) = self.drawn else {
             return Schedule::Idle;
         };
-        let (w, h) = canvas.logical_size();
         let max_axis = f64::from(w).hypot(f64::from(h));
         if let Some(ellipse) = drawn.ellipse {
             let axes = (
@@ -328,10 +399,10 @@ mod tests {
         let mut canvas = new_canvas(&mut buf);
         let now = Instant::now();
         let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
-        let (p, received) = point_at(now, Matrix2::new(100.0, 0.0, 0.0, 25.0), 0.0);
+        let (p, received) = point_at(now, Matrix2::new(100.0, 0.0, 0.0, 25.0), 0.25);
         scene.on_msg(p, received);
         scene.render(&mut canvas, received);
-        assert_alpha(&buf, 100, 100, 118.0, 3.0);
+        assert_alpha(&buf, 100, 100, 147.0, 3.0);
     }
 
     #[test]
@@ -493,6 +564,193 @@ mod tests {
 
         let new_angle = scene.drawn.unwrap().ellipse.unwrap().angle;
         assert_abs_diff_eq!(new_angle - drawn_angle, 0.063, epsilon = 0.01);
+    }
+
+    fn point_at_xy(
+        now: Instant,
+        px_logical: Point2<f64>,
+        cov_mm: Matrix2<f64>,
+        confidence: f64,
+    ) -> (GazePoint, Instant) {
+        (
+            GazePoint {
+                timestamp: eye_core::Timestamp::from_nanos(0),
+                output: OutputId::from("eDP-1"),
+                mm: Point2::new(0.0, 0.0),
+                px_physical: px_logical,
+                px_logical,
+                cov_mm,
+                confidence,
+            },
+            now,
+        )
+    }
+
+    #[test]
+    fn test_offscreen_point_draws_nothing() {
+        let mut buf = vec![0u8; 200 * 200 * 4];
+        let mut canvas = new_canvas(&mut buf);
+        let now = Instant::now();
+        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
+        let (p, received) = point_at_xy(
+            now,
+            Point2::new(-100.0, 100.0),
+            Matrix2::new(2000.0, 0.0, 0.0, 2000.0),
+            1.0,
+        );
+        scene.on_msg(p, received);
+        scene.render(&mut canvas, received);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_low_confidence_point_draws_nothing() {
+        let mut buf = vec![0u8; 200 * 200 * 4];
+        let mut canvas = new_canvas(&mut buf);
+        let now = Instant::now();
+        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
+        let (p, received) = point_at_xy(
+            now,
+            Point2::new(100.0, 100.0),
+            Matrix2::new(100.0, 0.0, 0.0, 25.0),
+            0.1,
+        );
+        scene.on_msg(p, received);
+        scene.render(&mut canvas, received);
+        assert!(buf.iter().all(|&b| b == 0));
+
+        buf.iter_mut().for_each(|b| *b = 0);
+        let mut canvas = new_canvas(&mut buf);
+        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
+        let (p, received) = point_at_xy(
+            now,
+            Point2::new(100.0, 100.0),
+            Matrix2::new(100.0, 0.0, 0.0, 25.0),
+            0.3,
+        );
+        scene.on_msg(p, received);
+        scene.render(&mut canvas, received);
+        assert!(!buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_edge_hysteresis_requires_reentry_by_margin() {
+        let mut buf = vec![0u8; 200 * 200 * 4];
+        let now = Instant::now();
+        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
+
+        let (p, received) = point_at_xy(now, Point2::new(-100.0, 100.0), Matrix2::zeros(), 1.0);
+        scene.on_msg(p, received);
+        {
+            let mut canvas = new_canvas(&mut buf);
+            scene.render(&mut canvas, received);
+        }
+        assert!(buf.iter().all(|&b| b == 0), "far off-screen hides");
+
+        for x in [-1.0, 10.0] {
+            let (p, received) = point_at_xy(now, Point2::new(x, 100.0), Matrix2::zeros(), 1.0);
+            scene.on_msg(p, received);
+            buf.iter_mut().for_each(|b| *b = 0);
+            let mut canvas = new_canvas(&mut buf);
+            scene.render(&mut canvas, received);
+            assert!(
+                buf.iter().all(|&b| b == 0),
+                "x = {x} is inside the margin dead zone, stays hidden"
+            );
+        }
+
+        let (p, received) = point_at_xy(now, Point2::new(30.0, 100.0), Matrix2::zeros(), 1.0);
+        scene.on_msg(p, received);
+        buf.iter_mut().for_each(|b| *b = 0);
+        let mut canvas = new_canvas(&mut buf);
+        scene.render(&mut canvas, received);
+        assert!(
+            !buf.iter().all(|&b| b == 0),
+            "x = 30 is past the margin, shown again"
+        );
+    }
+
+    #[test]
+    fn test_onscreen_point_with_clipped_ellipse_still_draws() {
+        let mut buf = vec![0u8; 200 * 200 * 4];
+        let mut canvas = new_canvas(&mut buf);
+        let now = Instant::now();
+        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
+        let (p, received) = point_at_xy(
+            now,
+            Point2::new(5.0, 100.0),
+            Matrix2::new(100.0, 0.0, 0.0, 25.0),
+            1.0,
+        );
+        scene.on_msg(p, received);
+        scene.render(&mut canvas, received);
+        assert_alpha(&buf, 5, 100, 234.0, 3.0);
+        assert_alpha(&buf, 27, 100, 40.0, 3.0);
+        assert_alpha(&buf, 33, 100, 0.0, 0.5);
+    }
+
+    #[test]
+    fn test_sample_after_settled_pause_eases_from_arrival() {
+        let now = Instant::now();
+        let mut scene = PointScene::with_easing(
+            Vector2::new(1.0, 1.0),
+            [255, 64, 64],
+            Easing {
+                tau: Duration::from_millis(80),
+                snap_px: 0.5,
+                reset_after: Duration::from_secs(1),
+            },
+        );
+        scene.drawn = Some(Eased {
+            center: Point2::new(0.0, 0.0),
+            ellipse: None,
+        });
+        scene.target = Some(Eased {
+            center: Point2::new(0.0, 0.0),
+            ellipse: None,
+        });
+        let (p0, _) = point_at_xy(now, Point2::new(0.0, 0.0), Matrix2::zeros(), 1.0);
+        scene.latest = Some((p0, now));
+        scene.last_step = Some(now);
+
+        let later = now + Duration::from_millis(500);
+        let (p1, _) = point_at_xy(later, Point2::new(100.0, 0.0), Matrix2::zeros(), 1.0);
+        scene.on_msg(p1, later);
+
+        let moving = scene.step(later + Duration::from_millis(16));
+        assert!(moving);
+        assert_abs_diff_eq!(scene.drawn.unwrap().center.x, 18.1, epsilon = 1.0);
+    }
+
+    #[test]
+    fn test_sample_mid_animation_preserves_frame_clock() {
+        let now = Instant::now();
+        let mut scene = PointScene::with_easing(
+            Vector2::new(1.0, 1.0),
+            [255, 64, 64],
+            Easing {
+                tau: Duration::from_millis(80),
+                snap_px: 0.5,
+                reset_after: Duration::from_secs(1),
+            },
+        );
+        scene.drawn = Some(Eased {
+            center: Point2::new(0.0, 0.0),
+            ellipse: None,
+        });
+        scene.target = Some(Eased {
+            center: Point2::new(100.0, 0.0),
+            ellipse: None,
+        });
+        let (p0, _) = point_at_xy(now, Point2::new(100.0, 0.0), Matrix2::zeros(), 1.0);
+        scene.latest = Some((p0, now));
+        let last_step = now - Duration::from_millis(50);
+        scene.last_step = Some(last_step);
+
+        let (p1, _) = point_at_xy(now, Point2::new(150.0, 0.0), Matrix2::zeros(), 1.0);
+        scene.on_msg(p1, now);
+
+        assert_eq!(scene.last_step, Some(last_step));
     }
 
     #[test]
