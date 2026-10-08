@@ -323,6 +323,7 @@ impl TestRegistry {
         let mut r = Self::empty();
         crate::selftest::register(&mut r);
         crate::hw::register(&mut r);
+        crate::regress::register(&mut r);
         r
     }
 

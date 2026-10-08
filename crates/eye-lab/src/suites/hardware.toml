@@ -1,0 +1,42 @@
+name = "hardware"
+description = "Every camera mode: open, format, frame rate, timestamps, IR alternation, emitter round trip, dual-stream timing"
+
+[[step]]
+test = "opens"
+mode = { streams = "*", rgb = "*" }
+
+[[step]]
+test = "frame_format"
+mode = { streams = "*", rgb = "*" }
+
+[[step]]
+test = "measured_fps"
+mode = { streams = "rgb", rgb = "*" }
+
+[[step]]
+test = "measured_fps"
+mode = { streams = "ir" }
+params = { expected_fps = 15.0 }
+
+[[step]]
+test = "monotonic_timestamps"
+mode = { streams = "dual" }
+
+[[step]]
+test = "ir_alternation"
+mode = { streams = "ir", emitter = "*" }
+
+[[step]]
+test = "ir_alternation"
+label = "ir_alternation brightness"
+mode = { streams = "ir", emitter = "on" }
+params = { expect = "on", tagging = "brightness" }
+
+[[step]]
+test = "emitter_toggle"
+mode = { streams = "ir", emitter = "off" }
+
+[[step]]
+test = "dual_sync"
+mode = { streams = "dual", emitter = "on" }
+params = { frames = 60, expected_median_ms = 3.0, min_dark_fraction = 0.95, expected_rgb_fps = 7.5, expected_ir_fps = 15.0 }

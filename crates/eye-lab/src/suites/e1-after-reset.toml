@@ -1,0 +1,13 @@
+name = "e1-after-reset"
+description = "E1 human procedure: after an event the root spec records as resetting, the emitter is off"
+
+[defaults]
+mode = { streams = "ir", emitter = "keep" }
+
+[[step]]
+test = "emitter_mode"
+params = { expect = "off" }
+
+[[step]]
+test = "ir_alternation"
+params = { expect = "off" }

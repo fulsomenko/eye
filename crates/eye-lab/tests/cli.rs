@@ -269,6 +269,30 @@ fn test_cli_list_tests_and_suites() {
 }
 
 #[test]
+fn test_cli_suites_lists_all_builtin_names() {
+    let result = bin().arg("suites").output().unwrap();
+    assert_eq!(result.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let expected = [
+        "selftest",
+        "smoke",
+        "hardware",
+        "e1",
+        "e1-after-event",
+        "e1-after-reset",
+        "e5",
+        "e6",
+        "regression",
+        "full",
+    ];
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), expected.len(), "{stdout}");
+    for (line, name) in lines.iter().zip(expected) {
+        assert!(line.starts_with(name), "expected {name:?}, got {line:?}");
+    }
+}
+
+#[test]
 fn test_cli_help_shows_subcommand_and_arg_descriptions() {
     let result = bin().arg("--help").output().unwrap();
     assert_eq!(result.status.code(), Some(0));

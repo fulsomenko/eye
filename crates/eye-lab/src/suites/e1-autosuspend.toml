@@ -1,0 +1,9 @@
+name = "e1-autosuspend"
+description = "E1: emitter byte across USB runtime autosuspend (row 3)"
+
+[[step]]
+test = "emitter_persistence"
+label = "e1 row 3: autosuspend"
+mode = { streams = "ir", emitter = "on" }
+params = { reopens = 1, frames = 30, rgb_cycle = false, autosuspend_wait_s = 330.0, expect_autosuspend = "report" }
+timeout_s = 420.0

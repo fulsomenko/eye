@@ -1,0 +1,13 @@
+name = "e1-after-event"
+description = "E1 human procedure: after an event the root spec records as persisting, the emitter is still on"
+
+[defaults]
+mode = { streams = "ir", emitter = "keep" }
+
+[[step]]
+test = "emitter_mode"
+params = { expect = "on" }
+
+[[step]]
+test = "ir_alternation"
+params = { expect = "on", tagging = "brightness" }

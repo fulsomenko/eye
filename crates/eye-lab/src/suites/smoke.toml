@@ -1,0 +1,12 @@
+name = "smoke"
+description = "Both cameras open and deliver well-formed frames; never touches the emitter"
+
+[defaults]
+mode = { streams = "dual" }
+
+[[step]]
+test = "opens"
+
+[[step]]
+test = "frame_format"
+params = { frames = 5 }

@@ -1,0 +1,8 @@
+name = "e5"
+description = "E5: RGB vs IR timestamp offset, dark pairing, rates and drift over 60 s (R30)"
+
+[[step]]
+test = "dual_sync"
+mode = { streams = "dual", emitter = "on" }
+params = { frames = 450, expected_median_ms = 3.0, median_tolerance_ms = 3.0, max_spread_ms = 10.0, max_drift_ms_per_min = 1.0, min_pair_rate = 0.95, min_dark_fraction = 0.95, expected_rgb_fps = 7.5, expected_ir_fps = 15.0, fps_tolerance = 1.0 }
+timeout_s = 120.0

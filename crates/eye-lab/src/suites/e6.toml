@@ -1,0 +1,7 @@
+name = "e6"
+description = "E6: UVCM FrameIllumination tags agree with per-frame brightness; parity holds; lit/dark margins"
+
+[[step]]
+test = "ir_tagging_agreement"
+mode = { streams = "ir", emitter = "on" }
+params = { frames = 1200, lit_threshold = 20.0, min_agreement = 0.999, max_dark_p95 = 15.0, min_lit_p5 = 25.0, require_metadata = true }

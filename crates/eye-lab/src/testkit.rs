@@ -454,6 +454,65 @@ impl FrameSource for EmitterAwareSource {
     }
 }
 
+/// Wraps an `EmitterAwareSource`; on its first `next_frame()` stores `MODE_OFF` into `mode`
+/// (a firmware that resets selector 6 on STREAMON).
+#[derive(Debug)]
+pub(crate) struct ResetOnStreamOn {
+    pub inner: EmitterAwareSource,
+    pub mode: Arc<AtomicU8>,
+    pub started: bool,
+}
+
+impl FrameSource for ResetOnStreamOn {
+    fn camera(&self) -> &CameraInfo {
+        self.inner.camera()
+    }
+
+    fn next_frame(&mut self) -> Result<Frame, CaptureError> {
+        if !self.started {
+            self.started = true;
+            self.mode
+                .store(eye_platform::emitter::MODE_OFF, Ordering::SeqCst);
+        }
+        self.inner.next_frame()
+    }
+}
+
+/// `FakeSession` whose devices map has an IR `CameraDevice` with `usb.sysfs_device = dir`
+/// (a temp dir holding `idVendor` and `power/runtime_status`).
+pub(crate) fn session_with_usb_dir(
+    dir: &Path,
+    emitter: FakeEmitter,
+    ir_sources: Vec<Box<dyn FrameSource>>,
+) -> FakeSession {
+    let usb = UsbIdentity {
+        vendor_id: 0x0c45,
+        product_id: 0x672c,
+        interface: 2,
+        sysfs_device: dir.to_path_buf(),
+    };
+    let device = CameraDevice {
+        node: PathBuf::from("/dev/video2"),
+        card: "Dell IR".to_owned(),
+        driver: "uvcvideo".to_owned(),
+        bus: "usb-0000:00:14.0-6".to_owned(),
+        kind: CameraKind::Ir,
+        formats: vec![],
+        usb: Some(usb),
+        extension_units: vec![],
+        metadata_node: None,
+    };
+    let mut session = FakeSession {
+        emitter: Some(emitter),
+        ..FakeSession::empty()
+    };
+    session.devices.insert(Role::Ir, device);
+    for s in ir_sources {
+        session = session.with_source(Role::Ir, s);
+    }
+    session
+}
+
 /// Metadata stream that pops scripted records, then `Err(CaptureError::EndOfStream)`.
 #[derive(Debug)]
 pub(crate) struct FakeMeta {

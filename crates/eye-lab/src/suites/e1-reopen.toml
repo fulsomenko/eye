@@ -1,0 +1,14 @@
+name = "e1-reopen"
+description = "E1: emitter byte survives IR stream reopen (row 1) and RGB stream start/stop (row 2) without re-applying it"
+
+[[step]]
+test = "emitter_persistence"
+label = "e1 row 1: ir reopen"
+mode = { streams = "ir", emitter = "on" }
+params = { reopens = 10, frames = 30, rgb_cycle = false, expect_reopen = "persist" }
+
+[[step]]
+test = "emitter_persistence"
+label = "e1 row 2: rgb start/stop"
+mode = { streams = "dual", emitter = "on" }
+params = { reopens = 10, frames = 30, rgb_cycle = true, expect_reopen = "report" }
