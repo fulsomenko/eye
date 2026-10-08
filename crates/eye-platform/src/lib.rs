@@ -16,6 +16,10 @@ pub use camera::{
     CameraDevice, CameraKind, CameraProbe, FormatInfo, FrameSizeInfo, UsbIdentity, V4l2CameraProbe,
     usb_desc::{ExtensionUnit, Guid, extension_units},
 };
+pub use emitter::{
+    EmitterControl, EmitterError, EmitterGuard, IrEmitter, MsxuIrEmitter, XuOpener,
+    find_face_auth_control,
+};
 pub use uvc::{
     META_FORMAT_UVCM, UvcXuDevice, XuError, XuInfo, XuQuery, XuTransport, meta_format,
     set_meta_format,
