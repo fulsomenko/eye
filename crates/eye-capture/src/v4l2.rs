@@ -19,7 +19,7 @@ fn default_buffers() -> u32 {
 }
 
 fn default_timeout_ms() -> u64 {
-    500
+    2000
 }
 
 #[derive(Debug, Clone)]
@@ -35,7 +35,7 @@ pub struct V4l2Config {
 }
 
 impl V4l2Config {
-    /// fps 30, buffers 4, timeout 500 ms.
+    /// fps 30, buffers 4, timeout 2000 ms.
     pub fn new(
         id: CameraId,
         device: PathBuf,
@@ -63,6 +63,27 @@ pub struct V4l2Source {
     timeout: Duration,
     stream: v4l::io::mmap::Stream<'static>,
     seq: SeqWidener,
+    started: bool,
+    timeout_state: TimeoutState,
+}
+
+#[derive(Debug, Default)]
+struct TimeoutState {
+    pending_dequeue: bool,
+}
+
+impl TimeoutState {
+    fn on_timeout(&mut self, started: bool) {
+        self.pending_dequeue = started;
+    }
+
+    fn needs_dequeue(&self) -> bool {
+        self.pending_dequeue
+    }
+
+    fn on_dequeued(&mut self) {
+        self.pending_dequeue = false;
+    }
 }
 
 impl std::fmt::Debug for V4l2Source {
@@ -148,6 +169,8 @@ impl V4l2Source {
             timeout,
             stream,
             seq: SeqWidener::default(),
+            started: false,
+            timeout_state: TimeoutState::default(),
         })
     }
 
@@ -217,9 +240,34 @@ impl FrameSource for V4l2Source {
         const ENODEV: i32 = 19;
         let camera = self.info.id.to_string();
         loop {
+            if self.timeout_state.needs_dequeue() {
+                match CaptureStream::dequeue(&mut self.stream) {
+                    Ok(_) => {
+                        self.timeout_state.on_dequeued();
+                        tracing::debug!(%camera, "recovered pending dequeue after timeout, dropping frame");
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                        return Err(CaptureError::Timeout {
+                            camera,
+                            timeout: self.timeout,
+                        });
+                    }
+                    Err(e) if e.raw_os_error() == Some(ENODEV) => {
+                        return Err(CaptureError::Disconnected { camera });
+                    }
+                    Err(source) => return Err(CaptureError::Io { camera, source }),
+                }
+                continue;
+            }
+
             let (buf, meta) = match CaptureStream::next(&mut self.stream) {
-                Ok(next) => next,
+                Ok(next) => {
+                    self.started = true;
+                    next
+                }
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    self.started = true;
+                    self.timeout_state.on_timeout(self.started);
                     return Err(CaptureError::Timeout {
                         camera,
                         timeout: self.timeout,
@@ -429,13 +477,13 @@ mod tests {
         let options: V4l2Options = table.try_into().unwrap();
         assert_eq!(options.fps, 30);
         assert_eq!(options.buffers, 4);
-        assert_eq!(options.timeout_ms, 500);
+        assert_eq!(options.timeout_ms, 2000);
 
         let config = options.into_config(CameraId::from("ir"));
         assert_eq!(config.format, PixelFormat::Gray8);
         assert_eq!(config.width, 640);
         assert_eq!(config.height, 360);
-        assert_eq!(config.timeout, Duration::from_millis(500));
+        assert_eq!(config.timeout, Duration::from_millis(2000));
     }
 
     #[test]
@@ -494,6 +542,78 @@ mod tests {
     fn test_v4l2_source_is_send() {
         fn f<T: Send>() {}
         f::<V4l2Source>();
+    }
+
+    #[test]
+    fn test_pending_dequeue_is_set_only_after_start() {
+        let mut state = TimeoutState::default();
+        assert!(!state.needs_dequeue());
+
+        state.on_timeout(false);
+        assert!(!state.needs_dequeue());
+
+        state.on_timeout(true);
+        assert!(state.needs_dequeue());
+
+        state.on_dequeued();
+        assert!(!state.needs_dequeue());
+    }
+
+    #[test]
+    #[ignore = "needs hardware"]
+    fn test_live_dual_first_frame_timeout_recovers() {
+        let ir_config = V4l2Config {
+            timeout: Duration::from_millis(50),
+            ..V4l2Config::new(
+                CameraId::from("ir"),
+                PathBuf::from("/dev/video2"),
+                PixelFormat::Gray8,
+                640,
+                360,
+            )
+        };
+        let mut ir = V4l2Source::open(ir_config).unwrap();
+        for attempt in 0.. {
+            match ir.next_frame() {
+                Ok(_) => break,
+                Err(CaptureError::Timeout { .. }) if attempt < 40 => continue,
+                Err(e) => panic!("ir first frame failed: {e}"),
+            }
+        }
+
+        let rgb_config = V4l2Config {
+            timeout: Duration::from_millis(50),
+            ..V4l2Config::new(
+                CameraId::from("rgb"),
+                PathBuf::from("/dev/video0"),
+                PixelFormat::Mjpeg,
+                1280,
+                720,
+            )
+        };
+        let mut rgb = V4l2Source::open(rgb_config).unwrap();
+
+        let mut timed_out = false;
+        let mut got_frame = false;
+        for _ in 0..30 {
+            match rgb.next_frame() {
+                Ok(_) => {
+                    got_frame = true;
+                    break;
+                }
+                Err(CaptureError::Timeout { .. }) => timed_out = true,
+                Err(e) => panic!("unexpected error before first frame: {e}"),
+            }
+        }
+        assert!(timed_out, "expected at least one timeout before recovery");
+        assert!(got_frame, "expected a frame after the recovery dequeue");
+
+        for _ in 0..30 {
+            match rgb.next_frame() {
+                Ok(_) | Err(CaptureError::Timeout { .. }) => {}
+                Err(e) => panic!("unexpected error after recovery: {e}"),
+            }
+        }
     }
 
     #[test]
