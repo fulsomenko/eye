@@ -10,12 +10,18 @@ use std::{
 };
 
 use eye_capture::{CaptureError, FrameSource, IlluminationMeta, MetaRecord};
-use eye_core::{CameraId, CameraInfo, Frame, FrameHeader, Illumination, PixelFormat, Timestamp};
+use eye_core::{
+    CameraId, CameraInfo, Ellipse2, EyeObservation, FaceObservation, Frame, FrameHeader, FrameSet,
+    Illumination, Measured, Observations, PixelFormat, Side, Timestamp,
+    observation::SCHEME_IR_PUPIL_PAIR,
+    stage::{Detector, StageError},
+};
 use eye_platform::{
     CameraDevice, CameraKind, EmitterError, ExtensionUnit, FormatInfo, FrameSizeInfo,
     MsxuIrEmitter, UsbIdentity, XuError, XuOpener, XuQuery, XuTransport, emitter::MSXU_GUID,
     find_face_auth_control,
 };
+use nalgebra::Point2;
 
 use crate::{
     case::{Needs, ParamError, RunOptions, TestCase, TestCtx, TestError, TestOutput, TestRegistry},
@@ -24,6 +30,7 @@ use crate::{
         StreamTarget, Teardown,
     },
     modes::{CameraSelection, LiveHost, opener::Opener},
+    pipeline::DetectorFactory,
     runner::PlannedStep,
     sequence::{EmitterSel, ModeSpec, StreamsSel},
 };
@@ -902,4 +909,81 @@ impl TestCase for ReadEmitterCase {
         out.push(crate::case::Measurement::info("mode", f64::from(mode), ""));
         Ok(out)
     }
+}
+
+/// Accepts Gray8 frames whose illumination is in `accepts` (empty = all); finds one Left eye with a
+/// pupil circle of radius 3 at `(100.0 + dx(seq), 50.0)` (sigma 0.5) in a `FaceObservation { scheme: SCHEME_IR_PUPIL_PAIR, landmarks: vec![], eyes }`
+/// when the frame's first byte is > 20, else returns `Observations::empty`; every `fail_every`-th call returns
+/// `Err(StageError::Failed("fake".into()))`.
+#[derive(Debug)]
+pub(crate) struct FakeDetector {
+    pub accepts: Vec<Illumination>,
+    pub fail_every: Option<usize>,
+    pub dx: fn(u64) -> f64,
+    pub calls: usize,
+}
+
+impl Detector for FakeDetector {
+    fn name(&self) -> &'static str {
+        "fake"
+    }
+
+    fn accepts(&self, format: PixelFormat, illumination: Illumination) -> bool {
+        format == PixelFormat::Gray8
+            && (self.accepts.is_empty() || self.accepts.contains(&illumination))
+    }
+
+    fn detect(&mut self, frames: &FrameSet) -> Result<Vec<Observations>, StageError> {
+        self.calls += 1;
+        if let Some(n) = self.fail_every
+            && n != 0
+            && self.calls.is_multiple_of(n)
+        {
+            return Err(StageError::Failed("fake".into()));
+        }
+        Ok(frames
+            .frames()
+            .iter()
+            .map(|f| {
+                let h = f.header();
+                if f.data().first().is_some_and(|&b| b > 20) {
+                    let mut eye = EyeObservation::new(Side::Left);
+                    eye.pupil = Some(
+                        Measured::new(
+                            Ellipse2::circle(Point2::new(100.0 + (self.dx)(h.seq), 50.0), 3.0)
+                                .expect("valid fake pupil circle"),
+                            0.5,
+                        )
+                        .expect("valid fake sigma"),
+                    );
+                    Observations {
+                        camera: h.camera.clone(),
+                        timestamp: h.timestamp,
+                        face: Some(FaceObservation {
+                            scheme: SCHEME_IR_PUPIL_PAIR,
+                            landmarks: vec![],
+                            eyes: vec![eye],
+                        }),
+                    }
+                } else {
+                    Observations::empty(h.camera.clone(), h.timestamp)
+                }
+            })
+            .collect())
+    }
+}
+
+pub(crate) fn fake_detectors(
+    accepts: Vec<Illumination>,
+    fail_every: Option<usize>,
+    dx: fn(u64) -> f64,
+) -> DetectorFactory {
+    Arc::new(move |_section, _rig| {
+        Ok(Box::new(FakeDetector {
+            accepts: accepts.clone(),
+            fail_every,
+            dx,
+            calls: 0,
+        }) as Box<dyn Detector>)
+    })
 }

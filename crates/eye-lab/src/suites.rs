@@ -16,6 +16,7 @@ const E1_AFTER_EVENT: &str = include_str!("suites/e1-after-event.toml");
 const E1_AFTER_RESET: &str = include_str!("suites/e1-after-reset.toml");
 const E5: &str = include_str!("suites/e5.toml");
 const E6: &str = include_str!("suites/e6.toml");
+const PIPELINE: &str = include_str!("suites/pipeline.toml");
 
 pub const BUILTIN: &[SuiteDef] = &[
     SuiteDef {
@@ -62,6 +63,11 @@ pub const BUILTIN: &[SuiteDef] = &[
         parts: &[("e6.toml", E6)],
     },
     SuiteDef {
+        name: "pipeline",
+        summary: "live IR pipeline; needs a subject (~1 min)",
+        parts: &[("pipeline.toml", PIPELINE)],
+    },
+    SuiteDef {
         name: "regression",
         summary: "E1 reopen + E5 + E6 (~4 min)",
         parts: &[
@@ -72,12 +78,13 @@ pub const BUILTIN: &[SuiteDef] = &[
     },
     SuiteDef {
         name: "full",
-        summary: "hardware + regression",
+        summary: "hardware + regression + pipeline (pipeline steps need a subject; --no-subject skips them)",
         parts: &[
             ("hardware.toml", HARDWARE),
             ("e1-reopen.toml", E1_REOPEN),
             ("e5.toml", E5),
             ("e6.toml", E6),
+            ("pipeline.toml", PIPELINE),
         ],
     },
 ];
@@ -137,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn test_suite_names_are_unique_and_full_is_hardware_plus_regression() {
+    fn test_suite_names_are_unique_and_full_is_hardware_plus_regression_plus_pipeline() {
         let mut names: Vec<&str> = BUILTIN.iter().map(|s| s.name).collect();
         names.sort_unstable();
         names.dedup();
@@ -145,11 +152,13 @@ mod tests {
 
         let hardware = find("hardware").unwrap();
         let regression = find("regression").unwrap();
+        let pipeline = find("pipeline").unwrap();
         let full = find("full").unwrap();
         let expected: Vec<String> = hardware
             .sources()
             .into_iter()
             .chain(regression.sources())
+            .chain(pipeline.sources())
             .collect();
         assert_eq!(full.sources(), expected);
 

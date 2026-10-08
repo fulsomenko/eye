@@ -1,0 +1,11 @@
+[[camera]]
+id = "ir"
+device = "/dev/video2"
+format = "gray"
+size = [640, 360]
+
+[detect]
+ir = "ir-classic"
+
+[estimate]
+kind = "ir-pupil"

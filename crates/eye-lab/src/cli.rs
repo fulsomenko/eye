@@ -78,6 +78,9 @@ pub struct RunArgs {
     /// Seconds a timed-out or interrupted test may take to stop before it is abandoned
     #[arg(long, value_name = "SECONDS", default_value_t = 5.0, value_parser = parse_positive_seconds)]
     pub grace_s: f64,
+    /// eye.toml for pipeline tests (default: the embedded IR-only config)
+    #[arg(long, value_name = "PATH")]
+    pub eye_config: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -246,7 +249,7 @@ fn run_command(args: RunArgs) -> u8 {
     let options = RunOptions {
         subject: !args.no_subject,
         grace: Duration::from_secs_f64(args.grace_s),
-        eye_config: None,
+        eye_config: args.eye_config.clone(),
     };
 
     let started = SystemTime::now();

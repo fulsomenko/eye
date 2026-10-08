@@ -282,6 +282,7 @@ fn test_cli_suites_lists_all_builtin_names() {
         "e1-after-reset",
         "e5",
         "e6",
+        "pipeline",
         "regression",
         "full",
     ];

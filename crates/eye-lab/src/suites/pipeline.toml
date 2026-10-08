@@ -1,0 +1,14 @@
+name = "pipeline"
+description = "Live IR pipeline with a person in front of the camera: detection rate, pupil jitter, tracker latency"
+
+[defaults]
+mode = { streams = "ir", emitter = "on" }
+
+[[step]]
+test = "detection_rate"
+
+[[step]]
+test = "pupil_jitter"
+
+[[step]]
+test = "tracker_latency"
