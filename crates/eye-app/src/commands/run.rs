@@ -32,6 +32,9 @@ pub struct Args {
     /// Log live latency (frame timestamp to emit) every 5 s
     #[arg(long)]
     pub stats: bool,
+    /// Overrides [output].easing_ms; 0 disables point-mode easing
+    #[arg(long)]
+    pub easing_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -69,6 +72,9 @@ pub fn apply_output_overrides(output: &mut OutputConfig, args: &Args) -> anyhow:
             "--grid only applies to region mode"
         );
         output.grid = [cols, rows];
+    }
+    if let Some(easing_ms) = args.easing_ms {
+        output.easing_ms = easing_ms;
     }
     Ok(())
 }
@@ -224,11 +230,13 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         &report.cameras,
         EmitterGuard::enable,
     )?;
-    let mut overlay = LayerShellOverlay::spawn(OverlayOptions::new(
+    let mut overlay_options = OverlayOptions::new(
         rig.screen().output.clone(),
         overlay_mode(&config.output),
         rig.screen(),
-    ))?;
+    );
+    overlay_options.easing = eye_overlay::point::Easing::from_millis(config.output.easing_ms);
+    let mut overlay = LayerShellOverlay::spawn(overlay_options)?;
     let tracker = Tracker::from_config(&config, rig, correction)?;
     let points = tracker.subscribe();
     let mut ticker = StatsTicker::new(args.stats, Duration::from_secs(5), Instant::now());
@@ -329,6 +337,7 @@ mod tests {
             profile: "default".to_string(),
             no_profile: false,
             stats: false,
+            easing_ms: None,
         }
     }
 
@@ -343,6 +352,15 @@ mod tests {
         assert_eq!(output.mode, OutputMode::Region);
         assert_eq!(output.grid, [3, 3]);
         assert_eq!(output.target, Some("eDP-1".to_string()));
+    }
+
+    #[test]
+    fn test_output_overrides_apply_easing_ms() {
+        let mut output = OutputConfig::default();
+        let mut args = args_with(None, None);
+        args.easing_ms = Some(0);
+        apply_output_overrides(&mut output, &args).expect("overrides apply");
+        assert_eq!(output.easing_ms, 0);
     }
 
     #[test]

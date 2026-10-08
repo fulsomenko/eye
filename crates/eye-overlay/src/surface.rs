@@ -260,7 +260,8 @@ impl<S: Scene> CompositorHandler for State<S> {
         _time: u32,
     ) {
         self.frame_pending = false;
-        if self.needs_redraw {
+        let moving = self.scene.step(Instant::now());
+        if self.needs_redraw || moving {
             self.draw();
         }
     }
@@ -728,6 +729,59 @@ mod tests {
             CountingScene { count },
         );
         assert!(matches!(result, Err(OverlayError::OutputNotFound { .. })));
+    }
+
+    struct MovingScene {
+        remaining_steps: Arc<AtomicUsize>,
+        draws: Arc<AtomicUsize>,
+    }
+
+    impl Scene for MovingScene {
+        type Msg = ();
+
+        fn on_msg(&mut self, _msg: (), _now: Instant) {}
+
+        fn step(&mut self, _now: Instant) -> bool {
+            self.remaining_steps
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    (n > 0).then(|| n - 1)
+                })
+                .is_ok()
+        }
+
+        fn render(
+            &mut self,
+            _canvas: &mut crate::canvas::Canvas<'_>,
+            _now: Instant,
+        ) -> crate::scene::Schedule {
+            self.draws.fetch_add(1, Ordering::SeqCst);
+            crate::scene::Schedule::Idle
+        }
+    }
+
+    #[test]
+    #[ignore = "needs wayland"]
+    fn test_frame_callback_draws_only_while_moving() {
+        let output = std::env::var("EYE_OUTPUT").unwrap_or_else(|_| "eDP-1".to_string());
+        let remaining_steps = Arc::new(AtomicUsize::new(5));
+        let draws = Arc::new(AtomicUsize::new(0));
+        let handle = spawn(
+            SurfaceOptions {
+                output: Some(output),
+                namespace: "eye-overlay",
+            },
+            MovingScene {
+                remaining_steps: remaining_steps.clone(),
+                draws: draws.clone(),
+            },
+        )
+        .expect("spawn succeeds");
+        std::thread::sleep(Duration::from_secs(1));
+        let settled = draws.load(Ordering::SeqCst);
+        assert!(settled >= 6);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(draws.load(Ordering::SeqCst), settled);
+        assert!(handle.close().is_ok());
     }
 
     #[test]

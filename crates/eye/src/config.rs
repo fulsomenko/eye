@@ -135,6 +135,8 @@ pub struct OutputConfig {
     pub mode: OutputMode,
     /// `[cols, rows]`, used by region mode.
     pub grid: [u32; 2],
+    /// Point-mode render-rate easing time constant; 0 disables easing. Ignored in region mode.
+    pub easing_ms: u64,
 }
 
 impl Default for OutputConfig {
@@ -144,6 +146,7 @@ impl Default for OutputConfig {
             target: None,
             mode: OutputMode::Point,
             grid: [3, 3],
+            easing_ms: 80,
         }
     }
 }
@@ -395,6 +398,7 @@ mod tests {
                 target: Some("eDP-1".to_string()),
                 mode: OutputMode::Point,
                 grid: [4, 4],
+                easing_ms: 80,
             }
         );
         assert_eq!(config.rig, None);
@@ -504,6 +508,7 @@ mod tests {
                 target: None,
                 mode: OutputMode::Point,
                 grid: [3, 3],
+                easing_ms: 80,
             }
         );
     }

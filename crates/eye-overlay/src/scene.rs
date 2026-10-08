@@ -25,6 +25,12 @@ pub trait Scene: Send + 'static {
 
     fn on_msg(&mut self, msg: Self::Msg, now: Instant);
 
+    /// Called once per compositor frame callback. `true` keeps the callback chain alive
+    /// (another `render` is needed); scenes with nothing to animate keep the default `false`.
+    fn step(&mut self, _now: Instant) -> bool {
+        false
+    }
+
     /// The canvas has already been cleared where this buffer was last drawn.
     fn render(&mut self, canvas: &mut Canvas<'_>, now: Instant) -> Schedule;
 

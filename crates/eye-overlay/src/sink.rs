@@ -8,7 +8,7 @@ use nalgebra::Vector2;
 use crate::ellipse::logical_px_per_mm;
 use crate::error::OverlayError;
 use crate::handle::OverlayHandle;
-use crate::point::PointScene;
+use crate::point::{Easing, PointScene};
 use crate::region::RegionScene;
 use crate::surface::{SurfaceOptions, spawn};
 
@@ -24,6 +24,7 @@ pub struct OverlayOptions {
     pub mode: OverlayMode,
     pub px_per_mm: Vector2<f64>,
     pub color: [u8; 3],
+    pub easing: Easing,
 }
 
 impl OverlayOptions {
@@ -33,6 +34,7 @@ impl OverlayOptions {
             mode,
             px_per_mm: logical_px_per_mm(screen),
             color: [255, 64, 64],
+            easing: Easing::default(),
         }
     }
 }
@@ -50,9 +52,10 @@ impl LayerShellOverlay {
             namespace: "eye-overlay",
         };
         let handle = match options.mode {
-            OverlayMode::Point => {
-                spawn(surface, PointScene::new(options.px_per_mm, options.color))?
-            }
+            OverlayMode::Point => spawn(
+                surface,
+                PointScene::with_easing(options.px_per_mm, options.color, options.easing),
+            )?,
             OverlayMode::Region { cols, rows } => {
                 let grid = Grid::new(cols, rows).ok_or(OverlayError::InvalidGrid { cols, rows })?;
                 spawn(
