@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use eye_core::stage::GazeCorrection;
 use eye_core::{GazeRay, Rig, Side};
 use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
-use eye_geometry::uncertainty::propagate;
+use eye_geometry::uncertainty::{block_diag, numeric_jacobian, propagate};
 use nalgebra::{Matrix2, SMatrix, SVector, Vector2};
 
 #[derive(
@@ -33,6 +33,16 @@ impl From<Option<Side>> for EyeKey {
 pub struct AngularCorrection {
     pub theta: [f64; 6],
     pub cov: [[f64; 6]; 6],
+    /// `Quadratic` only: `[c0, c1, c2, d0, d1, d2]` added to `theta`'s map as
+    /// `+ c0*yaw^2 + c1*pitch^2 + c2*yaw*pitch` (resp. `d.. ` for pitch'). Zero for every other model.
+    #[serde(default)]
+    pub quad: [f64; 6],
+    #[serde(default)]
+    pub quad_cov: [[f64; 6]; 6],
+    /// `Quadratic` only: the `cov[r][k] = Cov(theta_r, quad_k)` cross block of the joint 12x12
+    /// fit covariance. Zero for every other model.
+    #[serde(default)]
+    pub quad_cross_cov: [[f64; 6]; 6],
     pub model: CorrectionModel,
     pub targets_used: u32,
     pub rms_after_rad: f64,
@@ -43,6 +53,11 @@ pub struct AngularCorrection {
 pub enum CorrectionModel {
     Affine,
     OffsetOnly,
+    /// Second-order polynomial in `(yaw, pitch)`, screen frame: `theta`'s affine map plus `quad`.
+    Quadratic,
+    /// `theta`'s affine map applied in the head frame (`GazeRay::head_rotation`), not the screen
+    /// frame: rotate the ray into the head frame, apply, rotate back.
+    HeadFrame,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -60,19 +75,91 @@ pub(crate) fn design(o: &Vector2<f64>) -> SMatrix<f64, 2, 6> {
     SMatrix::<f64, 2, 6>::new(1.0, o.x, o.y, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, o.x, o.y)
 }
 
+pub(crate) fn design_quad(o: &Vector2<f64>) -> SMatrix<f64, 2, 6> {
+    let (yy, pp, yp) = (o.x * o.x, o.y * o.y, o.x * o.y);
+    SMatrix::<f64, 2, 6>::new(yy, pp, yp, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, yy, pp, yp)
+}
+
+pub(crate) fn design12(o: &Vector2<f64>) -> SMatrix<f64, 2, 12> {
+    let mut d = SMatrix::<f64, 2, 12>::zeros();
+    d.fixed_view_mut::<2, 6>(0, 0).copy_from(&design(o));
+    d.fixed_view_mut::<2, 6>(0, 6).copy_from(&design_quad(o));
+    d
+}
+
+fn head_frame_correct(
+    rot: &nalgebra::UnitQuaternion<f64>,
+    a: &Vector2<f64>,
+    th: &SVector<f64, 6>,
+) -> Vector2<f64> {
+    let dir_head = rot.inverse() * direction_from_yaw_pitch(a);
+    let a_head = yaw_pitch_from_direction(&dir_head);
+    let corrected_head = a_head + design(&a_head) * th;
+    yaw_pitch_from_direction(&(*rot * direction_from_yaw_pitch(&corrected_head)))
+}
+
 impl GazeCorrection for UserProfile {
     fn correct(&self, ray: &GazeRay) -> GazeRay {
         let Some(c) = self.eyes.get(&EyeKey::from(ray.side)) else {
             return ray.clone();
         };
-        let th = SVector::<f64, 6>::from(c.theta);
         let a = yaw_pitch_from_direction(&ray.direction);
-        let b = design(&a);
-        let j = Matrix2::new(1.0 + th[1], th[2], th[4], 1.0 + th[5]);
-        let cov_theta = SMatrix::<f64, 6, 6>::from_fn(|r, k| c.cov[r][k]);
+        let (corrected, angular_cov) = match c.model {
+            CorrectionModel::Affine | CorrectionModel::OffsetOnly => {
+                let th = SVector::<f64, 6>::from(c.theta);
+                let b = design(&a);
+                let j = Matrix2::new(1.0 + th[1], th[2], th[4], 1.0 + th[5]);
+                let cov_theta = SMatrix::<f64, 6, 6>::from_fn(|r, k| c.cov[r][k]);
+                (
+                    a + b * th,
+                    propagate(&j, &ray.angular_cov) + propagate(&b, &cov_theta),
+                )
+            }
+            CorrectionModel::Quadratic => {
+                let th = SVector::<f64, 6>::from(c.theta);
+                let q = SVector::<f64, 6>::from(c.quad);
+                let b = design(&a);
+                let bq = design_quad(&a);
+                let j = Matrix2::new(
+                    1.0 + th[1] + 2.0 * q[0] * a.x + q[2] * a.y,
+                    th[2] + 2.0 * q[1] * a.y + q[2] * a.x,
+                    th[4] + 2.0 * q[3] * a.x + q[5] * a.y,
+                    1.0 + th[5] + 2.0 * q[4] * a.y + q[5] * a.x,
+                );
+                let b12 = design12(&a);
+                let cov_theta = SMatrix::<f64, 6, 6>::from_fn(|r, k| c.cov[r][k]);
+                let cov_quad = SMatrix::<f64, 6, 6>::from_fn(|r, k| c.quad_cov[r][k]);
+                let cross = SMatrix::<f64, 6, 6>::from_fn(|r, k| c.quad_cross_cov[r][k]);
+                let mut cov12 = SMatrix::<f64, 12, 12>::zeros();
+                cov12.fixed_view_mut::<6, 6>(0, 0).copy_from(&cov_theta);
+                cov12.fixed_view_mut::<6, 6>(6, 6).copy_from(&cov_quad);
+                cov12.fixed_view_mut::<6, 6>(0, 6).copy_from(&cross);
+                cov12
+                    .fixed_view_mut::<6, 6>(6, 0)
+                    .copy_from(&cross.transpose());
+                (
+                    a + b * th + bq * q,
+                    propagate(&j, &ray.angular_cov) + propagate(&b12, &cov12),
+                )
+            }
+            CorrectionModel::HeadFrame => {
+                let th = SVector::<f64, 6>::from(c.theta);
+                let cov_theta = SMatrix::<f64, 6, 6>::from_fn(|r, k| c.cov[r][k]);
+                let rot = ray.head_rotation;
+                let x = SVector::<f64, 8>::from_fn(|i, _| if i < 2 { a[i] } else { th[i - 2] });
+                let cov8 = block_diag::<2, 6, 8>(&ray.angular_cov, &cov_theta);
+                let f = move |x: &SVector<f64, 8>| -> Option<SVector<f64, 2>> {
+                    let ao = Vector2::new(x[0], x[1]);
+                    let theta = SVector::<f64, 6>::from_fn(|i, _| x[2 + i]);
+                    Some(head_frame_correct(&rot, &ao, &theta))
+                };
+                let j = numeric_jacobian::<2, 8>(f, &x).unwrap_or_else(SMatrix::zeros);
+                (head_frame_correct(&rot, &a, &th), propagate(&j, &cov8))
+            }
+        };
         GazeRay {
-            direction: direction_from_yaw_pitch(&(a + b * th)),
-            angular_cov: propagate(&j, &ray.angular_cov) + propagate(&b, &cov_theta),
+            direction: direction_from_yaw_pitch(&corrected),
+            angular_cov,
             ..ray.clone()
         }
     }
@@ -139,7 +226,7 @@ mod tests {
 
     use approx::assert_abs_diff_eq;
     use eye_core::{CameraId, CameraModel, OutputId, ScreenModel};
-    use nalgebra::{Point3, SMatrix, Unit, Vector2, Vector3};
+    use nalgebra::{Point3, SMatrix, Unit, UnitQuaternion, Vector2, Vector3};
 
     use super::*;
     use crate::nominal::nominal_screen_from_camera;
@@ -185,6 +272,9 @@ mod tests {
             AngularCorrection {
                 theta: [0.01, -0.02, 0.0, 0.03, 0.0, -0.01],
                 cov: [[0.0; 6]; 6],
+                quad: [0.0; 6],
+                quad_cov: [[0.0; 6]; 6],
+                quad_cross_cov: [[0.0; 6]; 6],
                 model: CorrectionModel::Affine,
                 targets_used: 9,
                 rms_after_rad: 0.001,
@@ -207,6 +297,7 @@ mod tests {
             direction: Unit::new_normalize(Vector3::new(0.1, -0.05, 1.0)),
             angular_cov: Matrix2::identity() * 1e-4,
             origin_cov: nalgebra::Matrix3::zeros(),
+            head_rotation: UnitQuaternion::identity(),
         }
     }
 
@@ -231,6 +322,9 @@ mod tests {
             AngularCorrection {
                 theta: [0.0; 6],
                 cov,
+                quad: [0.0; 6],
+                quad_cov: [[0.0; 6]; 6],
+                quad_cross_cov: [[0.0; 6]; 6],
                 model: CorrectionModel::Affine,
                 targets_used: 9,
                 rms_after_rad: 0.0,
@@ -280,5 +374,135 @@ mod tests {
         let mut with_extra = text;
         with_extra.push_str("\nfoo = 1\n");
         assert!(toml::from_str::<UserProfile>(&with_extra).is_err());
+    }
+
+    fn single_eye_profile(model: CorrectionModel, theta: [f64; 6]) -> UserProfile {
+        let mut eyes = BTreeMap::new();
+        eyes.insert(
+            EyeKey::Right,
+            AngularCorrection {
+                theta,
+                cov: [[0.0; 6]; 6],
+                quad: [0.0; 6],
+                quad_cov: [[0.0; 6]; 6],
+                quad_cross_cov: [[0.0; 6]; 6],
+                model,
+                targets_used: 9,
+                rms_after_rad: 0.0,
+            },
+        );
+        UserProfile {
+            version: 1,
+            name: "x".into(),
+            created_unix_s: 0,
+            rig_fingerprint: String::new(),
+            estimator: "landmark".into(),
+            eyes,
+        }
+    }
+
+    #[test]
+    fn test_head_frame_equals_affine_at_identity_head_rotation() {
+        let theta = [0.02, -0.01, 0.0, -0.015, 0.0, 0.02];
+        let head_profile = single_eye_profile(CorrectionModel::HeadFrame, theta);
+        let affine_profile = single_eye_profile(CorrectionModel::Affine, theta);
+
+        let ray = straight_ray(Some(eye_core::Side::Right));
+        let a = yaw_pitch_from_direction(&head_profile.correct(&ray).direction);
+        let b = yaw_pitch_from_direction(&affine_profile.correct(&ray).direction);
+        assert_abs_diff_eq!(a.x, b.x, epsilon = 1e-9);
+        assert_abs_diff_eq!(a.y, b.y, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_head_frame_tracks_head_rotation() {
+        let theta = [0.2, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let profile = single_eye_profile(CorrectionModel::HeadFrame, theta);
+
+        let mut ray = straight_ray(Some(eye_core::Side::Right));
+        ray.head_rotation =
+            UnitQuaternion::from_axis_angle(&Vector3::x_axis(), 60.0_f64.to_radians());
+        let corrected = yaw_pitch_from_direction(&profile.correct(&ray).direction);
+
+        let th = SVector::<f64, 6>::from(theta);
+        let dir_head = ray.head_rotation.inverse() * ray.direction;
+        let a_head = yaw_pitch_from_direction(&dir_head);
+        let corrected_head = a_head + design(&a_head) * th;
+        let expected = yaw_pitch_from_direction(
+            &(ray.head_rotation * direction_from_yaw_pitch(&corrected_head)),
+        );
+
+        assert_abs_diff_eq!(corrected.x, expected.x, epsilon = 1e-9);
+        assert_abs_diff_eq!(corrected.y, expected.y, epsilon = 1e-9);
+
+        let a = yaw_pitch_from_direction(&ray.direction);
+        let naive = a + design(&a) * th;
+        assert!(
+            (corrected - naive).norm() > 0.02,
+            "{corrected:?} vs {naive:?}"
+        );
+    }
+
+    #[test]
+    fn test_quadratic_correction_includes_cross_covariance_term() {
+        let mut cov = [[0.0; 6]; 6];
+        cov[0][0] = 1e-4;
+        cov[3][3] = 1e-4;
+        let mut quad_cov = [[0.0; 6]; 6];
+        quad_cov[0][0] = 1e-3;
+        quad_cov[3][3] = 1e-3;
+        let mut quad_cross_cov = [[0.0; 6]; 6];
+        quad_cross_cov[0][0] = 5e-4;
+        quad_cross_cov[3][3] = -5e-4;
+
+        let mut eyes = BTreeMap::new();
+        eyes.insert(
+            EyeKey::Right,
+            AngularCorrection {
+                theta: [0.01, 0.0, 0.0, -0.01, 0.0, 0.0],
+                cov,
+                quad: [0.05, -0.03, 0.0, 0.02, 0.0, 0.0],
+                quad_cov,
+                quad_cross_cov,
+                model: CorrectionModel::Quadratic,
+                targets_used: 16,
+                rms_after_rad: 0.0,
+            },
+        );
+        let profile = UserProfile {
+            version: 1,
+            name: "x".into(),
+            created_unix_s: 0,
+            rig_fingerprint: String::new(),
+            estimator: "landmark".into(),
+            eyes,
+        };
+
+        let mut ray = straight_ray(Some(eye_core::Side::Right));
+        ray.angular_cov = Matrix2::zeros();
+        let corrected = profile.correct(&ray);
+
+        let a = yaw_pitch_from_direction(&ray.direction);
+        let b12 = design12(&a);
+        let cov_theta = SMatrix::<f64, 6, 6>::from_fn(|r, k| cov[r][k]);
+        let cov_quad = SMatrix::<f64, 6, 6>::from_fn(|r, k| quad_cov[r][k]);
+        let cross = SMatrix::<f64, 6, 6>::from_fn(|r, k| quad_cross_cov[r][k]);
+        let mut cov12 = SMatrix::<f64, 12, 12>::zeros();
+        cov12.fixed_view_mut::<6, 6>(0, 0).copy_from(&cov_theta);
+        cov12.fixed_view_mut::<6, 6>(6, 6).copy_from(&cov_quad);
+        cov12.fixed_view_mut::<6, 6>(0, 6).copy_from(&cross);
+        cov12
+            .fixed_view_mut::<6, 6>(6, 0)
+            .copy_from(&cross.transpose());
+        let expected = b12 * cov12 * b12.transpose();
+
+        assert_abs_diff_eq!(corrected.angular_cov, expected, epsilon = 1e-15);
+
+        let block_diag_only =
+            propagate(&design(&a), &cov_theta) + propagate(&design_quad(&a), &cov_quad);
+        assert!(
+            (corrected.angular_cov - block_diag_only).abs().sum() > 1e-9,
+            "cross term had no effect"
+        );
     }
 }

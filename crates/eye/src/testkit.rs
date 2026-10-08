@@ -9,7 +9,7 @@ use eye_core::{
     Illumination, Observations, OutputId, PixelFormat, Rig, ScreenModel, Timestamp,
     stage::{Detector, GazeCorrection, GazeEstimator, GazeFilter, StageError},
 };
-use nalgebra::{Matrix2, Matrix3, Point2, Rotation3, Vector2, Vector3};
+use nalgebra::{Matrix2, Matrix3, Point2, Rotation3, UnitQuaternion, Vector2, Vector3};
 
 use crate::registry::Registry;
 
@@ -189,6 +189,7 @@ impl GazeEstimator for FakeEstimator {
             direction: Vector3::z_axis(),
             angular_cov: Matrix2::identity() * 1e-6,
             origin_cov: Matrix3::zeros(),
+            head_rotation: UnitQuaternion::identity(),
         }])
     }
 }

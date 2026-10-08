@@ -177,6 +177,7 @@ pub fn gaze_ray(
         direction: direction_from_yaw_pitch(&angles),
         angular_cov,
         origin_cov: centre.cov,
+        head_rotation: *screen_from_viewer,
     })
 }
 

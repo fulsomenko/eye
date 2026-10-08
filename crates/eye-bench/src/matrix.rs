@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use eye_calibration::protocol::{ProtocolConfig, TargetProtocol};
+use eye_calibration::user_fit::FitConfig;
 use serde::Deserialize;
 
 use crate::error::BenchError;
@@ -34,6 +35,7 @@ pub struct Evaluation {
     pub calibration: Vec<CalibrationMode>,
     pub protocol: ProtocolConfig,
     pub metrics: MetricParams,
+    pub fit: FitConfig,
 }
 
 impl Default for Evaluation {
@@ -42,6 +44,7 @@ impl Default for Evaluation {
             calibration: vec![CalibrationMode::None, CalibrationMode::Loto],
             protocol: ProtocolConfig::default(),
             metrics: MetricParams::default(),
+            fit: FitConfig::default(),
         }
     }
 }

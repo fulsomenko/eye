@@ -4,7 +4,7 @@
 use eye::pipeline::RayBatch;
 use eye_calibration::correction::UserProfile;
 use eye_calibration::protocol::FixationWindow;
-use eye_calibration::user_fit::{DotSessionFit, FitSample};
+use eye_calibration::user_fit::{DotSessionFit, FitConfig, FitSample, ProfileMeta};
 use eye_core::{GazePoint, Rig};
 
 use crate::metrics::EvalInput;
@@ -149,6 +149,16 @@ pub fn dot_session_fitter(samples: &[FitSample], rig: &Rig) -> Result<UserProfil
     DotSessionFit::fit(samples, rig).map_err(|e| e.to_string())
 }
 
+pub fn dot_session_fitter_with(
+    cfg: FitConfig,
+) -> impl Fn(&[FitSample], &Rig) -> Result<UserProfile, String> {
+    move |samples, rig| {
+        DotSessionFit::fit_with(samples, rig, &cfg, ProfileMeta::default())
+            .map(|outcome| outcome.profile)
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -157,7 +167,7 @@ mod tests {
     use approx::assert_relative_eq;
     use eye_calibration::protocol::ProtocolConfig;
     use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
-    use nalgebra::{Point2, Point3, Unit, Vector2};
+    use nalgebra::{Point2, Point3, Unit, UnitQuaternion, Vector2};
 
     use super::*;
     use crate::row::RowOutcome;
@@ -255,6 +265,7 @@ mod tests {
             direction: Unit::new_normalize(nalgebra::Vector3::new(0.0, 0.0, 1.0)),
             origin_cov: nalgebra::Matrix3::zeros(),
             angular_cov: nalgebra::Matrix2::identity() * 1e-6,
+            head_rotation: UnitQuaternion::identity(),
         };
         let batch = RayBatch {
             timestamp: eye_core::Timestamp::from_nanos(500_000_000),
@@ -573,5 +584,69 @@ mod tests {
 
         let after = replayed.pipeline.finish(&first_batch);
         assert_eq!(after, first_point);
+    }
+
+    fn fit_section_toml(offset_prior_sigma_deg: Option<f64>) -> String {
+        match offset_prior_sigma_deg {
+            Some(sigma) => format!("\n[evaluation.fit]\noffset_prior_sigma_deg = {sigma:?}\n"),
+            None => String::new(),
+        }
+    }
+
+    #[test]
+    fn test_matrix_fit_config_is_passed_to_fitter() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let eye_toml = dir.path().join("kappa.toml");
+        std::fs::write(
+            &eye_toml,
+            kappa_ray_toml(&FOUR_BY_FOUR_CENTRES, [5.0, 0.0], None),
+        )
+        .unwrap();
+
+        let run = |offset_prior_sigma_deg: Option<f64>| {
+            let bench_toml_path = dir.path().join("bench.toml");
+            std::fs::write(
+                &bench_toml_path,
+                format!(
+                    "recordings = [{:?}]\n\n[[pipeline]]\nname = \"kappa\"\nconfig = {:?}\n\n[evaluation]\ncalibration = [\"loto\"]\n{}",
+                    session_dir.to_str().unwrap(),
+                    eye_toml.to_str().unwrap(),
+                    fit_section_toml(offset_prior_sigma_deg),
+                ),
+            )
+            .unwrap();
+            let matrix = crate::matrix::BenchMatrix::from_path(&bench_toml_path).unwrap();
+            let report = crate::runner::run_matrix(&matrix, &fake_registry());
+            let loto_row = report
+                .rows
+                .iter()
+                .find(|r| {
+                    r.kind == crate::row::RowKind::Session
+                        && r.calibration == crate::row::CalibrationMode::Loto
+                })
+                .unwrap();
+            let RowOutcome::Ok { metrics } = &loto_row.outcome else {
+                panic!("expected ok row: {loto_row:?}");
+            };
+            metrics.angular_error_deg.as_ref().unwrap().mean
+        };
+
+        let default_err = run(None);
+        let tight_prior_err = run(Some(0.001));
+
+        assert!(
+            default_err < 0.5,
+            "default offset prior should recover the bias: {default_err} deg"
+        );
+        assert!(
+            tight_prior_err > 3.0,
+            "a 0.001 deg offset prior should leave most of the 5 deg bias uncorrected: {tight_prior_err} deg"
+        );
     }
 }

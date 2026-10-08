@@ -391,6 +391,7 @@ mod tests {
                 direction: -nalgebra::Vector3::z_axis(),
                 angular_cov: Matrix2::identity() * 1e-6,
                 origin_cov: nalgebra::Matrix3::zeros(),
+                head_rotation: nalgebra::UnitQuaternion::identity(),
             }],
         };
         assert!(pipeline.finish(&batch).is_none());
@@ -407,6 +408,7 @@ mod tests {
                 direction: nalgebra::Vector3::z_axis(),
                 angular_cov: Matrix2::identity() * 1e-6,
                 origin_cov: nalgebra::Matrix3::zeros(),
+                head_rotation: nalgebra::UnitQuaternion::identity(),
             }],
         };
         assert!(pipeline.finish(&batch).is_none());

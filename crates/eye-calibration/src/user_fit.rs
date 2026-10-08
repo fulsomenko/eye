@@ -4,7 +4,9 @@ use eye_core::{GazeRay, Rig};
 use eye_geometry::angles::yaw_pitch_from_direction;
 use nalgebra::{Cholesky, Matrix2, Point2, Point3, SMatrix, SVector, Unit, Vector2};
 
-use crate::correction::{AngularCorrection, CorrectionModel, EyeKey, UserProfile, design};
+use crate::correction::{
+    AngularCorrection, CorrectionModel, EyeKey, UserProfile, design, design_quad, design12,
+};
 use crate::error::CalibrationError;
 
 #[derive(Debug, Clone)]
@@ -23,8 +25,14 @@ pub struct FitConfig {
     pub target_outlier_factor: f64,
     pub slope_prior_sigma: f64,
     pub offset_prior_sigma_deg: f64,
+    pub quad_prior_sigma: f64,
     pub min_targets_affine: usize,
     pub min_targets_offset: usize,
+    pub min_targets_quadratic: usize,
+    /// Skips the target-count ladder (`min_targets_*`) and fits this model directly, as long as
+    /// `min_targets_offset` is met. `None` keeps the ladder (ending in `Quadratic` once
+    /// `min_targets_quadratic` is met).
+    pub model_override: Option<CorrectionModel>,
 }
 
 impl Default for FitConfig {
@@ -37,8 +45,11 @@ impl Default for FitConfig {
             target_outlier_factor: 3.0,
             slope_prior_sigma: 0.15,
             offset_prior_sigma_deg: 10.0,
+            quad_prior_sigma: 2.0,
             min_targets_affine: 6,
             min_targets_offset: 3,
+            min_targets_quadratic: 12,
+            model_override: None,
         }
     }
 }
@@ -124,6 +135,17 @@ impl DotSessionFit {
             1.0 / (s_slope * s_slope),
             1.0 / (s_slope * s_slope),
         ]));
+        let s_quad = cfg.quad_prior_sigma;
+        let prior12 = {
+            let mut p = SMatrix::<f64, 12, 12>::zeros();
+            p.fixed_view_mut::<6, 6>(0, 0).copy_from(&prior6);
+            p.fixed_view_mut::<6, 6>(6, 6)
+                .copy_from(&SMatrix::<f64, 6, 6>::from_diagonal_element(
+                    1.0 / (s_quad * s_quad),
+                ));
+            p
+        };
+        let use_head_frame = cfg.model_override == Some(CorrectionModel::HeadFrame);
 
         let mut eyes = BTreeMap::new();
         let mut reports = Vec::new();
@@ -147,9 +169,22 @@ impl DotSessionFit {
                 let mut ds = Vec::with_capacity(group.len());
                 let mut es = Vec::with_capacity(group.len());
                 for s in group.iter() {
-                    let o = yaw_pitch_from_direction(&s.ray.direction);
                     let desired_dir = Unit::new_normalize(target_point - s.ray.origin);
-                    let d = yaw_pitch_from_direction(&desired_dir);
+                    let (o, d) = if use_head_frame {
+                        (
+                            yaw_pitch_from_direction(
+                                &(s.ray.head_rotation.inverse() * s.ray.direction),
+                            ),
+                            yaw_pitch_from_direction(
+                                &(s.ray.head_rotation.inverse() * desired_dir),
+                            ),
+                        )
+                    } else {
+                        (
+                            yaw_pitch_from_direction(&s.ray.direction),
+                            yaw_pitch_from_direction(&desired_dir),
+                        )
+                    };
                     os.push(o);
                     ds.push(d);
                     es.push(o - d);
@@ -282,18 +317,35 @@ impl DotSessionFit {
                 continue;
             }
 
-            let model = if remaining.len() >= cfg.min_targets_affine {
-                CorrectionModel::Affine
-            } else {
-                CorrectionModel::OffsetOnly
+            let model = match cfg.model_override {
+                Some(m) => m,
+                None if remaining.len() >= cfg.min_targets_quadratic => CorrectionModel::Quadratic,
+                None if remaining.len() >= cfg.min_targets_affine => CorrectionModel::Affine,
+                None => CorrectionModel::OffsetOnly,
             };
 
             let ones = vec![1.0; remaining.len()];
-            let (theta_final, cov_final_raw, chi2_final, dof) = match model {
-                CorrectionModel::Affine => {
+            let (
+                theta_final,
+                quad_final,
+                cov_final_raw,
+                quad_cov_final_raw,
+                cross_final_raw,
+                chi2_final,
+                dof,
+            ) = match model {
+                CorrectionModel::Affine | CorrectionModel::HeadFrame => {
                     let (theta, cov, chi2) = solve_weighted(&remaining, &ones, &prior6)
                         .expect("ridge prior keeps the normal matrix positive definite");
-                    (theta, cov, chi2, 2.0 * remaining.len() as f64 - 6.0)
+                    (
+                        theta,
+                        SVector::<f64, 6>::zeros(),
+                        cov,
+                        SMatrix::<f64, 6, 6>::zeros(),
+                        SMatrix::<f64, 6, 6>::zeros(),
+                        chi2,
+                        2.0 * remaining.len() as f64 - 6.0,
+                    )
                 }
                 CorrectionModel::OffsetOnly => {
                     let (theta2, cov2, chi2) = fit_offset_only(&remaining, s_off);
@@ -303,7 +355,33 @@ impl DotSessionFit {
                     cov[(0, 3)] = cov2[(0, 1)];
                     cov[(3, 0)] = cov2[(1, 0)];
                     cov[(3, 3)] = cov2[(1, 1)];
-                    (theta, cov, chi2, 2.0 * remaining.len() as f64 - 2.0)
+                    (
+                        theta,
+                        SVector::<f64, 6>::zeros(),
+                        cov,
+                        SMatrix::<f64, 6, 6>::zeros(),
+                        SMatrix::<f64, 6, 6>::zeros(),
+                        chi2,
+                        2.0 * remaining.len() as f64 - 2.0,
+                    )
+                }
+                CorrectionModel::Quadratic => {
+                    let (theta12, cov12, chi2) = solve_weighted12(&remaining, &ones, &prior12)
+                        .expect("ridge prior keeps the normal matrix positive definite");
+                    let theta = SVector::<f64, 6>::from_fn(|i, _| theta12[i]);
+                    let quad = SVector::<f64, 6>::from_fn(|i, _| theta12[6 + i]);
+                    let cov = SMatrix::<f64, 6, 6>::from_fn(|r, k| cov12[(r, k)]);
+                    let quad_cov = SMatrix::<f64, 6, 6>::from_fn(|r, k| cov12[(6 + r, 6 + k)]);
+                    let cross = SMatrix::<f64, 6, 6>::from_fn(|r, k| cov12[(r, 6 + k)]);
+                    (
+                        theta,
+                        quad,
+                        cov,
+                        quad_cov,
+                        cross,
+                        chi2,
+                        2.0 * remaining.len() as f64 - 12.0,
+                    )
                 }
             };
             let scale = if dof > 0.0 {
@@ -312,24 +390,32 @@ impl DotSessionFit {
                 1.0
             };
             let cov_final = cov_final_raw * scale;
+            let quad_cov_final = quad_cov_final_raw * scale;
+            let cross_final = cross_final_raw * scale;
 
             let mut targets_used: Vec<u32> = remaining.iter().map(|t| t.index).collect();
             targets_used.sort_unstable();
 
             let rms_before = rms_deg(remaining.iter().map(|t| (t.desired, t.observed)));
-            let rms_after = rms_deg(
-                remaining
-                    .iter()
-                    .map(|t| (t.desired, t.observed + design(&t.observed) * theta_final)),
-            );
+            let rms_after = rms_deg(remaining.iter().map(|t| {
+                (
+                    t.desired,
+                    t.observed
+                        + design(&t.observed) * theta_final
+                        + design_quad(&t.observed) * quad_final,
+                )
+            }));
 
-            let loo_rms = loo_rms_deg(&remaining, model, s_off, &prior6);
+            let loo_rms = loo_rms_deg(&remaining, model, s_off, &prior6, &prior12);
 
             eyes.insert(
                 eye,
                 AngularCorrection {
                     theta: theta_to_array(&theta_final),
                     cov: cov_to_array(&cov_final),
+                    quad: theta_to_array(&quad_final),
+                    quad_cov: cov_to_array(&quad_cov_final),
+                    quad_cross_cov: cov_to_array(&cross_final),
                     model,
                     targets_used: targets_used.len() as u32,
                     rms_after_rad: rms_after.to_radians(),
@@ -424,6 +510,30 @@ fn solve_weighted(
     Some((theta, chol.inverse(), chi2))
 }
 
+fn solve_weighted12(
+    targets: &[TargetAgg],
+    weights: &[f64],
+    prior: &SMatrix<f64, 12, 12>,
+) -> Option<(SVector<f64, 12>, SMatrix<f64, 12, 12>, f64)> {
+    let mut n = *prior;
+    let mut g = SVector::<f64, 12>::zeros();
+    for (t, &w) in targets.iter().zip(weights) {
+        let a = design12(&t.observed);
+        n += a.transpose() * t.cov_inv * a * w;
+        g += a.transpose() * t.cov_inv * (t.desired - t.observed) * w;
+    }
+    let chol = Cholesky::new(n)?;
+    let theta = chol.solve(&g);
+    let chi2: f64 = targets
+        .iter()
+        .map(|t| {
+            let r = t.observed + design12(&t.observed) * theta - t.desired;
+            r.dot(&(t.cov_inv * r))
+        })
+        .sum();
+    Some((theta, chol.inverse(), chi2))
+}
+
 fn fit_offset_only(targets: &[TargetAgg], prior_off_rad: f64) -> (Vector2<f64>, Matrix2<f64>, f64) {
     let prior = Matrix2::identity() * (1.0 / (prior_off_rad * prior_off_rad));
     let mut n = prior;
@@ -459,6 +569,7 @@ fn loo_rms_deg(
     model: CorrectionModel,
     s_off: f64,
     prior6: &SMatrix<f64, 6, 6>,
+    prior12: &SMatrix<f64, 12, 12>,
 ) -> f64 {
     let mut sum = 0.0;
     for (i, held_out) in targets.iter().enumerate() {
@@ -469,7 +580,7 @@ fn loo_rms_deg(
             .map(|(_, t)| t.clone())
             .collect();
         let predicted = match model {
-            CorrectionModel::Affine => {
+            CorrectionModel::Affine | CorrectionModel::HeadFrame => {
                 let ones = vec![1.0; rest.len()];
                 let (theta, _, _) = solve_weighted(&rest, &ones, prior6)
                     .expect("ridge prior keeps the normal matrix positive definite");
@@ -478,6 +589,12 @@ fn loo_rms_deg(
             CorrectionModel::OffsetOnly => {
                 let (theta2, _, _) = fit_offset_only(&rest, s_off);
                 held_out.observed + theta2
+            }
+            CorrectionModel::Quadratic => {
+                let ones = vec![1.0; rest.len()];
+                let (theta12, _, _) = solve_weighted12(&rest, &ones, prior12)
+                    .expect("ridge prior keeps the normal matrix positive definite");
+                held_out.observed + design12(&held_out.observed) * theta12
             }
         };
         sum += (held_out.desired - predicted).norm_squared();
@@ -510,7 +627,7 @@ mod tests {
     use eye_core::{CameraId, CameraModel, OutputId, ScreenModel, Side};
     use eye_geometry::angles::direction_from_yaw_pitch;
     use eye_geometry::synth::SplitMix64;
-    use nalgebra::Matrix3;
+    use nalgebra::{Matrix3, UnitQuaternion, Vector3};
 
     use super::*;
     use crate::correction::rig_fingerprint;
@@ -623,6 +740,7 @@ mod tests {
                     direction,
                     angular_cov: Matrix2::identity() * 1.0_f64.to_radians().powi(2),
                     origin_cov: Matrix3::identity(),
+                    head_rotation: UnitQuaternion::identity(),
                 };
                 out.push(FitSample { ray, target_mm });
                 n += 1;
@@ -675,10 +793,14 @@ mod tests {
             ..SessionConfig::default()
         };
         let samples = generate_session(&cfg);
+        let affine_cfg = FitConfig {
+            model_override: Some(CorrectionModel::Affine),
+            ..FitConfig::default()
+        };
         let outcome = DotSessionFit::fit_with(
             &samples,
             &fixture_rig(),
-            &FitConfig::default(),
+            &affine_cfg,
             ProfileMeta::default(),
         )
         .unwrap();
@@ -921,5 +1043,206 @@ mod tests {
         let rig = fixture_rig();
         let profile = DotSessionFit::fit(&samples, &rig).unwrap();
         assert_eq!(profile.rig_fingerprint, rig_fingerprint(&rig));
+    }
+
+    fn generate_quadratic_session(curvature_yaw: f64, seed: u64) -> Vec<FitSample> {
+        let proto = TargetProtocol::new(ProtocolConfig {
+            grid: [4, 4],
+            ..ProtocolConfig::default()
+        })
+        .unwrap();
+        let screen = screen();
+        let origin = Point3::new(185.0, 60.0, -500.0);
+        let targets = proto.sequence(0);
+        let mut rng = SplitMix64::new(seed);
+        let mut out = Vec::new();
+        for t in &targets {
+            let target_mm = proto.target_mm(t, &screen);
+            for _ in 0..24 {
+                let true_dir =
+                    Unit::new_normalize(Point3::new(target_mm.x, target_mm.y, 0.0) - origin);
+                let true_angles = yaw_pitch_from_direction(&true_dir);
+                let obs_yaw = true_angles.x
+                    + curvature_yaw * true_angles.x * true_angles.x
+                    + 0.3_f64.to_radians() * rng.gaussian();
+                let obs_pitch = true_angles.y + 0.3_f64.to_radians() * rng.gaussian();
+                let direction = direction_from_yaw_pitch(&Vector2::new(obs_yaw, obs_pitch));
+                let ray = GazeRay {
+                    side: Some(Side::Right),
+                    origin,
+                    direction,
+                    angular_cov: Matrix2::identity() * 1.0_f64.to_radians().powi(2),
+                    origin_cov: Matrix3::identity(),
+                    head_rotation: UnitQuaternion::identity(),
+                };
+                out.push(FitSample { ray, target_mm });
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_quadratic_recovers_synthetic_curvature() {
+        let curvature_yaw = -0.6;
+        let samples = generate_quadratic_session(curvature_yaw, 71);
+        let cfg = FitConfig {
+            model_override: Some(CorrectionModel::Quadratic),
+            ..FitConfig::default()
+        };
+        let outcome =
+            DotSessionFit::fit_with(&samples, &fixture_rig(), &cfg, ProfileMeta::default())
+                .unwrap();
+        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        assert_eq!(right.model, CorrectionModel::Quadratic);
+        assert_abs_diff_eq!(right.quad[0], -curvature_yaw, epsilon = 0.2);
+        let report = outcome
+            .reports
+            .iter()
+            .find(|r| r.key == EyeKey::Right)
+            .unwrap();
+        assert!(report.rms_after_deg < 1.0, "{}", report.rms_after_deg);
+    }
+
+    #[test]
+    fn test_quadratic_needs_twelve_targets() {
+        let cfg16 = SessionConfig {
+            grid: [4, 4],
+            ..SessionConfig::default()
+        };
+        let per_target = cfg16.samples_per_target;
+        let all16 = generate_session(&cfg16);
+
+        let samples11: Vec<FitSample> = all16
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(i, _)| i / per_target < 11)
+            .map(|(_, s)| s)
+            .collect();
+        let outcome11 = DotSessionFit::fit_with(
+            &samples11,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap();
+        let right11 = outcome11.profile.eyes.get(&EyeKey::Right).unwrap();
+        assert_eq!(right11.model, CorrectionModel::Affine);
+        assert_eq!(right11.targets_used, 11);
+
+        let samples12: Vec<FitSample> = all16
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| i / per_target < 12)
+            .map(|(_, s)| s)
+            .collect();
+        let outcome12 = DotSessionFit::fit_with(
+            &samples12,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap();
+        let right12 = outcome12.profile.eyes.get(&EyeKey::Right).unwrap();
+        assert_eq!(right12.model, CorrectionModel::Quadratic);
+        assert_eq!(right12.targets_used, 12);
+    }
+
+    #[test]
+    fn test_quadratic_cross_covariance_is_populated() {
+        let curvature_yaw = -0.6;
+        let samples = generate_quadratic_session(curvature_yaw, 71);
+        let cfg = FitConfig {
+            model_override: Some(CorrectionModel::Quadratic),
+            ..FitConfig::default()
+        };
+        let outcome =
+            DotSessionFit::fit_with(&samples, &fixture_rig(), &cfg, ProfileMeta::default())
+                .unwrap();
+        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        let has_nonzero_cross = right
+            .quad_cross_cov
+            .iter()
+            .flatten()
+            .any(|v| v.abs() > 1e-12);
+        assert!(has_nonzero_cross, "{:?}", right.quad_cross_cov);
+    }
+
+    #[test]
+    fn test_head_frame_fit_recovers_known_offset_under_rotation() {
+        let bias = [0.05, 0.0, 0.0, -0.03, 0.0, 0.0];
+        let theta_expected = bias.map(|v| -v);
+        let proto = TargetProtocol::new(ProtocolConfig {
+            grid: [3, 3],
+            ..ProtocolConfig::default()
+        })
+        .unwrap();
+        let screen = screen();
+        let origin = Point3::new(185.0, 60.0, -500.0);
+        let targets = proto.sequence(0);
+        let mut rng = SplitMix64::new(13);
+        let mut samples = Vec::new();
+        for (ti, t) in targets.iter().enumerate() {
+            let target_mm = proto.target_mm(t, &screen);
+            let rot_deg = -20.0 + 5.0 * ti as f64;
+            let rot = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), rot_deg.to_radians());
+            for _ in 0..24 {
+                let true_dir =
+                    Unit::new_normalize(Point3::new(target_mm.x, target_mm.y, 0.0) - origin);
+                let head_angles = yaw_pitch_from_direction(&(rot.inverse() * true_dir));
+                let th = SVector::<f64, 6>::from(bias);
+                let observed_head = head_angles
+                    + design(&head_angles) * th
+                    + Vector2::new(
+                        1.0_f64.to_radians() * rng.gaussian(),
+                        1.0_f64.to_radians() * rng.gaussian(),
+                    );
+                let direction = rot * direction_from_yaw_pitch(&observed_head);
+                let ray = GazeRay {
+                    side: Some(Side::Right),
+                    origin,
+                    direction,
+                    angular_cov: Matrix2::identity() * 1.0_f64.to_radians().powi(2),
+                    origin_cov: Matrix3::identity(),
+                    head_rotation: rot,
+                };
+                samples.push(FitSample { ray, target_mm });
+            }
+        }
+
+        let cfg = FitConfig {
+            model_override: Some(CorrectionModel::HeadFrame),
+            ..FitConfig::default()
+        };
+        let outcome =
+            DotSessionFit::fit_with(&samples, &fixture_rig(), &cfg, ProfileMeta::default())
+                .unwrap();
+        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        assert_eq!(right.model, CorrectionModel::HeadFrame);
+        for (fitted, expected) in right.theta.iter().zip(theta_expected.iter()) {
+            assert_abs_diff_eq!(fitted, expected, epsilon = 0.03);
+        }
+
+        let profile = outcome.profile.clone();
+        let probe_rot = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 35.0_f64.to_radians());
+        let probe_target = proto.target_mm(&targets[0], &screen);
+        let true_dir =
+            Unit::new_normalize(Point3::new(probe_target.x, probe_target.y, 0.0) - origin);
+        let head_angles = yaw_pitch_from_direction(&(probe_rot.inverse() * true_dir));
+        let th = SVector::<f64, 6>::from(bias);
+        let observed_head = head_angles + design(&head_angles) * th;
+        let probe_ray = GazeRay {
+            side: Some(Side::Right),
+            origin,
+            direction: probe_rot * direction_from_yaw_pitch(&observed_head),
+            angular_cov: Matrix2::identity() * 1.0_f64.to_radians().powi(2),
+            origin_cov: Matrix3::identity(),
+            head_rotation: probe_rot,
+        };
+        let corrected = profile.correct(&probe_ray);
+        let corrected_angles = yaw_pitch_from_direction(&corrected.direction);
+        let desired_angles = yaw_pitch_from_direction(&true_dir);
+        let err_deg = (corrected_angles - desired_angles).norm().to_degrees();
+        assert!(err_deg < 0.15, "{err_deg}");
     }
 }

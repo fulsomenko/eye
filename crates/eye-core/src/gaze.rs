@@ -1,4 +1,4 @@
-use nalgebra::{Matrix2, Matrix3, Point2, Point3, Unit, Vector3};
+use nalgebra::{Matrix2, Matrix3, Point2, Point3, Unit, UnitQuaternion, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::{CoreError, Side, Timestamp, id::string_id};
@@ -21,6 +21,9 @@ pub struct GazeRay {
     pub angular_cov: Matrix2<f64>,
     /// Covariance of `origin`, mm².
     pub origin_cov: Matrix3<f64>,
+    /// Screen-frame orientation of the head at this ray's frame, from PnP head pose. Identity
+    /// where the estimator has no head pose (e.g. ir-pupil).
+    pub head_rotation: UnitQuaternion<f64>,
 }
 
 impl GazeRay {
@@ -112,6 +115,7 @@ mod tests {
             direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
             angular_cov: Matrix2::identity() * 1e-4,
             origin_cov: Matrix3::zeros(),
+            head_rotation: UnitQuaternion::identity(),
         }
     }
 

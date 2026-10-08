@@ -216,6 +216,7 @@ pub fn eval_input<'a>(
 fn evaluate(
     mode: CalibrationMode,
     replayed: &mut Replayed,
+    fit: eye_calibration::user_fit::FitConfig,
 ) -> Result<(EvalInput, Vec<String>), String> {
     match mode {
         CalibrationMode::None => Ok((
@@ -228,8 +229,8 @@ fn evaluate(
             Vec::new(),
         )),
         CalibrationMode::Loto => {
-            crate::calibration::loto(replayed, &crate::calibration::dot_session_fitter)
-                .map(|o| (o.input, o.warnings))
+            let fitter = crate::calibration::dot_session_fitter_with(fit);
+            crate::calibration::loto(replayed, &fitter).map(|o| (o.input, o.warnings))
         }
     }
 }
@@ -328,7 +329,7 @@ fn rows_for_pipeline(
                     "session replayed"
                 );
                 for &mode in &matrix.evaluation.calibration {
-                    match evaluate(mode, &mut replayed) {
+                    match evaluate(mode, &mut replayed, matrix.evaluation.fit) {
                         Ok((input, warnings)) => {
                             let metrics = compute(&input, &matrix.evaluation.metrics);
                             rows.push(BenchRow {
@@ -415,7 +416,7 @@ pub fn run_matrix(matrix: &BenchMatrix, registry: &Registry) -> BenchReport {
 mod tests {
     use approx::assert_relative_eq;
     use eye_core::{GazeRay, OutputId};
-    use nalgebra::{Matrix2, Matrix3, Point2, Unit};
+    use nalgebra::{Matrix2, Matrix3, Point2, Unit, UnitQuaternion};
 
     use super::*;
     use crate::metrics;
@@ -491,6 +492,7 @@ mod tests {
                     direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
                     origin_cov: Matrix3::zeros(),
                     angular_cov: Matrix2::identity() * 1e-6,
+                    head_rotation: UnitQuaternion::identity(),
                 },
                 GazeRay {
                     side: None,
@@ -498,6 +500,7 @@ mod tests {
                     direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
                     origin_cov: Matrix3::zeros(),
                     angular_cov: Matrix2::identity() * 1e-6,
+                    head_rotation: UnitQuaternion::identity(),
                 },
             ],
         };

@@ -159,6 +159,7 @@ impl PccrEstimator {
             direction: eye_geometry::angles::direction_from_yaw_pitch(&angles),
             angular_cov,
             origin_cov,
+            head_rotation: UnitQuaternion::identity(),
         })
     }
 }

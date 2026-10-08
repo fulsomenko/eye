@@ -125,6 +125,7 @@ mod tests {
             )),
             angular_cov,
             origin_cov,
+            head_rotation: nalgebra::UnitQuaternion::identity(),
         }
     }
 

@@ -373,6 +373,7 @@ fn stereo_ray(
         direction: direction_from_yaw_pitch(&angles),
         angular_cov,
         origin_cov,
+        head_rotation: *viewer,
     })
 }
 
@@ -411,6 +412,7 @@ pub fn fuse_inverse_covariance(a: &GazeRay, b: &GazeRay) -> Option<GazeRay> {
         direction: direction_from_yaw_pitch(&theta),
         angular_cov,
         origin_cov,
+        head_rotation: a.head_rotation,
     })
 }
 
@@ -538,6 +540,7 @@ mod tests {
             direction,
             angular_cov: cov,
             origin_cov: Matrix3::zeros(),
+            head_rotation: UnitQuaternion::identity(),
         }
     }
 

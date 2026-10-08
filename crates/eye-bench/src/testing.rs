@@ -291,6 +291,7 @@ impl GazeEstimator for FixedRayEstimator {
             direction,
             origin_cov: Matrix3::zeros(),
             angular_cov: Matrix2::identity() * 1e-6,
+            head_rotation: UnitQuaternion::identity(),
         }])
     }
 }
@@ -425,6 +426,7 @@ impl GazeEstimator for KappaRayEstimator {
             direction,
             origin_cov: Matrix3::zeros(),
             angular_cov: Matrix2::identity() * 1e-6,
+            head_rotation: UnitQuaternion::identity(),
         }])
     }
 }
