@@ -1,0 +1,16 @@
+recordings = ["/home/max/fulsomenko/eye/recordings/20261008T212300Z", "/home/max/fulsomenko/eye/recordings/20261008T212331Z", "/home/max/fulsomenko/eye/recordings/20261008T212403Z"]
+
+[[pipeline]]
+name = "ir"
+config = "ir.toml"
+
+[[pipeline]]
+name = "rgb"
+config = "rgb.toml"
+
+[[pipeline]]
+name = "fused"
+config = "fused.toml"
+
+[evaluation]
+calibration = ["none", "loto"]

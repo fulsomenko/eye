@@ -1,0 +1,332 @@
+{
+  "schema_version": 1,
+  "eye_version": "0.1.0",
+  "params": {
+    "grids": [
+      [
+        3,
+        3
+      ],
+      [
+        4,
+        4
+      ]
+    ],
+    "boundary_margin_px": 20.0,
+    "dropout_bin": 200
+  },
+  "rows": [
+    {
+      "pipeline": "rgb",
+      "calibration": "none",
+      "kind": "session",
+      "session": "20261008T201638Z",
+      "step_errors": 0,
+      "warnings": [],
+      "status": "ok",
+      "metrics": {
+        "windows": 16,
+        "samples": 384,
+        "angular_error_deg": {
+          "mean": 20.604476036332553,
+          "p50": 20.399462472740375,
+          "p95": 27.04336383598032
+        },
+        "px_error_logical": {
+          "mean": 987.670471099356,
+          "p50": 962.2346237752896,
+          "p95": 1339.8559650930288
+        },
+        "accuracy_deg": 20.593375117045575,
+        "precision_rms_s2s_deg": 0.31337502184855853,
+        "regions": [
+          {
+            "cols": 3,
+            "rows": 3,
+            "windows": 16,
+            "excluded": 0,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "sample_hit_rate": 0.0
+          },
+          {
+            "cols": 4,
+            "rows": 4,
+            "windows": 16,
+            "excluded": 0,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "sample_hit_rate": 0.0
+          }
+        ],
+        "processing_ms": {
+          "mean": 43.53143400129196,
+          "p50": 39.086058,
+          "p95": 63.209222
+        },
+        "dropout_rate": 0.0,
+        "output_rate_hz": 29.999999999999993
+      }
+    },
+    {
+      "pipeline": "rgb",
+      "calibration": "none",
+      "kind": "session",
+      "session": "20261008T201709Z",
+      "step_errors": 0,
+      "warnings": [],
+      "status": "ok",
+      "metrics": {
+        "windows": 16,
+        "samples": 384,
+        "angular_error_deg": {
+          "mean": 21.842127720460848,
+          "p50": 21.16132803892072,
+          "p95": 27.813604947954126
+        },
+        "px_error_logical": {
+          "mean": 1053.9751131446856,
+          "p50": 1001.4784610520243,
+          "p95": 1388.3354767691926
+        },
+        "accuracy_deg": 21.817159662447377,
+        "precision_rms_s2s_deg": 0.5191576564459813,
+        "regions": [
+          {
+            "cols": 3,
+            "rows": 3,
+            "windows": 16,
+            "excluded": 0,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "sample_hit_rate": 0.0
+          },
+          {
+            "cols": 4,
+            "rows": 4,
+            "windows": 16,
+            "excluded": 0,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "sample_hit_rate": 0.0
+          }
+        ],
+        "processing_ms": {
+          "mean": 27.856457221502616,
+          "p50": 25.439392,
+          "p95": 37.327587
+        },
+        "dropout_rate": 0.0,
+        "output_rate_hz": 29.999999999999993
+      }
+    },
+    {
+      "pipeline": "rgb",
+      "calibration": "none",
+      "kind": "aggregate",
+      "session": "all",
+      "step_errors": 0,
+      "warnings": [],
+      "status": "ok",
+      "metrics": {
+        "windows": 32,
+        "samples": 768,
+        "angular_error_deg": {
+          "mean": 21.223301878396676,
+          "p50": 20.93734589662954,
+          "p95": 27.64096041798573
+        },
+        "px_error_logical": {
+          "mean": 1020.8227921220209,
+          "p50": 1001.4784610520243,
+          "p95": 1359.8442435357622
+        },
+        "accuracy_deg": 21.20526738974647,
+        "precision_rms_s2s_deg": 0.42879399282468283,
+        "regions": [
+          {
+            "cols": 3,
+            "rows": 3,
+            "windows": 32,
+            "excluded": 0,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "sample_hit_rate": 0.0
+          },
+          {
+            "cols": 4,
+            "rows": 4,
+            "windows": 32,
+            "excluded": 0,
+            "hits": 0,
+            "hit_rate": 0.0,
+            "sample_hit_rate": 0.0
+          }
+        ],
+        "processing_ms": {
+          "mean": 35.70408466494179,
+          "p50": 35.415006999999996,
+          "p95": 55.54626
+        },
+        "dropout_rate": 0.0,
+        "output_rate_hz": 29.999999999999986
+      }
+    },
+    {
+      "pipeline": "rgb",
+      "calibration": "loto",
+      "kind": "session",
+      "session": "20261008T201638Z",
+      "step_errors": 0,
+      "warnings": [],
+      "status": "ok",
+      "metrics": {
+        "windows": 16,
+        "samples": 384,
+        "angular_error_deg": {
+          "mean": 3.5849441127975776,
+          "p50": 3.3624993587296617,
+          "p95": 7.801509331295363
+        },
+        "px_error_logical": {
+          "mean": 179.03555764838745,
+          "p50": 165.6390566637874,
+          "p95": 394.15717019421317
+        },
+        "accuracy_deg": 3.502442662595213,
+        "precision_rms_s2s_deg": 0.45893818768284994,
+        "regions": [
+          {
+            "cols": 3,
+            "rows": 3,
+            "windows": 16,
+            "excluded": 0,
+            "hits": 12,
+            "hit_rate": 0.75,
+            "sample_hit_rate": 0.7265625
+          },
+          {
+            "cols": 4,
+            "rows": 4,
+            "windows": 16,
+            "excluded": 0,
+            "hits": 9,
+            "hit_rate": 0.5625,
+            "sample_hit_rate": 0.5234375
+          }
+        ],
+        "processing_ms": {
+          "mean": 43.53143400129196,
+          "p50": 39.086058,
+          "p95": 63.209222
+        },
+        "dropout_rate": 0.0,
+        "output_rate_hz": 29.999999999999993
+      }
+    },
+    {
+      "pipeline": "rgb",
+      "calibration": "loto",
+      "kind": "session",
+      "session": "20261008T201709Z",
+      "step_errors": 0,
+      "warnings": [],
+      "status": "ok",
+      "metrics": {
+        "windows": 16,
+        "samples": 384,
+        "angular_error_deg": {
+          "mean": 4.343305854640829,
+          "p50": 3.5512736800618763,
+          "p95": 8.924569908357961
+        },
+        "px_error_logical": {
+          "mean": 218.56118642168872,
+          "p50": 171.82379765424838,
+          "p95": 460.11536655675377
+        },
+        "accuracy_deg": 4.18974343871568,
+        "precision_rms_s2s_deg": 0.9428444972663942,
+        "regions": [
+          {
+            "cols": 3,
+            "rows": 3,
+            "windows": 16,
+            "excluded": 0,
+            "hits": 10,
+            "hit_rate": 0.625,
+            "sample_hit_rate": 0.5859375
+          },
+          {
+            "cols": 4,
+            "rows": 4,
+            "windows": 16,
+            "excluded": 0,
+            "hits": 7,
+            "hit_rate": 0.4375,
+            "sample_hit_rate": 0.4583333333333333
+          }
+        ],
+        "processing_ms": {
+          "mean": 27.856457221502616,
+          "p50": 25.439392,
+          "p95": 37.327587
+        },
+        "dropout_rate": 0.0,
+        "output_rate_hz": 29.999999999999993
+      }
+    },
+    {
+      "pipeline": "rgb",
+      "calibration": "loto",
+      "kind": "aggregate",
+      "session": "all",
+      "step_errors": 0,
+      "warnings": [],
+      "status": "ok",
+      "metrics": {
+        "windows": 32,
+        "samples": 768,
+        "angular_error_deg": {
+          "mean": 3.964124983719205,
+          "p50": 3.4527877444421247,
+          "p95": 8.393805905165735
+        },
+        "px_error_logical": {
+          "mean": 198.79837203503791,
+          "p50": 169.42727884028335,
+          "p95": 428.55298655959956
+        },
+        "accuracy_deg": 3.846093050655446,
+        "precision_rms_s2s_deg": 0.7414782552911239,
+        "regions": [
+          {
+            "cols": 3,
+            "rows": 3,
+            "windows": 32,
+            "excluded": 0,
+            "hits": 22,
+            "hit_rate": 0.6875,
+            "sample_hit_rate": 0.65625
+          },
+          {
+            "cols": 4,
+            "rows": 4,
+            "windows": 32,
+            "excluded": 0,
+            "hits": 16,
+            "hit_rate": 0.5,
+            "sample_hit_rate": 0.4908854166666667
+          }
+        ],
+        "processing_ms": {
+          "mean": 35.70408466494179,
+          "p50": 35.415006999999996,
+          "p95": 55.54626
+        },
+        "dropout_rate": 0.0,
+        "output_rate_hz": 29.999999999999986
+      }
+    }
+  ]
+}

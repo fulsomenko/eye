@@ -1,0 +1,8 @@
+recordings = ["/home/max/fulsomenko/eye/recordings/20261008T201638Z", "/home/max/fulsomenko/eye/recordings/20261008T201709Z"]
+
+[[pipeline]]
+name = "rgb"
+config = "rgb.toml"
+
+[evaluation]
+calibration = ["none", "loto"]

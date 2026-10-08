@@ -12,3 +12,5 @@ kind = "landmark"
 
 [filter]
 kind = "one-euro"
+min_cutoff = 0.3
+beta = 0.002
