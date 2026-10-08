@@ -1,0 +1,5 @@
+eye-geometry includes data derived from MediaPipe (https://github.com/google-ai-edge/mediapipe),
+file mediapipe/modules/face_geometry/data/canonical_face_model.obj at commit
+f6988c4769278bde600efd488dfc8645432dc92b, Copyright The MediaPipe Authors,
+licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+Modification: 13 vertices selected, converted from cm to mm and rotated by pi about x.
