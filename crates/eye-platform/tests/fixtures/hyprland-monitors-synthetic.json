@@ -1,0 +1,50 @@
+[
+  {
+    "name": "eDP-1",
+    "make": "Synthetic",
+    "model": "Panel-A",
+    "width": 2560,
+    "height": 1600,
+    "physicalWidth": 300,
+    "physicalHeight": 190,
+    "refreshRate": 60.0,
+    "x": 0,
+    "y": 0,
+    "scale": 1.5,
+    "transform": 1,
+    "disabled": false,
+    "futureField": 1
+  },
+  {
+    "name": "DP-1",
+    "make": "Synthetic",
+    "model": "Panel-B",
+    "width": 1920,
+    "height": 1080,
+    "physicalWidth": 0,
+    "physicalHeight": 0,
+    "refreshRate": 60.0,
+    "x": 1067,
+    "y": 0,
+    "scale": 1.0,
+    "transform": 0,
+    "disabled": false,
+    "futureField": 1
+  },
+  {
+    "name": "HDMI-A-1",
+    "make": "Synthetic",
+    "model": "Panel-C",
+    "width": 1920,
+    "height": 1080,
+    "physicalWidth": 480,
+    "physicalHeight": 270,
+    "refreshRate": 60.0,
+    "x": 2987,
+    "y": 0,
+    "scale": 1.0,
+    "transform": 0,
+    "disabled": true,
+    "futureField": 1
+  }
+]

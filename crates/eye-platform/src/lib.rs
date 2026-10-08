@@ -8,6 +8,7 @@ pub mod error;
 pub mod session;
 pub mod uvc;
 
+pub use display::{DisplayProbe, OutputInfo, Transform, hyprland::HyprlandDisplayProbe};
 pub use error::ProbeError;
 pub use session::{Compositor, SessionInfo, SessionType};
 
