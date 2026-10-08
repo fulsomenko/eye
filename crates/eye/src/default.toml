@@ -1,0 +1,33 @@
+[[camera]]
+id = "rgb"
+device = "/dev/video0"
+format = "mjpeg"
+size = [1280, 720]
+
+[[camera]]
+id = "ir"
+device = "/dev/video2"
+format = "gray"
+size = [640, 360]
+emitter = "msxu"          # read by eye-app / eye-lab, which hold EmitterGuard
+
+[capture]
+rgb_offset_ns = 3_000_000
+
+[detect]
+rgb = "mediapipe-ort"
+ir = "ir-classic"
+
+[estimate]
+kind = "fused"
+
+[filter]
+kind = "one-euro"
+min_cutoff = 1.0
+beta = 0.007
+
+[output]
+kind = "layer-shell"
+target = "eDP-1"          # optional; defaults to the rig's screen output
+mode = "point"            # or "region"
+grid = [4, 4]
