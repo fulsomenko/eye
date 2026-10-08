@@ -9,6 +9,7 @@ pub mod session;
 pub mod uvc;
 
 pub use error::ProbeError;
+pub use session::{Compositor, SessionInfo, SessionType};
 
 pub use camera::{
     CameraDevice, CameraKind, CameraProbe, FormatInfo, FrameSizeInfo, UsbIdentity, V4l2CameraProbe,
