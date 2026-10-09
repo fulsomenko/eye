@@ -18,7 +18,8 @@ use crate::config::Config;
 use crate::error::{ConfigError, StageKind};
 use crate::registry::Registry;
 
-/// Uncorrected rays of one frame set; `timestamp` is the newest frame's.
+/// Uncorrected rays of one frame set. `timestamp` is the newest frame's (the moment the set
+/// completed); each ray carries the time it describes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RayBatch {
     pub timestamp: Timestamp,
@@ -316,7 +317,10 @@ impl Pipeline {
                     .as_ref()
                     .map_or_else(|| ray.clone(), |c| c.correct(ray))
             })
-            .filter_map(|ray| gaze_point(&ray, screen, batch.timestamp))
+            .filter_map(|ray| {
+                let timestamp = ray.timestamp;
+                gaze_point(&ray, screen, timestamp)
+            })
             .collect();
         let Some(fused) = fuse_points(&points, screen) else {
             tracing::debug!(
@@ -673,6 +677,25 @@ mod tests {
         assert_relative_eq!(point.mm.y, 85.0, epsilon = 1e-6);
         assert_relative_eq!(point.px_logical.x, 960.0, epsilon = 1e-3);
         assert_relative_eq!(point.px_logical.y, 540.0, epsilon = 1e-3);
+    }
+
+    #[test]
+    fn test_finish_point_timestamp_is_ray_timestamp_not_batch() {
+        let mut pipeline = one_camera_pipeline(3);
+        let batch = RayBatch {
+            timestamp: Timestamp::from_nanos(105_000_000),
+            rays: vec![GazeRay {
+                side: None,
+                timestamp: Timestamp::from_nanos(37_000_000),
+                origin: nalgebra::Point3::new(155.0, 85.0, -500.0),
+                direction: nalgebra::Vector3::z_axis(),
+                angular_cov: Matrix2::identity() * 1e-6,
+                origin_cov: nalgebra::Matrix3::zeros(),
+                head_rotation: None,
+            }],
+        };
+        let point = pipeline.finish(&batch).expect("ray hits the panel");
+        assert_eq!(point.timestamp, Timestamp::from_nanos(37_000_000));
     }
 
     #[test]

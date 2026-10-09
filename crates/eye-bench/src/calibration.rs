@@ -42,8 +42,8 @@ pub fn latest_presentation(
     }
 }
 
-/// Every uncorrected ray of every batch whose timestamp lies in a window selected by `include`,
-/// with that window's `target_mm`.
+/// Every uncorrected ray whose own `timestamp` lies in a window selected by `include`, with
+/// that window's `target_mm`; the rays of one batch may land in different windows.
 pub fn fit_samples<'a>(
     windows: &[FixationWindow],
     batches: impl IntoIterator<Item = &'a RayBatch>,
@@ -51,16 +51,18 @@ pub fn fit_samples<'a>(
 ) -> Vec<FitSample> {
     let mut out = Vec::new();
     for batch in batches {
-        let Some(w) = window_at(windows, batch.timestamp)
-            .map(|i| &windows[i])
-            .filter(|w| include(w))
-        else {
-            continue;
-        };
-        out.extend(batch.rays.iter().map(|ray| FitSample {
-            ray: ray.clone(),
-            target_mm: w.target_mm,
-        }));
+        for ray in &batch.rays {
+            let Some(w) = window_at(windows, ray.timestamp)
+                .map(|i| &windows[i])
+                .filter(|w| include(w))
+            else {
+                continue;
+            };
+            out.push(FitSample {
+                ray: ray.clone(),
+                target_mm: w.target_mm,
+            });
+        }
     }
     out
 }
@@ -323,6 +325,45 @@ mod tests {
         let samples = fit_samples(std::slice::from_ref(&window), [&batch], |_| true);
         assert_eq!(samples.len(), 2);
         assert!(samples.iter().all(|s| s.target_mm == window.target_mm));
+    }
+
+    #[test]
+    fn test_fit_samples_assigns_rays_by_ray_timestamp() {
+        let window_a = FixationWindow {
+            index: 0,
+            cell: (0, 0),
+            onset: eye_core::Timestamp::from_nanos(0),
+            start: eye_core::Timestamp::from_nanos(0),
+            end: eye_core::Timestamp::from_nanos(800_000_000),
+            target_mm: Point2::new(10.0, 10.0),
+            target_px_logical: Point2::new(0.0, 0.0),
+        };
+        let window_b = FixationWindow {
+            index: 1,
+            cell: (1, 0),
+            onset: eye_core::Timestamp::from_nanos(1_500_000_000),
+            start: eye_core::Timestamp::from_nanos(1_500_000_000),
+            end: eye_core::Timestamp::from_nanos(2_300_000_000),
+            target_mm: Point2::new(200.0, 10.0),
+            target_px_logical: Point2::new(100.0, 0.0),
+        };
+        let ray = |nanos: u64| eye_core::GazeRay {
+            side: None,
+            timestamp: eye_core::Timestamp::from_nanos(nanos),
+            origin: eye(),
+            direction: Unit::new_normalize(nalgebra::Vector3::new(0.0, 0.0, 1.0)),
+            origin_cov: nalgebra::Matrix3::zeros(),
+            angular_cov: nalgebra::Matrix2::identity() * 1e-6,
+            head_rotation: None,
+        };
+        let batch = RayBatch {
+            timestamp: eye_core::Timestamp::from_nanos(1_600_000_000),
+            rays: vec![ray(700_000_000), ray(1_600_000_000)],
+        };
+        let samples = fit_samples(&[window_a.clone(), window_b.clone()], [&batch], |_| true);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].target_mm, window_a.target_mm);
+        assert_eq!(samples[1].target_mm, window_b.target_mm);
     }
 
     type SpyResult = (Result<LotoOutcome, String>, Vec<BTreeSet<(u64, u64)>>);

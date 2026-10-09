@@ -198,13 +198,17 @@ impl LiveFeedback {
             return Ok(());
         };
         if let Some((onset, target_mm, _px)) = self.current {
-            let elapsed =
-                Duration::from_nanos(batch.timestamp.as_nanos().saturating_sub(onset.as_nanos()));
-            if elapsed >= self.timing.settle && elapsed < self.timing.settle + self.timing.window {
-                self.samples.extend(batch.rays.iter().map(|ray| FitSample {
-                    ray: ray.clone(),
-                    target_mm,
-                }));
+            for ray in &batch.rays {
+                let elapsed =
+                    Duration::from_nanos(ray.timestamp.as_nanos().saturating_sub(onset.as_nanos()));
+                if elapsed >= self.timing.settle
+                    && elapsed < self.timing.settle + self.timing.window
+                {
+                    self.samples.push(FitSample {
+                        ray: ray.clone(),
+                        target_mm,
+                    });
+                }
             }
         }
         let pipeline = self
@@ -686,6 +690,7 @@ mod tests {
     use eye_core::session::TargetClock;
     use eye_core::{CameraId, FrameHeader, Illumination, OutputId, PixelFormat};
     use eye_overlay::targets::TargetEvent;
+    use nalgebra::{Matrix2, Matrix3, Point3, Vector3};
 
     use super::*;
     use crate::capture::CaptureMsg;
@@ -1197,6 +1202,170 @@ mod tests {
 
     fn px_error(fb: &Feedback, target_px: Point2<f64>) -> f64 {
         (fb.px_logical - target_px).norm()
+    }
+
+    #[derive(Debug)]
+    struct AnyFrameDetector;
+
+    impl eye_core::stage::Detector for AnyFrameDetector {
+        fn name(&self) -> &'static str {
+            "any-frame"
+        }
+
+        fn accepts(&self, _format: PixelFormat, _illumination: Illumination) -> bool {
+            true
+        }
+
+        fn detect(
+            &mut self,
+            frames: &eye_core::FrameSet,
+        ) -> Result<Vec<eye_core::Observations>, eye_core::stage::StageError> {
+            Ok(frames
+                .frames()
+                .iter()
+                .map(|f| {
+                    eye_core::Observations::empty(f.header().camera.clone(), f.header().timestamp)
+                })
+                .collect())
+        }
+    }
+
+    #[derive(Debug)]
+    struct RgbTimestampEstimator;
+
+    impl eye_core::stage::GazeEstimator for RgbTimestampEstimator {
+        fn name(&self) -> &'static str {
+            "rgb-timestamp"
+        }
+
+        fn estimate(
+            &mut self,
+            obs: &[eye_core::Observations],
+            _rig: &Rig,
+        ) -> Result<Vec<eye_core::GazeRay>, eye_core::stage::StageError> {
+            let timestamp = obs
+                .iter()
+                .find(|o| o.camera.as_str() == "rgb")
+                .or_else(|| obs.first())
+                .map_or(Timestamp::from_nanos(0), |o| o.timestamp);
+            Ok(vec![eye_core::GazeRay {
+                side: None,
+                timestamp,
+                origin: Point3::new(155.0, 85.0, -500.0),
+                direction: Vector3::z_axis(),
+                angular_cov: Matrix2::identity() * 1e-6,
+                origin_cov: Matrix3::zeros(),
+                head_rotation: None,
+            }])
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoOpFilter;
+
+    impl eye_core::stage::GazeFilter for NoOpFilter {
+        fn apply(&mut self, point: eye_core::GazePoint) -> eye_core::GazePoint {
+            point
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    fn dual_camera_frame(
+        camera: &str,
+        seq: u64,
+        t_ms: u64,
+        format: PixelFormat,
+        illumination: Illumination,
+    ) -> Frame {
+        let (width, height) = (4u32, 2u32);
+        let bpp = format
+            .bytes_per_pixel()
+            .expect("test format has a byte size");
+        let data: Arc<[u8]> = vec![0u8; width as usize * height as usize * bpp].into();
+        Frame::new(
+            FrameHeader {
+                camera: CameraId::from(camera),
+                seq,
+                timestamp: Timestamp::from_nanos(t_ms * 1_000_000),
+                width,
+                height,
+                format,
+                illumination,
+            },
+            data,
+        )
+        .expect("test frame is valid")
+    }
+
+    #[test]
+    fn test_live_feedback_window_test_uses_ray_timestamp() {
+        let ir_info = CameraInfo {
+            id: CameraId::from("ir"),
+            width: 4,
+            height: 2,
+            format: PixelFormat::Gray8,
+            frame_interval: Duration::from_millis(33),
+        };
+        let rgb_info = CameraInfo {
+            id: CameraId::from("rgb"),
+            width: 4,
+            height: 2,
+            format: PixelFormat::Rgb8,
+            frame_interval: Duration::from_millis(33),
+        };
+        let pairer = eye_capture::pairing::Pairer::with_config(
+            &[ir_info, rgb_info],
+            eye_capture::pairing::PairingConfig {
+                offset_secondary_ns: 0,
+                bracket_window: Duration::from_millis(200),
+            },
+        )
+        .expect("ir/rgb pairer is valid");
+        let pipeline = Pipeline::new(
+            synthetic_rig(),
+            pairer,
+            vec![
+                (CameraId::from("ir"), Box::new(AnyFrameDetector)),
+                (CameraId::from("rgb"), Box::new(AnyFrameDetector)),
+            ],
+            Box::new(RgbTimestampEstimator),
+            Box::new(NoOpFilter),
+            None,
+            3,
+        );
+        let timing = TargetTiming {
+            settle: Duration::from_millis(500),
+            window: Duration::from_millis(200),
+            dwell: Duration::from_millis(1000),
+        };
+        let mut live = LiveFeedback::with_pipeline(
+            pipeline,
+            timing,
+            FitConfig::default(),
+            ProfileMeta::default(),
+        );
+        live.current = Some((
+            Timestamp::from_nanos(0),
+            Point2::new(10.0, 10.0),
+            Point2::new(0.0, 0.0),
+        ));
+
+        let rgb_frame = dual_camera_frame("rgb", 0, 600, PixelFormat::Rgb8, Illumination::Ambient);
+        let ir_frame = dual_camera_frame("ir", 1, 750, PixelFormat::Gray8, Illumination::IrLit);
+        live.process(&rgb_frame)
+            .expect("rgb frame held, no set yet");
+        assert!(live.samples.is_empty(), "no set should have completed yet");
+        live.process(&ir_frame)
+            .expect("ir frame completes the pair");
+
+        assert_eq!(
+            live.samples.len(),
+            1,
+            "the ray's own timestamp (600 ms) falls in the settle..settle+window \
+             [500, 700) ms window even though the batch's timestamp (750 ms, the \
+             newer IR frame) does not"
+        );
     }
 
     #[test]
