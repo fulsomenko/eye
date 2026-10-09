@@ -240,8 +240,8 @@ mod tests {
         let rig = lab_rig(&ScreenParams::default(), &[(Role::Ir, 640, 360)]).unwrap();
         assert_eq!(rig.screen().size_px, (3840, 2160));
         assert_eq!(rig.screen().scale, 2.0);
-        assert_relative_eq!(rig.screen().size_mm.x, 310.0, epsilon = 1e-9);
-        assert_relative_eq!(rig.screen().size_mm.y, 174.375, epsilon = 1e-9);
+        assert_relative_eq!(rig.screen().size_mm.x, 308.14848630853817, epsilon = 1e-9);
+        assert_relative_eq!(rig.screen().size_mm.y, 173.33352354855273, epsilon = 1e-9);
         assert_eq!(rig.camera("ir").map(|c| c.width), Some(640));
     }
 

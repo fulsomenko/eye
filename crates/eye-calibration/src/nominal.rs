@@ -253,6 +253,7 @@ pub fn nominal_rig(
     Ok(Rig::new(cameras, screen)?)
 }
 
+/// An inconsistent EDID keeps its diagonal.
 pub fn corrected_screen_size_mm(
     screen: &ScreenModel,
     override_mm: Option<[f64; 2]>,
@@ -266,11 +267,9 @@ pub fn corrected_screen_size_mm(
     if ((h / w) / px_aspect - 1.0).abs() <= 0.01 {
         return screen.size_mm;
     }
-    if w >= h {
-        Vector2::new(w, w * px_aspect)
-    } else {
-        Vector2::new(h / px_aspect, h)
-    }
+    let d = w.hypot(h);
+    let px_diag = pw.hypot(ph);
+    Vector2::new(d * pw / px_diag, d * ph / px_diag)
 }
 
 pub fn nominal_screen_from_camera(position_mm: &Point3<f64>) -> Isometry3<f64> {
@@ -405,8 +404,8 @@ mod tests {
         assert_eq!(ir.distortion, [0.0; 5]);
         assert_relative_eq!(
             ir.screen_from_camera.translation.vector,
-            Vector3::new(155.0, -7.0, 0.0),
-            epsilon = 1e-12
+            Vector3::new(154.07424315426908, -7.0, 0.0),
+            epsilon = 1e-9
         );
     }
 
@@ -451,11 +450,24 @@ mod tests {
     #[test]
     fn test_edid_height_corrected_by_square_pixels() {
         let size = corrected_screen_size_mm(&edp1(), None);
-        assert_relative_eq!(size.x, 310.0, epsilon = 1e-9);
-        assert_relative_eq!(size.y, 174.375, epsilon = 1e-9);
+        assert_relative_eq!(size.x, 308.15, epsilon = 0.01);
+        assert_relative_eq!(size.y, 173.33, epsilon = 0.01);
 
         let rig = nominal_rig(edp1(), &streams(), &NominalRigConfig::default()).unwrap();
-        assert_relative_eq!(rig.screen().size_mm.y, 174.375, epsilon = 1e-9);
+        assert_relative_eq!(rig.screen().size_mm.y, 173.33, epsilon = 0.01);
+    }
+
+    #[test]
+    fn test_diagonal_is_preserved_by_correction() {
+        let edid = edp1();
+        let size = corrected_screen_size_mm(&edid, None);
+        assert_relative_eq!(
+            size.x.hypot(size.y),
+            edid.size_mm.x.hypot(edid.size_mm.y),
+            epsilon = 1e-9
+        );
+        let (pw, ph) = (f64::from(edid.size_px.0), f64::from(edid.size_px.1));
+        assert_relative_eq!(size.x / size.y, pw / ph, epsilon = 1e-12);
     }
 
     #[test]
@@ -487,7 +499,9 @@ mod tests {
         );
         match rec.fields.get("h_mm") {
             Some(eye_log::Value::F64(v)) => {
-                assert_abs_diff_eq!(*v, 310.0 * 2160.0 / 3840.0, epsilon = 1e-9)
+                let d = 310.0_f64.hypot(170.0);
+                let px_diag = 3840.0_f64.hypot(2160.0);
+                assert_abs_diff_eq!(*v, d * 2160.0 / px_diag, epsilon = 1e-9)
             }
             other => panic!("expected h_mm F64, got {other:?}"),
         }
@@ -585,8 +599,8 @@ mod tests {
             let cam = rig.camera(id).unwrap();
             assert_relative_eq!(
                 cam.screen_from_camera.translation.vector,
-                Vector3::new(155.0, -7.0, 0.0),
-                epsilon = 1e-12
+                Vector3::new(154.07424315426908, -7.0, 0.0),
+                epsilon = 1e-9
             );
         }
     }
