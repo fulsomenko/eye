@@ -730,6 +730,7 @@ dependencies = [
  "approx",
  "crossbeam-channel",
  "eye-core",
+ "eye-log",
  "nalgebra",
  "nix",
  "proptest",
@@ -737,6 +738,7 @@ dependencies = [
  "thiserror",
  "tiny-skia",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

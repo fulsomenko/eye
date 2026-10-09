@@ -20,6 +20,15 @@ pub enum PresentedAt {
     Commit(Timestamp),
 }
 
+impl PresentedAt {
+    pub(crate) fn clock_name(self) -> &'static str {
+        match self {
+            PresentedAt::Presentation(_) => "presentation",
+            PresentedAt::Commit(_) => "commit",
+        }
+    }
+}
+
 pub trait Scene: Send + 'static {
     type Msg: Send + 'static;
 

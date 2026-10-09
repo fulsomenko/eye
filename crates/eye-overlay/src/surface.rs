@@ -6,6 +6,7 @@ use std::thread;
 use std::time::Instant;
 
 use eye_core::Timestamp;
+use eye_core::log::field;
 use smithay_client_toolkit::compositor::{
     CompositorHandler, CompositorState, FrameCallbackData, Region,
 };
@@ -52,7 +53,11 @@ pub fn spawn<S: Scene>(
         crossbeam_channel::bounded::<Result<(u32, u32), OverlayError>>(1);
     let (tx, channel) = calloop::channel::sync_channel::<S::Msg>(64);
 
-    let thread = thread::spawn(move || run(options, scene, channel, startup_tx));
+    let parent = tracing::Span::current();
+    let thread = thread::spawn(move || {
+        let _parent = parent.entered();
+        run(options, scene, channel, startup_tx)
+    });
 
     match startup_rx.recv() {
         Ok(Ok(logical)) => Ok(OverlayHandle {
@@ -139,6 +144,12 @@ impl<S: Scene> State<S> {
             size: (bw, bh),
             drawn: Vec::new(),
         });
+        tracing::debug!(
+            buffer_w = bw,
+            buffer_h = bh,
+            buffers = self.buffers.len(),
+            "shm buffer created"
+        );
         Ok(self.buffers.len() - 1)
     }
 
@@ -175,6 +186,8 @@ impl<S: Scene> State<S> {
         }
         let schedule = self.scene.render(&mut canvas, Instant::now());
         let drawn = canvas.take_damage();
+        let mark = self.scene.presentation_mark();
+        log_drawn(drawn.len(), (bw, bh), schedule, mark.is_some());
         let surface = layer.wl_surface();
         for r in drawn.iter().chain(&self.on_screen) {
             surface.damage_buffer(r.x(), r.y(), r.width() as i32, r.height() as i32);
@@ -184,13 +197,17 @@ impl<S: Scene> State<S> {
         surface.frame(&self.qh, FrameCallbackData(surface.clone()));
         self.frame_pending = true;
         slot.buffer.attach_to(surface).expect("buffer is free");
-        let mark = self.scene.presentation_mark();
         let feedback = mark.map(|_| self.presentation.feedback(surface, &self.qh));
         layer.commit();
         let commit_time = Timestamp::now();
         match (mark, feedback) {
             (Some(m), Some(Ok(fb))) => self.feedbacks.push((fb, m, commit_time)),
             (Some(m), Some(Err(_))) => {
+                tracing::debug!(
+                    mark = m,
+                    { field::REASON } = "feedback_request_failed",
+                    "presentation feedback unavailable, using commit time"
+                );
                 let s =
                     self.scene
                         .on_presented(m, PresentedAt::Commit(commit_time), Instant::now());
@@ -206,6 +223,10 @@ impl<S: Scene> State<S> {
             Schedule::Idle => {}
             Schedule::NextFrame => self.needs_redraw = true,
             Schedule::At(t) => {
+                tracing::trace!(
+                    in_us = t.saturating_duration_since(Instant::now()).as_micros() as u64,
+                    "redraw scheduled"
+                );
                 let Some(handle) = self.loop_handle.clone() else {
                     return;
                 };
@@ -221,7 +242,10 @@ impl<S: Scene> State<S> {
                     Err(e) => self.exit = Some(Err(OverlayError::EventLoop(e.to_string()))),
                 }
             }
-            Schedule::Exit => self.exit = Some(Ok(())),
+            Schedule::Exit => {
+                tracing::debug!("scene requested exit");
+                self.exit = Some(Ok(()));
+            }
         }
     }
 }
@@ -235,6 +259,7 @@ impl<S: Scene> CompositorHandler for State<S> {
         new_factor: i32,
     ) {
         self.scale = new_factor.max(1) as u32;
+        tracing::info!(scale = self.scale, "buffer scale changed");
         if let Some(layer) = &self.layer {
             let _ = layer.set_buffer_scale(self.scale);
         }
@@ -257,10 +282,15 @@ impl<S: Scene> CompositorHandler for State<S> {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
-        _time: u32,
+        time: u32,
     ) {
         self.frame_pending = false;
         let moving = self.scene.step(Instant::now());
+        tracing::trace!(
+            compositor_ms = time,
+            redraw = self.needs_redraw,
+            "frame callback"
+        );
         if self.needs_redraw || moving {
             self.draw();
         }
@@ -337,6 +367,7 @@ impl<S: Scene> LayerShellHandler for State<S> {
         _serial: u32,
     ) {
         let new_size = configure.new_size;
+        let changed = new_size != self.logical || !self.configured;
         if new_size != self.logical {
             self.buffers.clear();
             self.on_screen.clear();
@@ -349,11 +380,14 @@ impl<S: Scene> LayerShellHandler for State<S> {
             && logical_size_mismatch(output_logical, new_size)
         {
             tracing::warn!(
-                ?output_logical,
-                configured = ?new_size,
-                "layer-shell configure size differs from output's logical size"
+                output_w = output_logical.0,
+                output_h = output_logical.1,
+                width = new_size.0,
+                height = new_size.1,
+                "configure size differs from output logical size"
             );
         }
+        log_configured(new_size, self.scale, changed);
         self.logical = new_size;
         self.configured = true;
         self.request_redraw();
@@ -391,9 +425,18 @@ impl<S: Scene> PresentationTimeHandler for State<S> {
             return;
         };
         let (_, mark, commit_time) = self.feedbacks.swap_remove(pos);
-        let schedule =
-            self.scene
-                .on_presented(mark, presented_at(&time, commit_time), Instant::now());
+        let at = presented_at(&time, commit_time);
+        let ts = match at {
+            PresentedAt::Presentation(t) | PresentedAt::Commit(t) => t,
+        };
+        tracing::debug!(
+            mark,
+            clock = at.clock_name(),
+            { field::TS_NS } = ts.as_nanos(),
+            commit_ns = commit_time.as_nanos(),
+            "frame presented"
+        );
+        let schedule = self.scene.on_presented(mark, at, Instant::now());
         self.apply(schedule);
     }
 
@@ -405,6 +448,10 @@ impl<S: Scene> PresentationTimeHandler for State<S> {
         _surface: &wl_surface::WlSurface,
     ) {
         self.feedbacks.retain(|(fb, _, _)| fb != feedback);
+        tracing::debug!(
+            pending = self.feedbacks.len(),
+            "presentation feedback discarded"
+        );
     }
 }
 
@@ -525,6 +572,12 @@ fn run<S: Scene>(
     let (mut state, conn, queue) = match setup {
         Ok(v) => v,
         Err(e) => {
+            tracing::warn!(
+                error = %e,
+                namespace = options.namespace,
+                output = options.output.as_deref().unwrap_or(""),
+                "overlay setup failed"
+            );
             let _ = startup.send(Err(e));
             return Ok(());
         }
@@ -550,6 +603,7 @@ fn run<S: Scene>(
                 state.request_redraw();
             }
             calloop::channel::Event::Closed => {
+                tracing::info!("overlay close requested");
                 state.exit = Some(Ok(()));
             }
         })
@@ -563,7 +617,58 @@ fn run<S: Scene>(
             .map_err(|e| OverlayError::EventLoop(e.to_string()))?;
     }
 
-    state.exit.take().unwrap_or(Ok(()))
+    let result = state.exit.take().unwrap_or(Ok(()));
+    log_exit(&result);
+    result
+}
+
+pub(crate) fn log_configured(new_size: (u32, u32), scale: u32, changed: bool) {
+    if changed {
+        tracing::info!(
+            width = new_size.0,
+            height = new_size.1,
+            scale,
+            "layer surface configured"
+        );
+    } else {
+        tracing::debug!(
+            width = new_size.0,
+            height = new_size.1,
+            "layer surface reconfigured"
+        );
+    }
+}
+
+pub(crate) fn schedule_name(s: Schedule) -> &'static str {
+    match s {
+        Schedule::Idle => "idle",
+        Schedule::NextFrame => "next_frame",
+        Schedule::At(_) => "at",
+        Schedule::Exit => "exit",
+    }
+}
+
+pub(crate) fn log_drawn(
+    damage_rects: usize,
+    buffer: (u32, u32),
+    schedule: Schedule,
+    feedback: bool,
+) {
+    tracing::trace!(
+        damage_rects,
+        buffer_w = buffer.0,
+        buffer_h = buffer.1,
+        schedule = schedule_name(schedule),
+        feedback,
+        "frame drawn"
+    );
+}
+
+pub(crate) fn log_exit(result: &Result<(), OverlayError>) {
+    match result {
+        Ok(()) => tracing::info!("overlay exited"),
+        Err(e) => tracing::error!(error = %e, "overlay exited with error"),
+    }
 }
 
 pub(crate) fn select_output<T: Clone>(
@@ -607,7 +712,64 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
+    use eye_log::Value;
+    use eye_log::testing::capture_logs;
+
     use super::*;
+
+    #[test]
+    fn test_logs_layer_surface_configured_at_info() {
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            log_configured((1920, 1080), 2, true);
+        });
+        assert_eq!(records.len(), 1);
+        let rec = &records[0];
+        assert_eq!(rec.level, eye_log::Level::Info);
+        assert_eq!(rec.message, "layer surface configured");
+        assert_eq!(rec.fields["width"], Value::U64(1920));
+        assert_eq!(rec.fields["height"], Value::U64(1080));
+        assert_eq!(rec.fields["scale"], Value::U64(2));
+
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            log_configured((1920, 1080), 2, false);
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].level, eye_log::Level::Debug);
+        assert_eq!(records[0].message, "layer surface reconfigured");
+    }
+
+    #[test]
+    fn test_logs_frame_drawn_at_trace() {
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            log_drawn(3, (3840, 2160), Schedule::NextFrame, true);
+        });
+        assert_eq!(records.len(), 1);
+        let rec = &records[0];
+        assert_eq!(rec.level, eye_log::Level::Trace);
+        assert_eq!(rec.message, "frame drawn");
+        assert_eq!(rec.fields["damage_rects"], Value::U64(3));
+        assert_eq!(rec.fields["schedule"], Value::Str("next_frame".to_string()));
+        assert_eq!(rec.fields["feedback"], Value::Bool(true));
+    }
+
+    #[test]
+    fn test_logs_overlay_exited_at_error() {
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            log_exit(&Err(OverlayError::SurfaceClosed));
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].level, eye_log::Level::Error);
+        match &records[0].fields["error"] {
+            Value::Str(s) => assert!(s.contains("closed the layer surface")),
+            other => panic!("expected Str, got {other:?}"),
+        }
+
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            log_exit(&Ok(()));
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].level, eye_log::Level::Info);
+    }
 
     #[test]
     fn test_logical_size_mismatch_detects_difference() {

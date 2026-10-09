@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use eye_core::GazePoint;
 use eye_core::grid::Grid;
+use eye_core::log::field;
 use nalgebra::{Point2, Vector2};
 
 use crate::canvas::{Canvas, LogicalRect, Rgba};
@@ -70,8 +71,14 @@ impl Scene for RegionScene {
             return Schedule::Idle;
         };
         let age = now.saturating_duration_since(*received);
+        let age_us = age.as_micros() as u64;
         let f = fade(age);
         if f == 0.0 {
+            tracing::debug!(
+                age_us,
+                { field::REASON } = "faded",
+                "stale gaze point hidden"
+            );
             self.latest = None;
             return Schedule::Idle;
         }
@@ -83,6 +90,12 @@ impl Scene for RegionScene {
         let (w, h) = canvas.logical_size();
         let size = (f64::from(w), f64::from(h));
         let Some(cell) = self.grid.cell_of(p.px_logical, size) else {
+            tracing::debug!(
+                x = p.px_logical.x,
+                y = p.px_logical.y,
+                { field::REASON } = "outside_grid",
+                "gaze point outside grid"
+            );
             return schedule;
         };
         let (min, max) = self.grid.cell_bounds(cell, size);
@@ -96,6 +109,17 @@ impl Scene for RegionScene {
             h: max.y - min.y,
         };
         canvas.fill_rect(rect, self.rgba((40.0 + 120.0 * containment) * f));
+        tracing::trace!(
+            x = p.px_logical.x,
+            y = p.px_logical.y,
+            col = cell.col,
+            row = cell.row,
+            containment,
+            fade = f,
+            age_us,
+            { field::TS_NS } = p.timestamp.as_nanos(),
+            "gaze cell drawn"
+        );
         let inset = LogicalRect {
             x: rect.x + 1.5,
             y: rect.y + 1.5,
@@ -111,6 +135,8 @@ impl Scene for RegionScene {
 mod tests {
     use approx::{assert_abs_diff_eq, assert_relative_eq};
     use eye_core::{OutputId, Timestamp};
+    use eye_log::Value;
+    use eye_log::testing::capture_logs;
     use nalgebra::Matrix2;
 
     use super::*;
@@ -228,6 +254,60 @@ mod tests {
 
         assert!(buf.iter().all(|&b| b == 0));
         assert_eq!(schedule, Schedule::At(now + FADE_START));
+    }
+
+    #[test]
+    fn test_logs_gaze_cell_drawn_at_trace() {
+        let mut buf = vec![0u8; 200 * 200 * 4];
+        let now = Instant::now();
+        let grid = Grid::new(4, 4).unwrap();
+        let mut scene = RegionScene::new(grid, Vector2::new(1.0, 1.0), [64, 160, 255]);
+        let p = point_at(
+            Point2::new(60.5, 60.5),
+            Matrix2::new(0.01, 0.0, 0.0, 0.01),
+            1.0,
+        );
+        scene.on_msg(p, now);
+
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            let mut canvas = new_canvas(&mut buf);
+            scene.render(&mut canvas, now);
+        });
+
+        let rec = records
+            .iter()
+            .find(|r| r.message == "gaze cell drawn")
+            .expect("gaze cell drawn record");
+        assert_eq!(rec.level, eye_log::Level::Trace);
+        assert_eq!(rec.fields["col"], Value::U64(1));
+        assert_eq!(rec.fields["row"], Value::U64(1));
+        assert_eq!(rec.fields["containment"], Value::F64(1.0));
+    }
+
+    #[test]
+    fn test_logs_gaze_point_outside_grid_at_debug() {
+        let mut buf = vec![0u8; 200 * 200 * 4];
+        let now = Instant::now();
+        let grid = Grid::new(4, 4).unwrap();
+        let mut scene = RegionScene::new(grid, Vector2::new(1.0, 1.0), [64, 160, 255]);
+        let p = point_at(
+            Point2::new(-5.0, 20.0),
+            Matrix2::new(0.01, 0.0, 0.0, 0.01),
+            1.0,
+        );
+        scene.on_msg(p, now);
+
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            let mut canvas = new_canvas(&mut buf);
+            scene.render(&mut canvas, now);
+        });
+
+        let rec = records
+            .iter()
+            .find(|r| r.message == "gaze point outside grid")
+            .expect("gaze point outside grid record");
+        assert_eq!(rec.level, eye_log::Level::Debug);
+        assert_eq!(rec.fields["reason"], Value::Str("outside_grid".to_string()));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use eye_core::log::field;
 use eye_core::session::TargetClock;
 use eye_core::session::TargetTiming;
 use eye_core::{OutputId, Timestamp};
@@ -181,6 +182,7 @@ impl TargetDisplay {
         track_append: bool,
     ) -> Result<(Self, Option<FeedbackSender>), TargetsError> {
         validate(&targets)?;
+        let target_count = targets.len();
         let (events_tx, events) = crossbeam_channel::unbounded();
         let (feedback_rx, feedback_tx) = if with_feedback {
             let (tx, rx) = crossbeam_channel::unbounded();
@@ -216,6 +218,12 @@ impl TargetDisplay {
             },
             scene,
         )?;
+        tracing::info!(
+            output = %output,
+            targets = target_count,
+            lead_in_ms = lead_in.as_millis() as u64,
+            "target sequence started"
+        );
         Ok((
             Self {
                 events,
@@ -357,6 +365,7 @@ impl Scene for TargetScene {
             let Some(t) = self.targets.get(self.current) else {
                 if self.awaiting_finish && self.settled_received >= self.hidden_sent {
                     self.awaiting_finish = false;
+                    tracing::info!(targets = self.targets.len(), "target sequence finished");
                     let _ = self.events.send(TargetEvent::Finished);
                     return Schedule::Exit;
                 }
@@ -365,11 +374,24 @@ impl Scene for TargetScene {
             if let Some(confirmed) = self.confirmed_at
                 && now >= confirmed + t.timing.dwell
             {
+                tracing::debug!(
+                    index = self.current,
+                    dwell_ms = t.timing.dwell.as_millis() as u64,
+                    "target dwell elapsed"
+                );
                 self.advance();
                 continue;
             }
             let size = canvas.logical_size();
             if !in_bounds(t.px_logical, size) {
+                tracing::error!(
+                    index = self.current,
+                    x = t.px_logical.x,
+                    y = t.px_logical.y,
+                    width = size.0,
+                    height = size.1,
+                    "target outside output"
+                );
                 *self.failure.lock().unwrap_or_else(PoisonError::into_inner) =
                     Some(TargetsError::OutOfBounds {
                         index: self.current,
@@ -402,7 +424,22 @@ impl Scene for TargetScene {
     }
 
     fn on_presented(&mut self, mark: u64, at: PresentedAt, now: Instant) -> Schedule {
-        if mark != self.current as u64 || self.confirmed_at.is_some() {
+        if mark != self.current as u64 {
+            tracing::trace!(
+                mark,
+                current = self.current,
+                { field::REASON } = "stale_mark",
+                "presentation mark ignored"
+            );
+            return Schedule::Idle;
+        }
+        if self.confirmed_at.is_some() {
+            tracing::trace!(
+                mark,
+                current = self.current,
+                { field::REASON } = "already_confirmed",
+                "presentation mark ignored"
+            );
             return Schedule::Idle;
         }
         self.confirmed_at = Some(now);
@@ -411,6 +448,12 @@ impl Scene for TargetScene {
             PresentedAt::Commit(t) => (t, TargetClock::Commit),
         };
         if self.current > 0 && self.last_hidden != Some(self.current - 1) {
+            tracing::debug!(
+                index = self.current - 1,
+                { field::TS_NS } = ts.as_nanos(),
+                clock = at.clock_name(),
+                "target hidden"
+            );
             let _ = self.events.send(TargetEvent::Hidden {
                 index: self.current - 1,
                 at: ts,
@@ -421,6 +464,18 @@ impl Scene for TargetScene {
         }
         match self.targets.get(self.current) {
             Some(t) => {
+                let confirm_us = self
+                    .first_frame
+                    .map_or(0, |f| now.saturating_duration_since(f).as_micros() as u64);
+                tracing::debug!(
+                    index = self.current,
+                    x = t.px_logical.x,
+                    y = t.px_logical.y,
+                    { field::TS_NS } = ts.as_nanos(),
+                    clock = at.clock_name(),
+                    confirm_us,
+                    "target shown"
+                );
                 let shown = TargetShown {
                     index: self.current,
                     output: self.output.clone(),
@@ -436,6 +491,7 @@ impl Scene for TargetScene {
                 Schedule::NextFrame
             }
             None => {
+                tracing::info!(targets = self.targets.len(), "target sequence finished");
                 let _ = self.events.send(TargetEvent::Finished);
                 Schedule::Exit
             }
@@ -556,6 +612,8 @@ fn draw_feedback(c: &mut Canvas<'_>, fb: &Feedback) {
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
+    use eye_log::Value;
+    use eye_log::testing::capture_logs;
 
     use super::*;
     use crate::canvas::bgra;
@@ -1357,6 +1415,190 @@ mod tests {
         assert_eq!(
             bgra(&buf, size.0, 50, 50),
             [AMBER.b, AMBER.g, AMBER.r, AMBER.a]
+        );
+    }
+
+    #[test]
+    fn test_logs_target_shown_at_debug() {
+        let targets = vec![TargetSpec::from((
+            Point2::new(50.0, 50.0),
+            Duration::from_secs(1),
+        ))];
+        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let size = (200u32, 200u32);
+        let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
+        let t0 = Instant::now();
+        render_into(&mut scene, &mut buf, size, t0);
+
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            scene.on_presented(0, PresentedAt::Presentation(Timestamp::from_nanos(42)), t0)
+        });
+        let shown = records
+            .iter()
+            .find(|r| r.message == "target shown")
+            .expect("target shown record");
+        assert_eq!(shown.level, eye_log::Level::Debug);
+        assert_eq!(shown.target, "eye_overlay::targets");
+        assert_eq!(shown.fields[field::TS_NS], Value::U64(42));
+        assert_eq!(
+            shown.fields["clock"],
+            Value::Str("presentation".to_string())
+        );
+        assert_eq!(shown.fields["index"], Value::U64(0));
+        assert!(matches!(shown.fields["x"], Value::F64(_)));
+        assert!(matches!(shown.fields["y"], Value::F64(_)));
+
+        let (_, records2) = capture_logs(tracing::Level::TRACE, || {
+            scene.on_presented(0, PresentedAt::Presentation(Timestamp::from_nanos(42)), t0)
+        });
+        let ignored = records2
+            .iter()
+            .find(|r| r.message == "presentation mark ignored")
+            .expect("ignored record");
+        assert_eq!(ignored.level, eye_log::Level::Trace);
+        assert_eq!(
+            ignored.fields[field::REASON],
+            Value::Str("already_confirmed".to_string())
+        );
+    }
+
+    #[test]
+    fn test_logs_target_hidden_at_debug() {
+        let timing = TargetTiming {
+            settle: Duration::from_millis(10),
+            window: Duration::from_millis(10),
+            dwell: Duration::from_millis(100),
+        };
+        let targets = vec![
+            TargetSpec {
+                px_logical: Point2::new(50.0, 50.0),
+                timing,
+                retry: false,
+            },
+            TargetSpec {
+                px_logical: Point2::new(150.0, 50.0),
+                timing,
+                retry: false,
+            },
+        ];
+        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let size = (200u32, 200u32);
+        let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
+        let t0 = Instant::now();
+        render_into(&mut scene, &mut buf, size, t0);
+        scene.on_presented(0, PresentedAt::Commit(Timestamp::from_nanos(1)), t0);
+
+        let t1 = t0 + timing.dwell;
+        render_into(&mut scene, &mut buf, size, t1);
+
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            scene.on_presented(1, PresentedAt::Commit(Timestamp::from_nanos(2)), t1)
+        });
+        let hidden_idx = records
+            .iter()
+            .position(|r| r.message == "target hidden")
+            .expect("hidden record");
+        let shown_idx = records
+            .iter()
+            .position(|r| r.message == "target shown")
+            .expect("shown record");
+        assert!(hidden_idx < shown_idx, "{records:?}");
+        assert_eq!(records[hidden_idx].level, eye_log::Level::Debug);
+        assert_eq!(records[hidden_idx].fields["index"], Value::U64(0));
+        assert_eq!(records[shown_idx].fields["index"], Value::U64(1));
+    }
+
+    #[test]
+    fn test_logs_target_sequence_finished_at_info() {
+        let targets = vec![
+            TargetSpec::from((Point2::new(50.0, 50.0), Duration::from_millis(100))),
+            TargetSpec::from((Point2::new(150.0, 50.0), Duration::from_millis(100))),
+        ];
+        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let size = (200u32, 200u32);
+        let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
+        let t0 = Instant::now();
+
+        render_into(&mut scene, &mut buf, size, t0);
+        scene.on_presented(0, PresentedAt::Commit(Timestamp::from_nanos(1)), t0);
+
+        let t_advance = t0 + Duration::from_millis(100);
+        render_into(&mut scene, &mut buf, size, t_advance);
+        scene.on_presented(1, PresentedAt::Commit(Timestamp::from_nanos(2)), t_advance);
+
+        let t_final = t_advance + Duration::from_millis(100);
+        render_into(&mut scene, &mut buf, size, t_final);
+
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            scene.on_presented(2, PresentedAt::Commit(Timestamp::from_nanos(3)), t_final)
+        });
+
+        let finished = records
+            .iter()
+            .rfind(|r| r.message == "target sequence finished")
+            .expect("finished record");
+        assert_eq!(finished.level, eye_log::Level::Info);
+        assert_eq!(finished.fields["targets"], Value::U64(2));
+    }
+
+    #[test]
+    fn test_logs_target_outside_output_at_error() {
+        let targets = vec![TargetSpec::from((
+            Point2::new(2000.0, 10.0),
+            Duration::from_secs(1),
+        ))];
+        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let size = (1920u32, 1080u32);
+        let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
+        let t0 = Instant::now();
+
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            render_into(&mut scene, &mut buf, size, t0)
+        });
+
+        let errs: Vec<_> = records
+            .iter()
+            .filter(|r| r.level == eye_log::Level::Error)
+            .collect();
+        assert_eq!(errs.len(), 1, "{records:?}");
+        assert_eq!(errs[0].message, "target outside output");
+        assert_eq!(errs[0].fields["index"], Value::U64(0));
+        assert_eq!(errs[0].fields["width"], Value::U64(1920));
+        assert_eq!(errs[0].fields["height"], Value::U64(1080));
+    }
+
+    #[test]
+    fn test_logs_presentation_mark_ignored_at_trace() {
+        let targets = vec![TargetSpec::from((
+            Point2::new(50.0, 50.0),
+            Duration::from_secs(1),
+        ))];
+        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let t0 = Instant::now();
+
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            scene.on_presented(5, PresentedAt::Commit(Timestamp::from_nanos(1)), t0)
+        });
+        let rec = records
+            .iter()
+            .find(|r| r.message == "presentation mark ignored")
+            .expect("ignored record");
+        assert_eq!(rec.level, eye_log::Level::Trace);
+        assert_eq!(rec.fields["mark"], Value::U64(5));
+        assert_eq!(rec.fields["current"], Value::U64(0));
+        assert_eq!(rec.fields["reason"], Value::Str("stale_mark".to_string()));
+
+        scene.on_presented(0, PresentedAt::Commit(Timestamp::from_nanos(2)), t0);
+        let (_, records2) = capture_logs(tracing::Level::TRACE, || {
+            scene.on_presented(0, PresentedAt::Commit(Timestamp::from_nanos(3)), t0)
+        });
+        let rec2 = records2
+            .iter()
+            .find(|r| r.message == "presentation mark ignored")
+            .expect("ignored record 2");
+        assert_eq!(
+            rec2.fields["reason"],
+            Value::Str("already_confirmed".to_string())
         );
     }
 

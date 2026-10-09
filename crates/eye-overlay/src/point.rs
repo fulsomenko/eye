@@ -3,6 +3,7 @@
 use std::time::{Duration, Instant};
 
 use eye_core::GazePoint;
+use eye_core::log::field;
 use nalgebra::{Point2, Vector2};
 
 use crate::canvas::{Canvas, Rgba};
@@ -244,8 +245,14 @@ impl Scene for PointScene {
             return Schedule::Idle;
         };
         let age = now.saturating_duration_since(*received);
+        let age_us = age.as_micros() as u64;
         let f = fade(age);
         if f == 0.0 {
+            tracing::debug!(
+                age_us,
+                { field::REASON } = "faded",
+                "stale gaze point hidden"
+            );
             self.latest = None;
             self.target = None;
             self.drawn = None;
@@ -282,6 +289,18 @@ impl Scene for PointScene {
         }
         let conf = p.confidence.clamp(0.0, 1.0);
         canvas.fill_circle(drawn.center, 6.0, self.rgba(230.0 * f * (0.4 + 0.6 * conf)));
+        tracing::trace!(
+            x = drawn.center.x,
+            y = drawn.center.y,
+            semi_major = drawn.ellipse.map_or(0.0, |e| e.axes.0),
+            semi_minor = drawn.ellipse.map_or(0.0, |e| e.axes.1),
+            angle_rad = drawn.ellipse.map_or(0.0, |e| e.angle),
+            confidence = p.confidence,
+            fade = f,
+            age_us,
+            { field::TS_NS } = p.timestamp.as_nanos(),
+            "gaze point drawn"
+        );
         if age < FADE_START {
             Schedule::At(*received + FADE_START)
         } else {
@@ -294,10 +313,13 @@ impl Scene for PointScene {
 mod tests {
     use approx::assert_abs_diff_eq;
     use eye_core::OutputId;
+    use eye_log::Value;
+    use eye_log::testing::capture_logs;
     use nalgebra::Matrix2;
 
     use super::*;
     use crate::canvas::bgra;
+    use crate::ellipse::K95;
 
     fn point_at(now: Instant, cov_mm: Matrix2<f64>, confidence: f64) -> (GazePoint, Instant) {
         (
@@ -751,6 +773,59 @@ mod tests {
         scene.on_msg(p1, now);
 
         assert_eq!(scene.last_step, Some(last_step));
+    }
+
+    #[test]
+    fn test_logs_gaze_point_drawn_at_trace() {
+        let now = Instant::now();
+        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
+        let (p, received) = point_at(now, Matrix2::new(100.0, 0.0, 0.0, 25.0), 1.0);
+
+        let mut buf = vec![0u8; 200 * 200 * 4];
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            scene.on_msg(p, received);
+            let mut canvas = new_canvas(&mut buf);
+            scene.render(&mut canvas, received);
+        });
+
+        let rec = records
+            .iter()
+            .find(|r| r.message == "gaze point drawn")
+            .expect("gaze point drawn record");
+        assert_eq!(rec.level, eye_log::Level::Trace);
+        assert_eq!(rec.fields["semi_major"], Value::F64(10.0 * K95));
+        assert_eq!(rec.fields["semi_minor"], Value::F64(5.0 * K95));
+        assert_eq!(rec.fields["confidence"], Value::F64(1.0));
+        assert_eq!(rec.fields["fade"], Value::F64(1.0));
+        assert_eq!(rec.fields["ts_ns"], Value::U64(0));
+        assert!(!rec.fields.contains_key("pixels"));
+        assert!(!rec.fields.contains_key("buf"));
+    }
+
+    #[test]
+    fn test_logs_stale_gaze_point_hidden_at_debug() {
+        let mut buf = vec![0u8; 200 * 200 * 4];
+        let now = Instant::now();
+        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
+        let (p, received) = point_at(now, Matrix2::new(100.0, 0.0, 0.0, 25.0), 1.0);
+        scene.on_msg(p, received);
+
+        let later = received + Duration::from_millis(900);
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            let mut canvas = new_canvas(&mut buf);
+            scene.render(&mut canvas, later);
+        });
+
+        let rec = records
+            .iter()
+            .find(|r| r.message == "stale gaze point hidden")
+            .expect("stale gaze point hidden record");
+        assert_eq!(rec.level, eye_log::Level::Debug);
+        assert_eq!(rec.fields["reason"], Value::Str("faded".to_string()));
+        match rec.fields["age_us"] {
+            Value::U64(v) => assert!(v >= 900_000, "age_us = {v}"),
+            ref other => panic!("expected U64, got {other:?}"),
+        }
     }
 
     #[test]

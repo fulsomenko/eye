@@ -2,6 +2,7 @@
 //! feeds it gaze points.
 
 use eye_core::grid::Grid;
+use eye_core::log::field;
 use eye_core::{GazePoint, GazeSink, OutputId, ScreenModel, SinkError};
 use nalgebra::Vector2;
 
@@ -67,6 +68,22 @@ impl LayerShellOverlay {
                 )?
             }
         };
+        let (mode_name, cols, rows): (&'static str, u32, u32) = match options.mode {
+            OverlayMode::Point => ("point", 0, 0),
+            OverlayMode::Region { cols, rows } => ("region", cols, rows),
+        };
+        let (width, height) = handle.logical_size();
+        tracing::info!(
+            output = %options.output,
+            mode = mode_name,
+            cols,
+            rows,
+            px_per_mm_x = options.px_per_mm.x,
+            px_per_mm_y = options.px_per_mm.y,
+            width,
+            height,
+            "gaze overlay ready"
+        );
         Ok(Self {
             handle,
             output: options.output,
@@ -91,7 +108,12 @@ impl GazeSink for LayerShellOverlay {
 
     fn push(&mut self, point: &GazePoint) -> Result<(), SinkError> {
         if point.output != self.output {
-            tracing::trace!(output = %point.output, "gaze point for another output ignored");
+            tracing::debug!(
+                output = %point.output,
+                expected = %self.output,
+                { field::REASON } = "other_output",
+                "gaze point for another output ignored"
+            );
             return Ok(());
         }
         self.handle
@@ -103,6 +125,8 @@ impl GazeSink for LayerShellOverlay {
 #[cfg(test)]
 mod tests {
     use eye_core::Timestamp;
+    use eye_log::Value;
+    use eye_log::testing::capture_logs;
     use nalgebra::{Matrix2, Point2, Vector2};
     use smithay_client_toolkit::reexports::calloop;
 
@@ -155,6 +179,28 @@ mod tests {
         let mut overlay =
             LayerShellOverlay::from_parts(OverlayHandle::detached(tx), OutputId::from("eDP-1"));
         assert!(overlay.push(&point_for("HDMI-A-1")).is_ok());
+    }
+
+    #[test]
+    fn test_logs_other_output_ignored_at_debug() {
+        let (tx, rx) = calloop::channel::sync_channel::<GazePoint>(1);
+        drop(rx);
+        let mut overlay =
+            LayerShellOverlay::from_parts(OverlayHandle::detached(tx), OutputId::from("eDP-1"));
+
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            overlay.push(&point_for("HDMI-A-1")).expect("ok")
+        });
+        assert!(
+            records.iter().all(|r| r.level != eye_log::Level::Trace),
+            "{records:?}"
+        );
+        assert_eq!(records.len(), 1);
+        let rec = &records[0];
+        assert_eq!(rec.level, eye_log::Level::Debug);
+        assert_eq!(rec.message, "gaze point for another output ignored");
+        assert_eq!(rec.fields["expected"], Value::Str("eDP-1".to_string()));
+        assert_eq!(rec.fields["reason"], Value::Str("other_output".to_string()));
     }
 
     #[test]

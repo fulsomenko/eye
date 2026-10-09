@@ -36,7 +36,8 @@ impl<M: Send + 'static> OverlayHandle<M> {
         match tx.try_send(msg) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
+                let dropped_total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(dropped_total, "gaze point dropped, overlay queue full");
                 Ok(())
             }
             Err(TrySendError::Disconnected(_)) => Err(OverlayError::Closed),
@@ -83,6 +84,8 @@ impl<M: Send + 'static> Drop for OverlayHandle<M> {
 
 #[cfg(test)]
 mod tests {
+    use eye_log::Value;
+    use eye_log::testing::capture_logs;
     use smithay_client_toolkit::reexports::calloop;
 
     use super::*;
@@ -95,6 +98,25 @@ mod tests {
             assert!(handle.send(i).is_ok());
         }
         assert_eq!(handle.dropped(), 3);
+    }
+
+    #[test]
+    fn test_logs_gaze_point_dropped_at_warn() {
+        let (tx, _rx) = calloop::channel::sync_channel::<u32>(2);
+        let handle = OverlayHandle::detached(tx);
+
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            for i in 0..5 {
+                handle.send(i).expect("never errors on a full queue");
+            }
+        });
+
+        let warns: Vec<_> = records
+            .iter()
+            .filter(|r| r.level == eye_log::Level::Warn)
+            .collect();
+        assert_eq!(warns.len(), 3, "{records:?}");
+        assert_eq!(warns.last().unwrap().fields["dropped_total"], Value::U64(3));
     }
 
     #[test]
