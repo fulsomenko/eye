@@ -285,25 +285,77 @@ pub fn eval_input<'a>(
     }
 }
 
+type SessionSlot = (String, Result<Replayed, BenchError>);
+
 /// `Err(message)` becomes that mode's `RowOutcome::Error`; the `None` arm always returns `Ok`.
+/// `index` must name a slot whose replay is `Ok`.
 fn evaluate(
     mode: CalibrationMode,
-    replayed: &mut Replayed,
-    fit: eye_calibration::user_fit::FitConfig,
+    index: usize,
+    replayed: &mut [SessionSlot],
+    matrix: &BenchMatrix,
 ) -> Result<(EvalInput, Vec<String>), String> {
     match mode {
-        CalibrationMode::None => Ok((
-            eval_input(
-                &replayed.run.rig,
-                &replayed.run.windows,
-                replayed.run.samples(),
-                replayed.run.processing(),
-            ),
-            Vec::new(),
-        )),
+        CalibrationMode::None => {
+            let r = replayed[index]
+                .1
+                .as_mut()
+                .expect("replay checked ok by caller");
+            Ok((
+                eval_input(
+                    &r.run.rig,
+                    &r.run.windows,
+                    r.run.samples(),
+                    r.run.processing(),
+                ),
+                Vec::new(),
+            ))
+        }
         CalibrationMode::Loto => {
-            let fitter = crate::calibration::dot_session_fitter_with(fit);
-            crate::calibration::loto(replayed, &fitter).map(|o| (o.input, o.warnings))
+            let fitter = crate::calibration::dot_session_fitter_with(matrix.evaluation.fit);
+            let r = replayed[index]
+                .1
+                .as_mut()
+                .expect("replay checked ok by caller");
+            crate::calibration::loto(r, &fitter).map(|o| (o.input, o.warnings))
+        }
+        CalibrationMode::Profile => {
+            let path = matrix
+                .evaluation
+                .profile
+                .as_ref()
+                .expect("evaluation.profile is required for profile mode; validated on load");
+            let profile =
+                eye_calibration::profiles::read_profile(path).map_err(|e| e.to_string())?;
+            let r = replayed[index]
+                .1
+                .as_mut()
+                .expect("replay checked ok by caller");
+            let fingerprint = eye_calibration::correction::rig_fingerprint(&r.run.rig);
+            let mut warnings = Vec::new();
+            if profile.rig_fingerprint != fingerprint {
+                warnings.push(format!(
+                    "profile rig fingerprint {:?} does not match session rig fingerprint {:?}",
+                    profile.rig_fingerprint, fingerprint
+                ));
+            }
+            let windows = r.run.windows.clone();
+            let input = crate::calibration::evaluate_with(r, &profile, &windows);
+            Ok((input, warnings))
+        }
+        CalibrationMode::Cross => {
+            let fitter = crate::calibration::dot_session_fitter_with(matrix.evaluation.fit);
+            let (left, right) = replayed.split_at_mut(index);
+            let (held, rest) = right.split_first_mut().expect("index in range");
+            let others: Vec<&SessionRun> = left
+                .iter()
+                .chain(rest.iter())
+                .filter_map(|(_, r)| r.as_ref().ok())
+                .map(|r| &r.run)
+                .collect();
+            let held_replayed = held.1.as_mut().expect("replay checked ok by caller");
+            crate::calibration::cross(held_replayed, &others, &fitter)
+                .map(|input| (input, Vec::new()))
         }
     }
 }
@@ -392,9 +444,7 @@ fn rows_for_pipeline(
         }
     };
 
-    let mut rows = Vec::new();
-    let mut per_mode: HashMap<CalibrationMode, (Vec<EvalInput>, usize)> = HashMap::new();
-
+    let mut replayed: Vec<SessionSlot> = Vec::new();
     for dir in &matrix.recordings {
         let session = session_name(dir);
         let _session = tracing::info_span!(
@@ -404,61 +454,81 @@ fn rows_for_pipeline(
         )
         .entered();
         let started = Instant::now();
-        match replay_session(dir, &config, registry, &matrix.evaluation.protocol) {
-            Ok(mut replayed) => {
-                let step_errors = replayed.run.step_errors();
+        let result = replay_session(dir, &config, registry, &matrix.evaluation.protocol);
+        match &result {
+            Ok(r) => {
                 tracing::info!(
-                    steps = replayed.run.steps.len() as u64,
-                    step_errors = step_errors as u64,
+                    steps = r.run.steps.len() as u64,
+                    step_errors = r.run.step_errors() as u64,
                     { field::ELAPSED_US } = started.elapsed().as_micros() as u64,
                     "session replayed"
                 );
-                for &mode in &matrix.evaluation.calibration {
-                    match evaluate(mode, &mut replayed, matrix.evaluation.fit) {
-                        Ok((input, warnings)) => {
-                            let metrics = compute(&input, &matrix.evaluation.metrics);
-                            log_session_scored(mode, &metrics, warnings.len() as u64);
-                            rows.push(BenchRow {
-                                pipeline: spec.name.clone(),
-                                calibration: mode,
-                                kind: RowKind::Session,
-                                session: session.clone(),
-                                step_errors,
-                                warnings,
-                                outcome: RowOutcome::Ok { metrics },
-                            });
-                            let entry = per_mode.entry(mode).or_default();
-                            entry.0.push(input);
-                            entry.1 += step_errors;
-                        }
-                        Err(message) => {
-                            tracing::warn!(
-                                calibration = mode.as_str(),
-                                { field::REASON } = %message,
-                                "session evaluation failed"
-                            );
-                            rows.push(error_row(
-                                &spec.name,
-                                mode,
-                                RowKind::Session,
-                                &session,
-                                step_errors,
-                                message,
-                            ));
-                        }
-                    }
-                }
             }
             Err(e) => {
                 tracing::warn!({ field::REASON } = %e, "session replay failed");
-                for &mode in &matrix.evaluation.calibration {
+            }
+        }
+        replayed.push((session, result));
+    }
+
+    let mut rows = Vec::new();
+    let mut per_mode: HashMap<CalibrationMode, (Vec<EvalInput>, usize)> = HashMap::new();
+
+    for index in 0..replayed.len() {
+        let session = replayed[index].0.clone();
+        let _session = tracing::info_span!(
+            span::SESSION,
+            { field::SESSION_ID } = %session,
+            pipeline = %spec.name,
+        )
+        .entered();
+        let (step_errors, replay_error) = match &replayed[index].1 {
+            Ok(r) => (r.run.step_errors(), None),
+            Err(e) => (0, Some(e.to_string())),
+        };
+
+        for &mode in &matrix.evaluation.calibration {
+            if let Some(message) = &replay_error {
+                rows.push(error_row(
+                    &spec.name,
+                    mode,
+                    RowKind::Session,
+                    &session,
+                    0,
+                    message.clone(),
+                ));
+                continue;
+            }
+            match evaluate(mode, index, &mut replayed, matrix) {
+                Ok((input, warnings)) => {
+                    let metrics = compute(&input, &matrix.evaluation.metrics);
+                    log_session_scored(mode, &metrics, warnings.len() as u64);
+                    rows.push(BenchRow {
+                        pipeline: spec.name.clone(),
+                        calibration: mode,
+                        kind: RowKind::Session,
+                        session: session.clone(),
+                        step_errors,
+                        warnings,
+                        outcome: RowOutcome::Ok { metrics },
+                    });
+                    let entry = per_mode.entry(mode).or_default();
+                    entry.0.push(input);
+                    entry.1 += step_errors;
+                }
+                Err(message) => {
+                    tracing::warn!(
+                        calibration = mode.as_str(),
+                        { field::REASON } = %message,
+                        "session evaluation failed"
+                    );
                     rows.push(error_row(
                         &spec.name,
                         mode,
                         RowKind::Session,
                         &session,
-                        0,
-                        e.to_string(),
+                        step_errors,
+                        message,
                     ));
                 }
             }
@@ -1177,6 +1247,148 @@ mod tests {
         for row in session_rows {
             assert!(matches!(row.outcome, RowOutcome::Ok { .. }), "{row:?}");
         }
+    }
+
+    #[test]
+    fn test_cross_with_one_recording_is_error_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let toml_path = dir.path().join("kappa.toml");
+        std::fs::write(
+            &toml_path,
+            kappa_ray_toml(&FOUR_BY_FOUR_CENTRES, [3.0, -1.0], None),
+        )
+        .unwrap();
+        let matrix = BenchMatrix {
+            recordings: vec![session_dir],
+            pipelines: vec![PipelineSpec {
+                name: "kappa".to_string(),
+                config: Some(toml_path),
+            }],
+            evaluation: crate::matrix::Evaluation {
+                calibration: vec![CalibrationMode::Cross],
+                ..Default::default()
+            },
+        };
+        let report = run_matrix(&matrix, &fake_registry());
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Session && r.calibration == CalibrationMode::Cross)
+            .unwrap();
+        let RowOutcome::Error { message } = &row.outcome else {
+            panic!("expected error row: {row:?}");
+        };
+        assert!(message.contains("at least two"));
+    }
+
+    fn fitted_profile_for(session_dir: &Path) -> eye_calibration::correction::UserProfile {
+        let config =
+            Config::from_toml_str(&kappa_ray_toml(&FOUR_BY_FOUR_CENTRES, [3.0, -1.0], None))
+                .unwrap();
+        let replayed = replay_session(
+            session_dir,
+            &config,
+            &fake_registry(),
+            &ProtocolConfig::default(),
+        )
+        .unwrap();
+        let train = crate::calibration::fit_samples(
+            &replayed.run.windows,
+            replayed.run.steps.iter().filter_map(|s| s.batch.as_ref()),
+            |_| true,
+        );
+        crate::calibration::dot_session_fitter(&train, &replayed.run.rig).unwrap()
+    }
+
+    #[test]
+    fn test_profile_mode_applies_given_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let toml_path = dir.path().join("kappa.toml");
+        std::fs::write(
+            &toml_path,
+            kappa_ray_toml(&FOUR_BY_FOUR_CENTRES, [3.0, -1.0], None),
+        )
+        .unwrap();
+        let profile = fitted_profile_for(&session_dir);
+        let profile_path = dir.path().join("profile.toml");
+        eye_calibration::profiles::write_profile(&profile_path, &profile).unwrap();
+
+        let matrix = BenchMatrix {
+            recordings: vec![session_dir],
+            pipelines: vec![PipelineSpec {
+                name: "kappa".to_string(),
+                config: Some(toml_path),
+            }],
+            evaluation: crate::matrix::Evaluation {
+                calibration: vec![CalibrationMode::Profile],
+                profile: Some(profile_path),
+                ..Default::default()
+            },
+        };
+        let report = run_matrix(&matrix, &fake_registry());
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Session && r.calibration == CalibrationMode::Profile)
+            .unwrap();
+        let RowOutcome::Ok { metrics } = &row.outcome else {
+            panic!("expected ok row: {row:?}");
+        };
+        assert!(metrics.angular_error_deg.as_ref().unwrap().mean < 0.1);
+        assert!(row.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_profile_mode_warns_on_rig_fingerprint_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let toml_path = dir.path().join("kappa.toml");
+        std::fs::write(
+            &toml_path,
+            kappa_ray_toml(&FOUR_BY_FOUR_CENTRES, [3.0, -1.0], None),
+        )
+        .unwrap();
+        let mut profile = fitted_profile_for(&session_dir);
+        profile.rig_fingerprint = "stale".to_string();
+        let profile_path = dir.path().join("profile.toml");
+        eye_calibration::profiles::write_profile(&profile_path, &profile).unwrap();
+
+        let matrix = BenchMatrix {
+            recordings: vec![session_dir],
+            pipelines: vec![PipelineSpec {
+                name: "kappa".to_string(),
+                config: Some(toml_path),
+            }],
+            evaluation: crate::matrix::Evaluation {
+                calibration: vec![CalibrationMode::Profile],
+                profile: Some(profile_path),
+                ..Default::default()
+            },
+        };
+        let report = run_matrix(&matrix, &fake_registry());
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Session && r.calibration == CalibrationMode::Profile)
+            .unwrap();
+        assert!(row.warnings.iter().any(|w| w.contains("rig")));
     }
 
     fn single_mode_matrix(dir: &Path, session_dir: PathBuf) -> BenchMatrix {

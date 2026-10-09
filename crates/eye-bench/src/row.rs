@@ -7,14 +7,18 @@ use crate::metrics::SessionMetrics;
 pub enum CalibrationMode {
     None,
     Loto,
+    Profile,
+    Cross,
 }
 
 impl CalibrationMode {
-    /// The serialized name ("none", "loto").
+    /// The serialized name ("none", "loto", "profile", "cross").
     pub fn as_str(self) -> &'static str {
         match self {
             CalibrationMode::None => "none",
             CalibrationMode::Loto => "loto",
+            CalibrationMode::Profile => "profile",
+            CalibrationMode::Cross => "cross",
         }
     }
 }

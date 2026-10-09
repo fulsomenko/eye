@@ -9,7 +9,7 @@ use eye_core::log::{field, span};
 use eye_core::{GazePoint, Rig};
 
 use crate::metrics::EvalInput;
-use crate::runner::{Replayed, eval_input, window_at};
+use crate::runner::{Replayed, SessionRun, eval_input, window_at};
 
 pub type Fitter<'a> = &'a dyn Fn(&[FitSample], &Rig) -> Result<UserProfile, String>;
 
@@ -84,6 +84,63 @@ fn fold_keys(windows: &[FixationWindow]) -> Vec<(u64, u64)> {
     keys
 }
 
+/// Applies `profile` to `replayed`'s pipeline, re-finishes every cached batch, and scores the
+/// points that fall inside `windows`. Leaves the pipeline uncorrected on return.
+pub fn evaluate_with(
+    replayed: &mut Replayed,
+    profile: &UserProfile,
+    windows: &[FixationWindow],
+) -> EvalInput {
+    replayed
+        .pipeline
+        .set_correction(Some(Box::new(profile.clone())));
+
+    let mut kept: Vec<(&RayBatch, GazePoint)> = Vec::new();
+    for step in &replayed.run.steps {
+        let Some(batch) = &step.batch else { continue };
+        let Some(point) = replayed.pipeline.finish(batch) else {
+            continue;
+        };
+        kept.push((batch, point));
+    }
+
+    let input = eval_input(
+        &replayed.run.rig,
+        windows,
+        kept.iter().map(|(batch, point)| (*batch, point)),
+        replayed.run.processing(),
+    );
+
+    replayed.pipeline.set_correction(None);
+    input
+}
+
+/// Fits on every recording in `others`, then evaluates on `held_out`'s own windows via
+/// [`evaluate_with`]. `Err` when `others` is empty or the fit fails.
+pub fn cross(
+    held_out: &mut Replayed,
+    others: &[&SessionRun],
+    fitter: Fitter<'_>,
+) -> Result<EvalInput, String> {
+    if others.is_empty() {
+        return Err("cross needs at least two recordings".to_string());
+    }
+
+    let mut train = Vec::new();
+    for other in others {
+        let base_len = other.protocol.grid[0] * other.protocol.grid[1];
+        train.extend(fit_samples(
+            &other.windows,
+            other.steps.iter().filter_map(|s| s.batch.as_ref()),
+            latest_presentation(&other.windows, base_len),
+        ));
+    }
+
+    let profile = fitter(&train, &held_out.run.rig)?;
+    let windows = held_out.run.windows.clone();
+    Ok(evaluate_with(held_out, &profile, &windows))
+}
+
 /// Err when there is no window or every fold failed. Leaves the pipeline uncorrected.
 pub fn loto(replayed: &mut Replayed, fitter: Fitter<'_>) -> Result<LotoOutcome, String> {
     if replayed.run.windows.is_empty() {
@@ -132,7 +189,6 @@ pub fn loto(replayed: &mut Replayed, fitter: Fitter<'_>) -> Result<LotoOutcome, 
             }
         };
         any_ok = true;
-        replayed.pipeline.set_correction(Some(Box::new(profile)));
 
         let held_out: Vec<FixationWindow> = replayed
             .run
@@ -142,38 +198,21 @@ pub fn loto(replayed: &mut Replayed, fitter: Fitter<'_>) -> Result<LotoOutcome, 
             .cloned()
             .collect();
 
-        let mut kept: Vec<(&RayBatch, GazePoint)> = Vec::new();
-        for step in &replayed.run.steps {
-            let Some(batch) = &step.batch else { continue };
-            let Some(point) = replayed.pipeline.finish(batch) else {
-                continue;
-            };
-            if held_out
-                .iter()
-                .any(|w| w.start <= point.timestamp && point.timestamp < w.end)
-            {
-                kept.push((batch, point));
-            }
-        }
-
-        let fold_input = eval_input(
-            &replayed.run.rig,
-            &held_out,
-            kept.iter().map(|(batch, point)| (*batch, point)),
-            Vec::new(),
-        );
+        let fold_input = evaluate_with(replayed, &profile, &held_out);
         tracing::debug!(
             target_mm_x = held_out[0].target_mm.x,
             target_mm_y = held_out[0].target_mm.y,
             train_samples = train.len() as u64,
             held_out_windows = held_out.len() as u64,
-            kept_samples = kept.len() as u64,
+            kept_samples = fold_input
+                .windows
+                .iter()
+                .map(|w| w.points.len())
+                .sum::<usize>() as u64,
             "loto fold evaluated"
         );
         eval_windows.extend(fold_input.windows);
     }
-
-    replayed.pipeline.set_correction(None);
 
     if !any_ok {
         return Err(format!(
@@ -636,6 +675,114 @@ mod tests {
         let fitter = |_: &[FitSample], _: &Rig| Err("x".to_string());
         let err = loto(&mut replayed, &fitter).unwrap_err();
         assert!(err.contains("every leave-one-target-out fold failed"));
+    }
+
+    #[test]
+    fn test_evaluate_with_restores_no_correction() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let config = kappa_ray_config(&FOUR_BY_FOUR_CENTRES, [3.0, -1.0], None);
+        let mut replayed = replay_session(
+            &session_dir,
+            &config,
+            &fake_registry(),
+            &ProtocolConfig::default(),
+        )
+        .unwrap();
+        let first_batch = replayed
+            .run
+            .steps
+            .iter()
+            .find_map(|s| s.batch.clone())
+            .unwrap();
+        let first_point = replayed
+            .run
+            .steps
+            .iter()
+            .find(|s| s.batch.is_some())
+            .unwrap()
+            .point
+            .clone();
+
+        let train = fit_samples(
+            &replayed.run.windows,
+            replayed.run.steps.iter().filter_map(|s| s.batch.as_ref()),
+            |_| true,
+        );
+        let profile = dot_session_fitter(&train, &replayed.run.rig).unwrap();
+        let windows = replayed.run.windows.clone();
+        evaluate_with(&mut replayed, &profile, &windows);
+
+        let after = replayed.pipeline.finish(&first_batch);
+        assert_eq!(after, first_point);
+    }
+
+    #[test]
+    fn test_cross_trains_on_other_sessions_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_a_dir = write_synthetic_session(dir.path(), "a", &spec).unwrap();
+        let session_b_dir = write_synthetic_session(dir.path(), "b", &spec).unwrap();
+
+        let config_a = kappa_ray_config(&FOUR_BY_FOUR_CENTRES, [2.0, 0.0], None);
+        let config_b = kappa_ray_config(&FOUR_BY_FOUR_CENTRES, [-2.0, 0.0], None);
+        let mut replayed_a = replay_session(
+            &session_a_dir,
+            &config_a,
+            &fake_registry(),
+            &ProtocolConfig::default(),
+        )
+        .unwrap();
+        let replayed_b = replay_session(
+            &session_b_dir,
+            &config_b,
+            &fake_registry(),
+            &ProtocolConfig::default(),
+        )
+        .unwrap();
+
+        let cross_outcome = cross(&mut replayed_a, &[&replayed_b.run], &dot_session_fitter)
+            .expect("cross should succeed with two recordings");
+        let cross_mean = cross_outcome
+            .windows
+            .iter()
+            .flat_map(|w| w.points.iter().map(move |p| (w, p)))
+            .map(|(w, p)| crate::metrics::angle_deg(&p.eye_mm, &p.gaze_mm, &w.target_mm))
+            .sum::<f64>()
+            / cross_outcome
+                .windows
+                .iter()
+                .map(|w| w.points.len())
+                .sum::<usize>() as f64;
+        assert!(
+            (3.0..5.0).contains(&cross_mean),
+            "cross mean error {cross_mean} outside expected range"
+        );
+
+        let loto_outcome = loto(&mut replayed_a, &dot_session_fitter).unwrap();
+        let loto_mean = loto_outcome
+            .input
+            .windows
+            .iter()
+            .flat_map(|w| w.points.iter().map(move |p| (w, p)))
+            .map(|(w, p)| crate::metrics::angle_deg(&p.eye_mm, &p.gaze_mm, &w.target_mm))
+            .sum::<f64>()
+            / loto_outcome
+                .input
+                .windows
+                .iter()
+                .map(|w| w.points.len())
+                .sum::<usize>() as f64;
+        assert!(loto_mean < 0.5, "loto mean error {loto_mean} too high");
     }
 
     #[test]

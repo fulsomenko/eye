@@ -36,6 +36,8 @@ pub struct Evaluation {
     pub protocol: ProtocolConfig,
     pub metrics: MetricParams,
     pub fit: FitConfig,
+    /// Required when `calibration` lists `Profile`; resolved against the matrix's directory.
+    pub profile: Option<PathBuf>,
 }
 
 impl Default for Evaluation {
@@ -45,6 +47,7 @@ impl Default for Evaluation {
             protocol: ProtocolConfig::default(),
             metrics: MetricParams::default(),
             fit: FitConfig::default(),
+            profile: None,
         }
     }
 }
@@ -82,6 +85,7 @@ impl BenchMatrix {
         for pipeline in &mut matrix.pipelines {
             pipeline.config = pipeline.config.take().map(|p| resolve(dir, p));
         }
+        matrix.evaluation.profile = matrix.evaluation.profile.take().map(|p| resolve(dir, p));
         matrix.validate()?;
         tracing::debug!(
             path = %path.display(),
@@ -107,7 +111,8 @@ impl BenchMatrix {
     }
 
     /// `Matrix(..)` for: no recordings, no pipelines, a duplicate or invalid pipeline name, an empty or
-    /// duplicated `calibration` list, `metrics.validate()` failing (message passed through);
+    /// duplicated `calibration` list, `Profile` listed in `calibration` without `evaluation.profile`,
+    /// `metrics.validate()` failing (message passed through);
     /// `Calibration(..)` for `TargetProtocol::new(protocol)` failing.
     #[allow(clippy::result_large_err)]
     pub fn validate(&self) -> Result<(), BenchError> {
@@ -146,6 +151,17 @@ impl BenchMatrix {
                     "duplicate calibration mode {mode:?}"
                 )));
             }
+        }
+
+        if self
+            .evaluation
+            .calibration
+            .contains(&CalibrationMode::Profile)
+            && self.evaluation.profile.is_none()
+        {
+            return Err(BenchError::Matrix(
+                "evaluation.profile is required for calibration mode profile".to_string(),
+            ));
         }
 
         self.evaluation
@@ -248,6 +264,25 @@ foo = 1
             BenchMatrix::from_path(&path),
             Err(BenchError::Toml(_))
         ));
+    }
+
+    #[test]
+    fn test_matrix_profile_mode_requires_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_bench_toml(
+            dir.path(),
+            r#"
+recordings = ["rec"]
+
+[[pipeline]]
+name = "a"
+
+[evaluation]
+calibration = ["profile"]
+"#,
+        );
+        let err = BenchMatrix::from_path(&path).unwrap_err();
+        assert!(matches!(err, BenchError::Matrix(ref m) if m.contains("evaluation.profile")));
     }
 
     #[test]

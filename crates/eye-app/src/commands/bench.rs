@@ -18,6 +18,9 @@ pub struct Args {
     /// Calibration modes to evaluate, comma-separated or repeated; overrides the matrix (default: none,loto)
     #[arg(long, value_enum, value_delimiter = ',')]
     pub calibration: Vec<CalibrationArg>,
+    /// Profile file for calibration mode `profile`; overrides the matrix's evaluation.profile
+    #[arg(long, value_name = "FILE")]
+    pub profile: Option<PathBuf>,
     /// Recording directories; override the matrix's list
     #[arg(value_name = "RECORDING")]
     pub recordings: Vec<PathBuf>,
@@ -27,6 +30,8 @@ pub struct Args {
 pub enum CalibrationArg {
     None,
     Loto,
+    Profile,
+    Cross,
 }
 
 impl From<CalibrationArg> for CalibrationMode {
@@ -34,6 +39,8 @@ impl From<CalibrationArg> for CalibrationMode {
         match value {
             CalibrationArg::None => CalibrationMode::None,
             CalibrationArg::Loto => CalibrationMode::Loto,
+            CalibrationArg::Profile => CalibrationMode::Profile,
+            CalibrationArg::Cross => CalibrationMode::Cross,
         }
     }
 }
@@ -60,6 +67,9 @@ pub fn build_matrix(config_path: Option<PathBuf>, args: &Args) -> anyhow::Result
     };
     if !args.calibration.is_empty() {
         matrix.evaluation.calibration = args.calibration.iter().copied().map(Into::into).collect();
+    }
+    if args.profile.is_some() {
+        matrix.evaluation.profile = args.profile.clone();
     }
     matrix.validate()?;
     Ok(matrix)
@@ -114,6 +124,7 @@ mod tests {
         Args {
             matrix,
             calibration,
+            profile: None,
             recordings: recordings.into_iter().map(PathBuf::from).collect(),
         }
     }
@@ -209,6 +220,39 @@ mod tests {
             a.calibration,
             vec![CalibrationArg::None, CalibrationArg::Loto]
         );
+    }
+
+    #[test]
+    fn test_bench_profile_and_cross_args_parse() {
+        use clap::Parser;
+
+        use crate::cli::{Cli, Command};
+
+        let cli = Cli::try_parse_from([
+            "eye",
+            "bench",
+            "--calibration",
+            "profile,cross",
+            "--profile",
+            "p.toml",
+            "r",
+        ])
+        .unwrap();
+        let Command::Bench(a) = cli.command else {
+            panic!("expected bench command");
+        };
+        assert_eq!(
+            a.calibration,
+            vec![CalibrationArg::Profile, CalibrationArg::Cross]
+        );
+        assert_eq!(a.profile, Some(PathBuf::from("p.toml")));
+
+        let matrix = build_matrix(None, &a).unwrap();
+        assert_eq!(
+            matrix.evaluation.calibration,
+            vec![CalibrationMode::Profile, CalibrationMode::Cross]
+        );
+        assert_eq!(matrix.evaluation.profile, Some(PathBuf::from("p.toml")));
     }
 
     #[test]
