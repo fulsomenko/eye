@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use eye_core::log::field;
 use eye_core::{GazeRay, Rig};
 use eye_geometry::angles::yaw_pitch_from_direction;
-use nalgebra::{
-    Cholesky, Matrix2, Point2, Point3, SMatrix, SVector, Unit, UnitQuaternion, Vector2,
-};
+use nalgebra::{Cholesky, Matrix2, Point2, Point3, SMatrix, SVector, Unit, Vector2};
 
 use crate::correction::{
     AngularCorrection, CorrectionModel, EyeKey, UserProfile, design, design_quad, design12,
@@ -115,7 +113,11 @@ pub struct EyeFitReport {
     pub targets_rejected: Vec<u32>,
     pub rms_before_deg: f64,
     pub rms_after_deg: f64,
-    pub loo_rms_deg: f64,
+    /// Leave-one-target-out RMS over per-target means, in-fit (no filter, no screen
+    /// intersection): a fit-stability diagnostic, not the accuracy estimate (the bench LOTO is).
+    pub loo_target_mean_deg: f64,
+    /// Samples skipped because the HeadFrame model was requested and the ray carried no head pose.
+    pub samples_without_head_pose: usize,
     pub diagnostics: Vec<TargetVerdict>,
 }
 
@@ -165,9 +167,26 @@ impl DotSessionFit {
         cfg: &FitConfig,
         meta: ProfileMeta,
     ) -> Result<FitOutcome, CalibrationError> {
+        let use_head_frame = cfg.model_override == Some(CorrectionModel::HeadFrame);
+        let (samples, without_pose): (Vec<&FitSample>, Vec<&FitSample>) = samples
+            .iter()
+            .partition(|s| !use_head_frame || s.ray.head_rotation.is_some());
+        if use_head_frame && samples.is_empty() {
+            return Err(CalibrationError::NoHeadPose {
+                samples: without_pose.len(),
+            });
+        }
+        if !without_pose.is_empty() {
+            tracing::debug!(
+                { field::REASON } = "no_head_pose",
+                dropped = without_pose.len() as u64,
+                "samples skipped"
+            );
+        }
+
         let mut target_index_of: HashMap<(u64, u64), u32> = HashMap::new();
         let mut target_mm_of: Vec<Point2<f64>> = Vec::new();
-        for s in samples {
+        for s in samples.iter().copied() {
             let key = (s.target_mm.x.to_bits(), s.target_mm.y.to_bits());
             target_index_of.entry(key).or_insert_with(|| {
                 let idx = target_mm_of.len() as u32;
@@ -177,7 +196,7 @@ impl DotSessionFit {
         }
 
         let mut by_eye_target: HashMap<(EyeKey, u32), Vec<&FitSample>> = HashMap::new();
-        for s in samples {
+        for s in samples.iter().copied() {
             let key = (s.target_mm.x.to_bits(), s.target_mm.y.to_bits());
             let idx = target_index_of[&key];
             let eye = EyeKey::from(s.ray.side);
@@ -209,7 +228,6 @@ impl DotSessionFit {
                 ));
             p
         };
-        let use_head_frame = cfg.model_override == Some(CorrectionModel::HeadFrame);
 
         let mut eyes = BTreeMap::new();
         let mut reports = Vec::new();
@@ -236,10 +254,7 @@ impl DotSessionFit {
                 for s in group.iter() {
                     let desired_dir = Unit::new_normalize(target_point - s.ray.origin);
                     let (o, d) = if use_head_frame {
-                        let inv = s
-                            .ray
-                            .head_rotation
-                            .map_or_else(UnitQuaternion::identity, |r| r.inverse());
+                        let inv = s.ray.head_rotation.expect("partitioned above").inverse();
                         (
                             yaw_pitch_from_direction(&(inv * s.ray.direction)),
                             yaw_pitch_from_direction(&(inv * desired_dir)),
@@ -353,7 +368,8 @@ impl DotSessionFit {
                     targets_rejected: sample_rejected,
                     rms_before_deg: 0.0,
                     rms_after_deg: 0.0,
-                    loo_rms_deg: 0.0,
+                    loo_target_mean_deg: 0.0,
+                    samples_without_head_pose: without_pose.len(),
                     diagnostics,
                 });
                 continue;
@@ -456,7 +472,8 @@ impl DotSessionFit {
                     targets_rejected,
                     rms_before_deg: 0.0,
                     rms_after_deg: 0.0,
-                    loo_rms_deg: 0.0,
+                    loo_target_mean_deg: 0.0,
+                    samples_without_head_pose: without_pose.len(),
                     diagnostics,
                 });
                 continue;
@@ -551,7 +568,8 @@ impl DotSessionFit {
                 )
             }));
 
-            let loo_rms = loo_rms_deg(eye, &remaining, model, s_off, &prior6, &prior12);
+            let loo_target_mean =
+                loo_target_mean_deg(eye, &remaining, model, s_off, &prior6, &prior12);
 
             eyes.insert(
                 eye,
@@ -575,7 +593,7 @@ impl DotSessionFit {
                 targets_rejected = targets_rejected.len() as u64,
                 rms_before_deg = rms_before,
                 rms_after_deg = rms_after,
-                loo_rms_deg = loo_rms,
+                loo_target_mean_deg = loo_target_mean,
                 chi2_reduced,
                 "eye fitted"
             );
@@ -587,7 +605,8 @@ impl DotSessionFit {
                 targets_rejected,
                 rms_before_deg: rms_before,
                 rms_after_deg: rms_after,
-                loo_rms_deg: loo_rms,
+                loo_target_mean_deg: loo_target_mean,
+                samples_without_head_pose: without_pose.len(),
                 diagnostics,
             });
         }
@@ -741,7 +760,7 @@ fn rms_deg(pairs: impl Iterator<Item = (Vector2<f64>, Vector2<f64>)>) -> f64 {
     (sum / n as f64).sqrt().to_degrees()
 }
 
-fn loo_rms_deg(
+fn loo_target_mean_deg(
     eye: EyeKey,
     targets: &[TargetAgg],
     model: CorrectionModel,
@@ -1607,6 +1626,139 @@ mod tests {
         let desired_angles = yaw_pitch_from_direction(&true_dir);
         let err_deg = (corrected_angles - desired_angles).norm().to_degrees();
         assert!(err_deg < 0.15, "{err_deg}");
+    }
+
+    #[test]
+    fn test_head_frame_fit_errors_when_no_sample_has_head_pose() {
+        let samples = generate_session(&SessionConfig::default());
+        assert!(samples.iter().all(|s| s.ray.head_rotation.is_none()));
+        let cfg = FitConfig {
+            model_override: Some(CorrectionModel::HeadFrame),
+            ..FitConfig::default()
+        };
+        let err = DotSessionFit::fit_with(&samples, &fixture_rig(), &cfg, ProfileMeta::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, CalibrationError::NoHeadPose { samples } if samples == 216),
+            "{err:?}"
+        );
+    }
+
+    fn head_frame_rotation_session() -> (Vec<FitSample>, Vec<Point2<f64>>, Point3<f64>) {
+        let bias = [0.05, 0.0, 0.0, -0.03, 0.0, 0.0];
+        let proto = TargetProtocol::new(ProtocolConfig {
+            grid: [3, 3],
+            ..ProtocolConfig::default()
+        })
+        .unwrap();
+        let screen = screen();
+        let origin = Point3::new(185.0, 60.0, -500.0);
+        let targets = proto.sequence(0);
+        let mut rng = SplitMix64::new(13);
+        let mut samples = Vec::new();
+        let mut target_mms = Vec::new();
+        for (ti, t) in targets.iter().enumerate() {
+            let target_mm = proto.target_mm(t, &screen);
+            target_mms.push(target_mm);
+            let rot_deg = -20.0 + 5.0 * ti as f64;
+            let rot = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), rot_deg.to_radians());
+            for _ in 0..24 {
+                let true_dir =
+                    Unit::new_normalize(Point3::new(target_mm.x, target_mm.y, 0.0) - origin);
+                let head_angles = yaw_pitch_from_direction(&(rot.inverse() * true_dir));
+                let th = SVector::<f64, 6>::from(bias);
+                let observed_head = head_angles
+                    + design(&head_angles) * th
+                    + Vector2::new(
+                        1.0_f64.to_radians() * rng.gaussian(),
+                        1.0_f64.to_radians() * rng.gaussian(),
+                    );
+                let direction = rot * direction_from_yaw_pitch(&observed_head);
+                let ray = GazeRay {
+                    side: Some(Side::Right),
+                    timestamp: eye_core::Timestamp::from_nanos(0),
+                    origin,
+                    direction,
+                    angular_cov: Matrix2::identity() * 1.0_f64.to_radians().powi(2),
+                    origin_cov: Matrix3::identity(),
+                    head_rotation: Some(rot),
+                };
+                samples.push(FitSample { ray, target_mm });
+            }
+        }
+        (samples, target_mms, origin)
+    }
+
+    #[test]
+    fn test_head_frame_fit_drops_samples_without_pose_and_reports() {
+        let (samples, target_mms, origin) = head_frame_rotation_session();
+        let cfg = FitConfig {
+            model_override: Some(CorrectionModel::HeadFrame),
+            ..FitConfig::default()
+        };
+
+        let outcome_a =
+            DotSessionFit::fit_with(&samples, &fixture_rig(), &cfg, ProfileMeta::default())
+                .unwrap();
+        let theta_a = outcome_a.profile.eyes.get(&EyeKey::Right).unwrap().theta;
+
+        let mut samples_b = samples.clone();
+        let off_direction = Unit::new_normalize(Vector3::new(1.0, 1.0, 1.0));
+        for target_mm in &target_mms {
+            for _ in 0..3 {
+                let ray = GazeRay {
+                    side: Some(Side::Right),
+                    timestamp: eye_core::Timestamp::from_nanos(0),
+                    origin,
+                    direction: off_direction,
+                    angular_cov: Matrix2::identity() * 1.0_f64.to_radians().powi(2),
+                    origin_cov: Matrix3::identity(),
+                    head_rotation: None,
+                };
+                samples_b.push(FitSample {
+                    ray,
+                    target_mm: *target_mm,
+                });
+            }
+        }
+
+        let outcome_b =
+            DotSessionFit::fit_with(&samples_b, &fixture_rig(), &cfg, ProfileMeta::default())
+                .unwrap();
+        let theta_b = outcome_b.profile.eyes.get(&EyeKey::Right).unwrap().theta;
+
+        for (a, b) in theta_a.iter().zip(theta_b.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-9);
+        }
+        assert_eq!(
+            outcome_b.reports[0].samples_without_head_pose,
+            3 * target_mms.len()
+        );
+    }
+
+    #[test]
+    fn test_eye_fit_report_exposes_loo_target_mean_deg() {
+        let samples = generate_session(&SessionConfig::default());
+        let (outcome, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            DotSessionFit::fit_with(
+                &samples,
+                &fixture_rig(),
+                &FitConfig::default(),
+                ProfileMeta::default(),
+            )
+            .unwrap()
+        });
+
+        let eye_fitted: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "eye fitted")
+            .collect();
+        assert_eq!(eye_fitted.len(), 1);
+        let logged_loo = match eye_fitted[0].fields.get("loo_target_mean_deg") {
+            Some(eye_log::Value::F64(v)) => *v,
+            other => panic!("expected loo_target_mean_deg F64, got {other:?}"),
+        };
+        assert_eq!(outcome.reports[0].loo_target_mean_deg, logged_loo);
     }
 
     #[test]

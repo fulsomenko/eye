@@ -14,6 +14,8 @@ pub enum CalibrationError {
         need: usize,
         got: usize,
     },
+    #[error("head-frame fit: none of the {samples} samples carries a head pose")]
+    NoHeadPose { samples: usize },
     #[error(transparent)]
     Geometry(#[from] eye_geometry::GeometryError),
     #[error(transparent)]
