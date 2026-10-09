@@ -31,9 +31,9 @@ pub struct FitConfig {
     pub min_targets_affine: usize,
     pub min_targets_offset: usize,
     pub min_targets_quadratic: usize,
-    /// Skips the target-count ladder (`min_targets_*`) and fits this model directly, as long as
-    /// `min_targets_offset` is met. `None` keeps the ladder (ending in `Quadratic` once
-    /// `min_targets_quadratic` is met).
+    /// Skips model selection and fits this model directly, as long as `min_targets_offset` is met.
+    /// `None` fits `HeadFrame` when any sample carries a head pose, and otherwise walks the
+    /// target-count ladder (`min_targets_*`, ending in `Quadratic`).
     pub model_override: Option<CorrectionModel>,
 }
 
@@ -167,7 +167,13 @@ impl DotSessionFit {
         cfg: &FitConfig,
         meta: ProfileMeta,
     ) -> Result<FitOutcome, CalibrationError> {
-        let use_head_frame = cfg.model_override == Some(CorrectionModel::HeadFrame);
+        let model_override = cfg.model_override.or_else(|| {
+            samples
+                .iter()
+                .any(|s| s.ray.head_rotation.is_some())
+                .then_some(CorrectionModel::HeadFrame)
+        });
+        let use_head_frame = model_override == Some(CorrectionModel::HeadFrame);
         let (samples, without_pose): (Vec<&FitSample>, Vec<&FitSample>) = samples
             .iter()
             .partition(|s| !use_head_frame || s.ray.head_rotation.is_some());
@@ -479,7 +485,7 @@ impl DotSessionFit {
                 continue;
             }
 
-            let model = match cfg.model_override {
+            let model = match model_override {
                 Some(m) => m,
                 None if remaining.len() >= cfg.min_targets_quadratic => CorrectionModel::Quadratic,
                 None if remaining.len() >= cfg.min_targets_affine => CorrectionModel::Affine,
@@ -1687,6 +1693,50 @@ mod tests {
             }
         }
         (samples, target_mms, origin)
+    }
+
+    #[test]
+    fn test_default_fit_picks_head_frame_when_samples_carry_pose() {
+        let (samples, _, _) = head_frame_rotation_session();
+        let outcome = DotSessionFit::fit_with(
+            &samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap();
+        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        assert_eq!(right.model, CorrectionModel::HeadFrame);
+        assert_eq!(right.targets_used, 9);
+    }
+
+    #[test]
+    fn test_default_fit_keeps_ladder_without_head_pose() {
+        let samples = generate_session(&SessionConfig::default());
+        assert!(samples.iter().all(|s| s.ray.head_rotation.is_none()));
+        let outcome = DotSessionFit::fit_with(
+            &samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap();
+        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        assert_ne!(right.model, CorrectionModel::HeadFrame);
+    }
+
+    #[test]
+    fn test_explicit_override_beats_head_frame_default() {
+        let (samples, _, _) = head_frame_rotation_session();
+        let cfg = FitConfig {
+            model_override: Some(CorrectionModel::Affine),
+            ..FitConfig::default()
+        };
+        let outcome =
+            DotSessionFit::fit_with(&samples, &fixture_rig(), &cfg, ProfileMeta::default())
+                .unwrap();
+        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        assert_eq!(right.model, CorrectionModel::Affine);
     }
 
     #[test]
