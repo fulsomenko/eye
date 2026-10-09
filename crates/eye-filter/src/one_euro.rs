@@ -122,8 +122,11 @@ impl GazeFilter for OneEuroFilter {
         let cutoff_hz = self.cfg.min_cutoff + self.cfg.beta * speed_mm_s;
         let a = alpha(cutoff_hz, dt);
         let xf = a * x + (1.0 - a) * prev.x;
-        let cov_lp = prev.cov_lp + (point.cov_mm - prev.cov_lp) * a;
-        let cov = cov_lp * (a / (2.0 - a));
+        // The covariance uses the rest cutoff, not the speed-adapted one: the reported
+        // uncertainty would otherwise swell with every saccade or jitter and shrink when still.
+        let a_rest = alpha(self.cfg.min_cutoff, dt);
+        let cov_lp = prev.cov_lp + (point.cov_mm - prev.cov_lp) * a_rest;
+        let cov = cov_lp * (a_rest / (2.0 - a_rest));
         self.state = Some(State {
             t: point.timestamp,
             x: xf,
@@ -467,6 +470,21 @@ mod tests {
             "expected and naive should differ meaningfully: expected={expected}, naive={naive}"
         );
         approx::assert_abs_diff_eq!(out.cov_mm[(0, 0)], expected, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_covariance_does_not_change_with_speed() {
+        let mut still = filter(OneEuroConfig::default());
+        let mut moving = filter(OneEuroConfig::default());
+        let mut out_still = None;
+        let mut out_moving = None;
+        for k in 0..10u64 {
+            out_still = Some(still.apply(pt_cov(k * P30, 0.0, 0.0, 400.0)));
+            out_moving = Some(moving.apply(pt_cov(k * P30, 40.0 * k as f64, 0.0, 400.0)));
+        }
+        let (still, moving) = (out_still.unwrap(), out_moving.unwrap());
+        approx::assert_abs_diff_eq!(moving.cov_mm[(0, 0)], still.cov_mm[(0, 0)], epsilon = 1e-9);
+        assert!(moving.px_logical.x != still.px_logical.x, "positions must differ");
     }
 
     #[test]
