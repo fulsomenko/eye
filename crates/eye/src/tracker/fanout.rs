@@ -56,6 +56,23 @@ impl Shared {
     }
 }
 
+pub(crate) enum SendOutcome {
+    Sent,
+    Evicted,
+    Disconnected,
+}
+
+pub(crate) fn send_newest_wins<T>(tx: &Sender<T>, evict: &Receiver<T>, msg: T) -> SendOutcome {
+    let msg = match tx.try_send(msg) {
+        Ok(()) => return SendOutcome::Sent,
+        Err(TrySendError::Disconnected(_)) => return SendOutcome::Disconnected,
+        Err(TrySendError::Full(msg)) => msg,
+    };
+    let _ = evict.try_recv();
+    let _ = tx.try_send(msg);
+    SendOutcome::Evicted
+}
+
 #[derive(Debug)]
 pub(crate) struct OutputSender {
     pub(crate) tx: Sender<Output>,
@@ -64,12 +81,7 @@ pub(crate) struct OutputSender {
 
 impl OutputSender {
     pub(crate) fn send(&self, msg: Output) {
-        let msg = match self.tx.try_send(msg) {
-            Ok(()) | Err(TrySendError::Disconnected(_)) => return,
-            Err(TrySendError::Full(msg)) => msg,
-        };
-        let _ = self.evict.try_recv();
-        let _ = self.tx.try_send(msg);
+        send_newest_wins(&self.tx, &self.evict, msg);
     }
 }
 
@@ -79,8 +91,8 @@ pub(crate) struct PipelineThread {
     pub(crate) shared: Arc<Shared>,
     pub(crate) out: OutputSender,
     pub(crate) sinks: Vec<Box<dyn GazeSink>>,
-    pub(crate) new_subscribers: Receiver<Sender<GazePoint>>,
-    pub(crate) subscribers: Vec<Sender<GazePoint>>,
+    pub(crate) new_subscribers: Receiver<(Sender<GazePoint>, Receiver<GazePoint>, Arc<AtomicBool>)>,
+    pub(crate) subscribers: Vec<(Sender<GazePoint>, Receiver<GazePoint>, Arc<AtomicBool>)>,
 }
 
 impl PipelineThread {
@@ -177,7 +189,22 @@ impl PipelineThread {
         }
 
         let paired = Timestamp::now();
-        self.shared.with_stats(|s| s.counts.framesets += 1);
+        self.shared.with_stats(|s| {
+            s.counts.framesets += 1;
+            for f in set.frames() {
+                let h = f.header();
+                *s.counts
+                    .frames_received
+                    .entry(h.camera.clone())
+                    .or_default() += 1;
+                *s.counts
+                    .illumination
+                    .entry(h.camera.clone())
+                    .or_default()
+                    .entry(h.illumination.as_str())
+                    .or_default() += 1;
+            }
+        });
         let batch = match self.pipeline.rays(set)? {
             RayStep::Rays(batch) => batch,
             RayStep::NoGaze => {
@@ -206,27 +233,33 @@ impl PipelineThread {
         )
         .entered();
 
-        for tx in self.new_subscribers.try_iter().collect::<Vec<_>>() {
-            self.subscribers.push(tx);
+        for pair in self.new_subscribers.try_iter().collect::<Vec<_>>() {
+            self.subscribers.push(pair);
             tracing::debug!(subscribers = self.subscribers.len(), "subscriber added");
         }
 
         let mut subscriber_drops = 0u64;
         let mut remaining = self.subscribers.len() as u64;
-        self.subscribers
-            .retain_mut(|tx| match tx.try_send(point.clone()) {
-                Ok(()) => true,
-                Err(TrySendError::Full(_)) => {
+        self.subscribers.retain_mut(|(tx, rx, alive)| {
+            if !alive.load(Ordering::Acquire) {
+                remaining -= 1;
+                tracing::debug!(subscribers = remaining, "subscriber disconnected");
+                return false;
+            }
+            match send_newest_wins(tx, rx, point.clone()) {
+                SendOutcome::Sent => true,
+                SendOutcome::Evicted => {
                     subscriber_drops += 1;
                     tracing::debug!("point dropped for slow subscriber");
                     true
                 }
-                Err(TrySendError::Disconnected(_)) => {
+                SendOutcome::Disconnected => {
                     remaining -= 1;
                     tracing::debug!(subscribers = remaining, "subscriber disconnected");
                     false
                 }
-            });
+            }
+        });
 
         self.sinks.retain_mut(|sink| match sink.push(point) {
             Ok(()) => true,
@@ -248,6 +281,9 @@ impl PipelineThread {
             s.counts.subscribers = subscribers;
             s.capture_to_emit.record(capture_to_emit);
             s.processing.record(processing);
+            for sink in &self.sinks {
+                s.counts.sink_drops.insert(sink.name(), sink.dropped());
+            }
         });
         tracing::trace!(
             mm_x = point.mm.x,
@@ -376,7 +412,11 @@ mod tests {
     #[test]
     fn test_logs_sink_failed_at_warn() {
         let pushes = Arc::new(AtomicUsize::new(0));
-        let (mut thread, _rx) = thread(vec![Box::new(FakeSink { pushes, fail_on: 1 })]);
+        let (mut thread, _rx) = thread(vec![Box::new(FakeSink {
+            pushes,
+            fail_on: 1,
+            dropped: 0,
+        })]);
         let set = FrameSet::single(testkit::frame("ir", 0, 100, Illumination::IrLit));
         let (_, records) = eye_log::testing::capture_logs(tracing::Level::WARN, || {
             let _ = thread.process(&set);
@@ -396,8 +436,10 @@ mod tests {
     #[test]
     fn test_logs_point_dropped_for_slow_subscriber_at_debug() {
         let (mut thread, _rx) = thread(vec![]);
-        let (tx, _rx_sub) = crossbeam_channel::bounded(1);
-        thread.subscribers.push(tx);
+        let (tx, rx_sub) = crossbeam_channel::bounded(1);
+        thread
+            .subscribers
+            .push((tx, rx_sub, Arc::new(AtomicBool::new(true))));
         let point = testkit::point(0.0, 0.0, nalgebra::Matrix2::identity());
         let paired = Timestamp::now();
         let (_, records) = eye_log::testing::capture_logs(tracing::Level::DEBUG, || {
@@ -410,6 +452,67 @@ mod tests {
             .collect();
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].level, eye_log::Level::Debug);
+    }
+
+    #[test]
+    fn test_subscriber_full_evicts_oldest_and_counts() {
+        let (mut thread, _rx) = thread(vec![]);
+        let (tx, rx_sub) = crossbeam_channel::bounded(1);
+        thread
+            .subscribers
+            .push((tx, rx_sub.clone(), Arc::new(AtomicBool::new(true))));
+        let paired = Timestamp::now();
+        for nanos in [1, 2, 3] {
+            let point = testkit::point(0.0, 0.0, nalgebra::Matrix2::identity());
+            let mut point = point;
+            point.timestamp = Timestamp::from_nanos(nanos);
+            thread.fan_out(&point, paired);
+        }
+        let received = rx_sub.try_recv().expect("newest point retained");
+        assert_eq!(received.timestamp.as_nanos(), 3);
+        assert_eq!(thread.shared.snapshot().subscriber_drops, 2);
+    }
+
+    #[test]
+    fn test_sink_drops_reported_in_stats() {
+        let pushes = Arc::new(AtomicUsize::new(0));
+        let (mut thread, _rx) = thread(vec![Box::new(FakeSink {
+            pushes,
+            fail_on: 0,
+            dropped: 7,
+        })]);
+        let set = FrameSet::single(testkit::frame("ir", 0, 100, Illumination::IrLit));
+        thread.process(&set).expect("process succeeds");
+        let stats = thread.shared.snapshot();
+        assert_eq!(stats.sink_drops.get("fake"), Some(&7));
+    }
+
+    #[test]
+    fn test_stats_count_frames_and_illumination_per_camera() {
+        let (mut thread, _rx) = thread(vec![]);
+        let set = FrameSet::new(vec![
+            testkit::frame("ir", 1, 200, Illumination::IrLit),
+            testkit::frame_fmt("rgb", 0, 100, PixelFormat::Mjpeg, Illumination::Ambient),
+        ])
+        .expect("distinct cameras");
+        let _ = thread.process(&set);
+        let stats = thread.shared.snapshot();
+        assert_eq!(stats.frames_received.get(&CameraId::from("ir")), Some(&1));
+        assert_eq!(stats.frames_received.get(&CameraId::from("rgb")), Some(&1));
+        assert_eq!(
+            stats
+                .illumination
+                .get(&CameraId::from("ir"))
+                .and_then(|m| m.get("ir_lit")),
+            Some(&1)
+        );
+        assert_eq!(
+            stats
+                .illumination
+                .get(&CameraId::from("rgb"))
+                .and_then(|m| m.get("ambient")),
+            Some(&1)
+        );
     }
 
     #[test]

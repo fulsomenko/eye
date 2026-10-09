@@ -4,6 +4,7 @@ mod sources;
 mod stats;
 
 use std::fmt;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,10 +67,30 @@ impl fmt::Debug for TrackerOptions {
     }
 }
 
+#[derive(Debug)]
+pub struct Subscription {
+    rx: Receiver<GazePoint>,
+    alive: Arc<AtomicBool>,
+}
+
+impl Deref for Subscription {
+    type Target = Receiver<GazePoint>;
+
+    fn deref(&self) -> &Receiver<GazePoint> {
+        &self.rx
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+    }
+}
+
 pub struct Tracker {
     output: Option<Receiver<Output>>,
     failed: Receiver<()>,
-    new_subscribers: Sender<Sender<GazePoint>>,
+    new_subscribers: Sender<(Sender<GazePoint>, Receiver<GazePoint>, Arc<AtomicBool>)>,
     output_capacity: usize,
     shared: Arc<Shared>,
     captures: Vec<JoinHandle<()>>,
@@ -261,12 +282,16 @@ impl Tracker {
         outcome.unwrap_or_else(|| self.join_pipeline().err().unwrap_or(TrackerError::Stopped))
     }
 
-    /// Own `bounded(output_capacity)` channel; full drops the NEW point for this subscriber.
-    /// Disconnects when the pipeline thread ends (error, end of stream, shutdown).
-    pub fn subscribe(&self) -> Receiver<GazePoint> {
+    /// Own `bounded(output_capacity)` channel; full evicts the oldest point for this subscriber
+    /// (newest wins). Disconnects when the pipeline thread ends (error, end of stream, shutdown)
+    /// or when the `Subscription` is dropped.
+    pub fn subscribe(&self) -> Subscription {
         let (tx, rx) = crossbeam_channel::bounded(self.output_capacity);
-        let _ = self.new_subscribers.send(tx);
-        rx
+        let alive = Arc::new(AtomicBool::new(true));
+        let _ = self
+            .new_subscribers
+            .send((tx, rx.clone(), Arc::clone(&alive)));
+        Subscription { rx, alive }
     }
 
     pub fn stats(&self) -> TrackerStats {
@@ -300,6 +325,7 @@ impl Tracker {
                 stage_errors = stats.stage_errors,
                 frames_dropped = stats.frames_dropped.values().sum::<u64>(),
                 subscriber_drops = stats.subscriber_drops,
+                sink_drops = stats.sink_drops.values().sum::<u64>(),
                 "tracker stopped"
             );
         }
@@ -493,6 +519,7 @@ mod tests {
         let sink = FakeSink {
             pushes: pushes.clone(),
             fail_on: 1,
+            dropped: 0,
         };
         let mut t = start(
             script_source(frames),

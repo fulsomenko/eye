@@ -18,6 +18,11 @@ pub enum SinkError {
 pub trait GazeSink: Send {
     fn name(&self) -> &'static str;
     fn push(&mut self, point: &GazePoint) -> Result<(), SinkError>;
+    /// Points this sink has discarded because its consumer was behind, cumulative. A sink
+    /// whose `push` never discards keeps the default.
+    fn dropped(&self) -> u64 {
+        0
+    }
 }
 
 #[cfg(test)]

@@ -21,13 +21,21 @@ pub struct TrackerStats {
     pub stage_errors: u64,
     /// Frames evicted by the capture side's drop-oldest channel, per camera.
     pub frames_dropped: BTreeMap<CameraId, u64>,
+    /// Oldest points evicted from full subscriber channels (newest wins).
     pub subscriber_drops: u64,
     pub sinks: usize,
     pub subscribers: usize,
-    /// `Timestamp::now() - point.timestamp` at emit (frame capture to emit, live only).
+    /// `Timestamp::now() - point.timestamp` at emit: capture of the OLDEST frame whose ray
+    /// contributed, to emit (live only).
     pub capture_to_emit: LatencySummary,
     /// `Timestamp::now()` at emit minus the moment `Pipeline::pair` completed the set.
     pub processing: LatencySummary,
+    /// Frames delivered to the pipeline thread per camera (after capture-side eviction).
+    pub frames_received: BTreeMap<CameraId, u64>,
+    /// Per camera, how many received frames carried each `Illumination` (`Illumination::as_str` keys).
+    pub illumination: BTreeMap<CameraId, BTreeMap<&'static str, u64>>,
+    /// Points each sink reported as discarded (`GazeSink::dropped`), by sink name.
+    pub sink_drops: BTreeMap<&'static str, u64>,
 }
 
 #[derive(Debug, Default)]

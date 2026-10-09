@@ -313,6 +313,7 @@ pub(crate) fn script_source(frames: Vec<Result<Frame, CaptureError>>) -> ScriptS
 pub(crate) struct FakeSink {
     pub(crate) pushes: Arc<AtomicUsize>,
     pub(crate) fail_on: usize,
+    pub(crate) dropped: u64,
 }
 
 impl GazeSink for FakeSink {
@@ -327,5 +328,9 @@ impl GazeSink for FakeSink {
         } else {
             Ok(())
         }
+    }
+
+    fn dropped(&self) -> u64 {
+        self.dropped
     }
 }
