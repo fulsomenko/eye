@@ -65,6 +65,51 @@ impl Default for HideRules {
     }
 }
 
+/// How the point communicates certainty and how it reacts to small moves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PointStyle {
+    /// Colour the dot by confidence (green, white, red) instead of the scene colour.
+    pub certainty_colors: bool,
+    /// Draw the 95 % uncertainty ellipse around the dot.
+    pub show_ellipse: bool,
+    /// A new sample within this many standard deviations (its own covariance, Mahalanobis)
+    /// of the current target leaves the dot where it is; `0.0` follows every sample.
+    pub hold_sigmas: f64,
+}
+
+impl Default for PointStyle {
+    fn default() -> Self {
+        Self {
+            certainty_colors: true,
+            show_ellipse: false,
+            hold_sigmas: 1.5,
+        }
+    }
+}
+
+/// Confidence at or above which the dot is green, and below which it is red.
+pub const CERTAIN_CONFIDENCE: f64 = 0.3;
+pub const UNCERTAIN_CONFIDENCE: f64 = 0.1;
+
+fn certainty_rgb(confidence: f64) -> [u8; 3] {
+    if confidence >= CERTAIN_CONFIDENCE {
+        [60, 220, 90]
+    } else if confidence < UNCERTAIN_CONFIDENCE {
+        [235, 60, 60]
+    } else {
+        [240, 240, 240]
+    }
+}
+
+fn rgba_of(color: [u8; 3], alpha: f64) -> Rgba {
+    Rgba {
+        r: color[0],
+        g: color[1],
+        b: color[2],
+        a: alpha.round().clamp(0.0, 255.0) as u8,
+    }
+}
+
 /// `was_hidden` carries the hysteresis: inside the band between the grown and shrunk
 /// canvas, the previous state wins so a point hovering near the edge does not flicker.
 fn offscreen_hidden(
@@ -113,6 +158,7 @@ pub struct PointScene {
     drawn: Option<Eased>,
     last_step: Option<Instant>,
     hide: HideRules,
+    style: PointStyle,
     hidden_offscreen: bool,
     present: PresentStats,
     /// `timestamp.as_nanos()` of the latest sample whose first on-target commit has not
@@ -142,6 +188,7 @@ impl PointScene {
             drawn: None,
             last_step: None,
             hide: HideRules::default(),
+            style: PointStyle::default(),
             hidden_offscreen: false,
             present: PresentStats::default(),
             pending_mark: None,
@@ -154,19 +201,33 @@ impl PointScene {
         self
     }
 
+    pub fn with_style(mut self, style: PointStyle) -> Self {
+        self.style = style;
+        self
+    }
+
     pub fn with_present_stats(mut self, stats: PresentStats) -> Self {
         self.present = stats;
         self
     }
 
     fn rgba(&self, alpha: f64) -> Rgba {
-        let a = alpha.round().clamp(0.0, 255.0) as u8;
-        Rgba {
-            r: self.color[0],
-            g: self.color[1],
-            b: self.color[2],
-            a,
+        rgba_of(self.color, alpha)
+    }
+
+    fn held(&self, msg: &GazePoint) -> bool {
+        let Some(current) = self.target else {
+            return false;
+        };
+        if self.style.hold_sigmas <= 0.0 {
+            return false;
         }
+        let cov_px = cov_mm_to_logical_px(&msg.cov_mm, &self.px_per_mm);
+        let Some(inv) = cov_px.try_inverse() else {
+            return false;
+        };
+        let d = msg.px_logical - current.center;
+        (d.transpose() * inv * d)[(0, 0)].sqrt() < self.style.hold_sigmas
     }
 
     fn target_for(&self, p: &GazePoint) -> Eased {
@@ -231,10 +292,16 @@ impl Scene for PointScene {
     type Msg = GazePoint;
 
     fn on_msg(&mut self, msg: GazePoint, now: Instant) {
-        let target = self.target_for(&msg);
+        let mut target = self.target_for(&msg);
         let stale = self.latest.as_ref().is_some_and(|(_, received)| {
             now.saturating_duration_since(*received) > self.easing.reset_after
         });
+        if !stale
+            && self.held(&msg)
+            && let Some(current) = self.target
+        {
+            target.center = current.center;
+        }
         if self.drawn.is_none() || stale || self.easing.disabled() {
             self.drawn = Some(target);
         } else if self.drawn == self.target {
@@ -308,7 +375,7 @@ impl Scene for PointScene {
             self.mark_ready = self.pending_mark.take();
         }
         let max_axis = f64::from(w).hypot(f64::from(h));
-        if let Some(ellipse) = drawn.ellipse {
+        if let Some(ellipse) = drawn.ellipse.filter(|_| self.style.show_ellipse) {
             let axes = (
                 ellipse.axes.0.clamp(0.5, max_axis),
                 ellipse.axes.1.clamp(0.5, max_axis),
@@ -317,7 +384,12 @@ impl Scene for PointScene {
             canvas.stroke_ellipse(drawn.center, axes, ellipse.angle, 2.0, self.rgba(160.0 * f));
         }
         let conf = p.confidence.clamp(0.0, 1.0);
-        canvas.fill_circle(drawn.center, 6.0, self.rgba(230.0 * f * (0.4 + 0.6 * conf)));
+        let dot = if self.style.certainty_colors {
+            rgba_of(certainty_rgb(conf), 230.0 * f)
+        } else {
+            self.rgba(230.0 * f * (0.4 + 0.6 * conf))
+        };
+        canvas.fill_circle(drawn.center, 6.0, dot);
         tracing::trace!(
             x = drawn.center.x,
             y = drawn.center.y,
@@ -385,6 +457,77 @@ mod tests {
         )
     }
 
+    const LEGACY: PointStyle = PointStyle {
+        certainty_colors: false,
+        show_ellipse: true,
+        hold_sigmas: 0.0,
+    };
+
+    fn point_px(now: Instant, x: f64, y: f64, cov: f64, confidence: f64) -> (GazePoint, Instant) {
+        let (mut p, t) = point_at(now, Matrix2::identity() * cov, confidence);
+        p.px_logical = Point2::new(x, y);
+        (p, t)
+    }
+
+    #[test]
+    fn test_small_move_within_hold_keeps_dot() {
+        let now = Instant::now();
+        let mut scene = PointScene::with_easing(
+            Vector2::new(1.0, 1.0),
+            [255, 64, 64],
+            Easing::from_millis(0),
+        );
+        let (a, t) = point_px(now, 100.0, 100.0, 100.0, 0.5);
+        scene.on_msg(a, t);
+        let (b, t) = point_px(now, 112.0, 100.0, 100.0, 0.5);
+        scene.on_msg(b, t);
+        scene.step(t);
+        assert_eq!(scene.drawn.unwrap().center, Point2::new(100.0, 100.0));
+    }
+
+    #[test]
+    fn test_move_beyond_hold_follows() {
+        let now = Instant::now();
+        let mut scene = PointScene::with_easing(
+            Vector2::new(1.0, 1.0),
+            [255, 64, 64],
+            Easing::from_millis(0),
+        );
+        let (a, t) = point_px(now, 100.0, 100.0, 100.0, 0.5);
+        scene.on_msg(a, t);
+        let (b, t) = point_px(now, 130.0, 100.0, 100.0, 0.5);
+        scene.on_msg(b, t);
+        scene.step(t);
+        assert_eq!(scene.drawn.unwrap().center, Point2::new(130.0, 100.0));
+    }
+
+    #[test]
+    fn test_dot_colour_follows_confidence() {
+        for (confidence, rgb) in [
+            (0.5, [60u8, 220, 90]),
+            (0.2, [240, 240, 240]),
+            (0.05, [235, 60, 60]),
+        ] {
+            let mut buf = vec![0u8; 200 * 200 * 4];
+            let mut canvas = new_canvas(&mut buf);
+            let now = Instant::now();
+            let mut scene =
+                PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]).with_hide_rules(HideRules {
+                    margin_px: 24.0,
+                    min_confidence: 0.0,
+                });
+            let (p, received) = point_at(now, Matrix2::new(100.0, 0.0, 0.0, 25.0), confidence);
+            scene.on_msg(p, received);
+            scene.render(&mut canvas, received);
+            let px = bgra(&buf, 200, 100, 100);
+            let alpha = f64::from(px[3]) / 255.0;
+            for (channel, want) in [(px[2], rgb[0]), (px[1], rgb[1]), (px[0], rgb[2])] {
+                assert_abs_diff_eq!(f64::from(channel), f64::from(want) * alpha, epsilon = 3.0);
+            }
+            assert_alpha(&buf, 122, 100, 0.0, 0.5);
+        }
+    }
+
     fn new_canvas(buf: &mut [u8]) -> Canvas<'_> {
         Canvas::new(buf, (200, 200), 1).expect("size")
     }
@@ -399,7 +542,7 @@ mod tests {
         let mut buf = vec![0u8; 200 * 200 * 4];
         let mut canvas = new_canvas(&mut buf);
         let now = Instant::now();
-        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
+        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]).with_style(LEGACY);
         let (p, received) = point_at(now, Matrix2::new(100.0, 0.0, 0.0, 25.0), 1.0);
         scene.on_msg(p, received);
         scene.render(&mut canvas, received);
@@ -442,7 +585,7 @@ mod tests {
     fn test_point_scene_fades_then_hides() {
         let mut buf = vec![0u8; 200 * 200 * 4];
         let now = Instant::now();
-        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
+        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]).with_style(LEGACY);
         let (p, received) = point_at(now, Matrix2::new(100.0, 0.0, 0.0, 25.0), 1.0);
         scene.on_msg(p, received);
 
@@ -469,7 +612,7 @@ mod tests {
         let mut buf = vec![0u8; 200 * 200 * 4];
         let mut canvas = new_canvas(&mut buf);
         let now = Instant::now();
-        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
+        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]).with_style(LEGACY);
         let (p, received) = point_at(now, Matrix2::new(100.0, 0.0, 0.0, 25.0), 0.25);
         scene.on_msg(p, received);
         scene.render(&mut canvas, received);
@@ -752,7 +895,7 @@ mod tests {
         let mut buf = vec![0u8; 200 * 200 * 4];
         let mut canvas = new_canvas(&mut buf);
         let now = Instant::now();
-        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
+        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]).with_style(LEGACY);
         let (p, received) = point_at_xy(
             now,
             Point2::new(5.0, 100.0),

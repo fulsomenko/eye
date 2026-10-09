@@ -484,7 +484,10 @@ mod tests {
         }
         let (still, moving) = (out_still.unwrap(), out_moving.unwrap());
         approx::assert_abs_diff_eq!(moving.cov_mm[(0, 0)], still.cov_mm[(0, 0)], epsilon = 1e-9);
-        assert!(moving.px_logical.x != still.px_logical.x, "positions must differ");
+        assert!(
+            (moving.px_logical.x - still.px_logical.x).abs() > 1.0,
+            "positions must differ"
+        );
     }
 
     #[test]

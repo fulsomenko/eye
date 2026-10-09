@@ -10,7 +10,6 @@ use eye_core::{OutputId, Timestamp};
 use nalgebra::{Matrix2, Point2};
 
 use crate::canvas::{Canvas, Rgba};
-use crate::ellipse::{K95, confidence_ellipse};
 use crate::error::OverlayError;
 use crate::handle::OverlayHandle;
 use crate::scene::{PresentedAt, Scene, Schedule};
@@ -532,7 +531,6 @@ const FEEDBACK_CALIBRATED: Rgba = Rgba {
     a: 255,
 };
 const FEEDBACK_RADIUS: f64 = 6.0;
-const FEEDBACK_ELLIPSE_WIDTH: f64 = 1.0;
 
 fn animation_len(dwell: Duration) -> Duration {
     Duration::from_millis(500).min(dwell / 2)
@@ -595,17 +593,6 @@ fn draw_feedback(c: &mut Canvas<'_>, fb: &Feedback) {
     } else {
         FEEDBACK_UNCALIBRATED
     };
-    let (w, h) = c.logical_size();
-    let max_axis = f64::from(w).hypot(f64::from(h));
-    if let Some(e) = confidence_ellipse(fb.px_logical, &fb.cov_px, K95, max_axis) {
-        c.stroke_ellipse(
-            e.center,
-            e.semi_axes,
-            e.angle,
-            FEEDBACK_ELLIPSE_WIDTH,
-            color,
-        );
-    }
     c.fill_circle(fb.px_logical, FEEDBACK_RADIUS, color);
 }
 
