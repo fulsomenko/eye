@@ -568,11 +568,12 @@ mod tests {
                 timestamp: Timestamp::from_nanos(0),
                 rays: vec![GazeRay {
                     side: None,
+                    timestamp: Timestamp::from_nanos(0),
                     origin: nalgebra::Point3::new(155.0, 85.0, -500.0),
                     direction: -nalgebra::Vector3::z_axis(),
                     angular_cov: Matrix2::identity() * 1e-6,
                     origin_cov: nalgebra::Matrix3::zeros(),
-                    head_rotation: nalgebra::UnitQuaternion::identity(),
+                    head_rotation: None,
                 }],
             };
             pipeline.finish(&batch)
@@ -681,11 +682,12 @@ mod tests {
             timestamp: Timestamp::from_nanos(0),
             rays: vec![GazeRay {
                 side: None,
+                timestamp: Timestamp::from_nanos(0),
                 origin: nalgebra::Point3::new(155.0, 85.0, -500.0),
                 direction: -nalgebra::Vector3::z_axis(),
                 angular_cov: Matrix2::identity() * 1e-6,
                 origin_cov: nalgebra::Matrix3::zeros(),
-                head_rotation: nalgebra::UnitQuaternion::identity(),
+                head_rotation: None,
             }],
         };
         assert!(pipeline.finish(&batch).is_none());
@@ -698,11 +700,12 @@ mod tests {
             timestamp: Timestamp::from_nanos(0),
             rays: vec![GazeRay {
                 side: None,
+                timestamp: Timestamp::from_nanos(0),
                 origin: nalgebra::Point3::new(155.0, 85.0, 500.0),
                 direction: nalgebra::Vector3::z_axis(),
                 angular_cov: Matrix2::identity() * 1e-6,
                 origin_cov: nalgebra::Matrix3::zeros(),
-                head_rotation: nalgebra::UnitQuaternion::identity(),
+                head_rotation: None,
             }],
         };
         assert!(pipeline.finish(&batch).is_none());

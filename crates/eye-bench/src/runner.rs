@@ -579,7 +579,7 @@ mod tests {
     use eye_core::log::field;
     use eye_core::{GazeRay, OutputId};
     use eye_log::testing::capture_logs;
-    use nalgebra::{Matrix2, Matrix3, Point2, Unit, UnitQuaternion};
+    use nalgebra::{Matrix2, Matrix3, Point2, Unit};
 
     use super::*;
     use crate::metrics;
@@ -651,19 +651,21 @@ mod tests {
             rays: vec![
                 GazeRay {
                     side: None,
+                    timestamp: Timestamp::from_nanos(500_000_000),
                     origin: Point3::new(120.0, 85.0, -500.0),
                     direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
                     origin_cov: Matrix3::zeros(),
                     angular_cov: Matrix2::identity() * 1e-6,
-                    head_rotation: UnitQuaternion::identity(),
+                    head_rotation: None,
                 },
                 GazeRay {
                     side: None,
+                    timestamp: Timestamp::from_nanos(500_000_000),
                     origin: Point3::new(190.0, 85.0, -500.0),
                     direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
                     origin_cov: Matrix3::zeros(),
                     angular_cov: Matrix2::identity() * 1e-6,
-                    head_rotation: UnitQuaternion::identity(),
+                    head_rotation: None,
                 },
             ],
         };

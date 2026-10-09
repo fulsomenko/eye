@@ -12,7 +12,7 @@ use eye_core::{
     Illumination, Observations, OutputId, PixelFormat, Rig, ScreenModel, SinkError, Timestamp,
     stage::{Detector, GazeCorrection, GazeEstimator, GazeFilter, StageError},
 };
-use nalgebra::{Matrix2, Matrix3, Point2, Rotation3, UnitQuaternion, Vector2, Vector3};
+use nalgebra::{Matrix2, Matrix3, Point2, Rotation3, Vector2, Vector3};
 
 use crate::registry::Registry;
 
@@ -185,14 +185,17 @@ impl GazeEstimator for FakeEstimator {
         "fake"
     }
 
-    fn estimate(&mut self, _obs: &[Observations], _rig: &Rig) -> Result<Vec<GazeRay>, StageError> {
+    fn estimate(&mut self, obs: &[Observations], _rig: &Rig) -> Result<Vec<GazeRay>, StageError> {
         Ok(vec![GazeRay {
             side: None,
+            timestamp: obs
+                .first()
+                .map_or(Timestamp::from_nanos(0), |o| o.timestamp),
             origin: nalgebra::Point3::new(155.0, 85.0, -500.0),
             direction: Vector3::z_axis(),
             angular_cov: Matrix2::identity() * 1e-6,
             origin_cov: Matrix3::zeros(),
-            head_rotation: UnitQuaternion::identity(),
+            head_rotation: None,
         }])
     }
 }

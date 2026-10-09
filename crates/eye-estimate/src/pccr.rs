@@ -102,7 +102,7 @@ impl PccrEstimator {
             ];
             let cov =
                 Matrix6::from_diagonal(&Vector6::from_iterator(sigmas.into_iter().map(|s| s * s)));
-            match self.ray(side, cam, &z, &cov) {
+            match self.ray(side, cam, &z, &cov, pair.timestamp) {
                 Some(ray) => {
                     trace_ray(Self::NAME, &ray);
                     rays.push(ray);
@@ -184,6 +184,7 @@ impl PccrEstimator {
         cam: &eye_core::CameraModel,
         z: &Vector6<f64>,
         cov: &Matrix6<f64>,
+        at: eye_core::Timestamp,
     ) -> Option<GazeRay> {
         let (angles, angular_cov) = propagate_fn::<2, 6>(
             |z| {
@@ -197,11 +198,12 @@ impl PccrEstimator {
             propagate_fn::<3, 6>(|z| self.solve(side, cam, z).map(|(o, _)| o.coords), z, cov)?;
         Some(GazeRay {
             side: Some(side),
+            timestamp: at,
             origin: Point3::from(origin),
             direction: eye_geometry::angles::direction_from_yaw_pitch(&angles),
             angular_cov,
             origin_cov,
-            head_rotation: UnitQuaternion::identity(),
+            head_rotation: None,
         })
     }
 }
@@ -519,7 +521,13 @@ mod tests {
         let cov =
             Matrix6::from_diagonal(&Vector6::from_iterator(sigmas.into_iter().map(|s| s * s)));
         let predicted = estimator
-            .ray(Side::Right, cam, &base_z, &cov)
+            .ray(
+                Side::Right,
+                cam,
+                &base_z,
+                &cov,
+                eye_core::Timestamp::from_nanos(0),
+            )
             .expect("ray computed")
             .angular_cov;
 
@@ -736,5 +744,24 @@ mod tests {
             .expect("no_glint logged for right eye");
         assert!(matches!(rec2.fields["nearest_px"], Value::F64(v) if v > 3.0));
         assert_eq!(rec2.fields["max_glint_offset_px"], Value::F64(3.0));
+    }
+
+    #[test]
+    fn test_pccr_rays_have_pair_timestamp_and_no_pose() {
+        let rig = test_rig();
+        let target = Point2::new(155.0, 85.0);
+        let mut obs = synthetic_pccr_observation(&rig, target, Vector3::zeros(), 0.0, 0.0, 1);
+        obs.timestamp = eye_core::Timestamp::from_nanos(68_000_000);
+        let mut estimator = PccrEstimator::new(PccrOptions::default());
+
+        let rays = estimator
+            .estimate_rays(&[obs.clone()], &rig)
+            .expect("estimate succeeds");
+
+        assert_eq!(rays.len(), 2);
+        for ray in &rays {
+            assert_eq!(ray.timestamp, obs.timestamp);
+            assert_eq!(ray.head_rotation, None);
+        }
     }
 }

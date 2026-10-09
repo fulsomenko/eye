@@ -215,7 +215,7 @@ mod tests {
     use eye_core::log::field;
     use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
     use eye_log::testing::capture_logs;
-    use nalgebra::{Point2, Point3, Unit, UnitQuaternion, Vector2};
+    use nalgebra::{Point2, Point3, Unit, Vector2};
 
     use super::*;
     use crate::row::RowOutcome;
@@ -309,11 +309,12 @@ mod tests {
         };
         let ray = eye_core::GazeRay {
             side: None,
+            timestamp: eye_core::Timestamp::from_nanos(500_000_000),
             origin: eye(),
             direction: Unit::new_normalize(nalgebra::Vector3::new(0.0, 0.0, 1.0)),
             origin_cov: nalgebra::Matrix3::zeros(),
             angular_cov: nalgebra::Matrix2::identity() * 1e-6,
-            head_rotation: UnitQuaternion::identity(),
+            head_rotation: None,
         };
         let batch = RayBatch {
             timestamp: eye_core::Timestamp::from_nanos(500_000_000),

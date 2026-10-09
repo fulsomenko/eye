@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, HashMap};
 use eye_core::log::field;
 use eye_core::{GazeRay, Rig};
 use eye_geometry::angles::yaw_pitch_from_direction;
-use nalgebra::{Cholesky, Matrix2, Point2, Point3, SMatrix, SVector, Unit, Vector2};
+use nalgebra::{
+    Cholesky, Matrix2, Point2, Point3, SMatrix, SVector, Unit, UnitQuaternion, Vector2,
+};
 
 use crate::correction::{
     AngularCorrection, CorrectionModel, EyeKey, UserProfile, design, design_quad, design12,
@@ -234,13 +236,13 @@ impl DotSessionFit {
                 for s in group.iter() {
                     let desired_dir = Unit::new_normalize(target_point - s.ray.origin);
                     let (o, d) = if use_head_frame {
+                        let inv = s
+                            .ray
+                            .head_rotation
+                            .map_or_else(UnitQuaternion::identity, |r| r.inverse());
                         (
-                            yaw_pitch_from_direction(
-                                &(s.ray.head_rotation.inverse() * s.ray.direction),
-                            ),
-                            yaw_pitch_from_direction(
-                                &(s.ray.head_rotation.inverse() * desired_dir),
-                            ),
+                            yaw_pitch_from_direction(&(inv * s.ray.direction)),
+                            yaw_pitch_from_direction(&(inv * desired_dir)),
                         )
                     } else {
                         (
@@ -920,11 +922,12 @@ mod tests {
                 let direction = direction_from_yaw_pitch(&Vector2::new(obs_yaw, obs_pitch));
                 let ray = GazeRay {
                     side: cfg.side,
+                    timestamp: eye_core::Timestamp::from_nanos(0),
                     origin,
                     direction,
                     angular_cov: Matrix2::identity() * 1.0_f64.to_radians().powi(2),
                     origin_cov: Matrix3::identity(),
-                    head_rotation: UnitQuaternion::identity(),
+                    head_rotation: None,
                 };
                 out.push(FitSample { ray, target_mm });
                 n += 1;
@@ -1426,11 +1429,12 @@ mod tests {
                 let direction = direction_from_yaw_pitch(&Vector2::new(obs_yaw, obs_pitch));
                 let ray = GazeRay {
                     side: Some(Side::Right),
+                    timestamp: eye_core::Timestamp::from_nanos(0),
                     origin,
                     direction,
                     angular_cov: Matrix2::identity() * 1.0_f64.to_radians().powi(2),
                     origin_cov: Matrix3::identity(),
-                    head_rotation: UnitQuaternion::identity(),
+                    head_rotation: None,
                 };
                 out.push(FitSample { ray, target_mm });
             }
@@ -1557,11 +1561,12 @@ mod tests {
                 let direction = rot * direction_from_yaw_pitch(&observed_head);
                 let ray = GazeRay {
                     side: Some(Side::Right),
+                    timestamp: eye_core::Timestamp::from_nanos(0),
                     origin,
                     direction,
                     angular_cov: Matrix2::identity() * 1.0_f64.to_radians().powi(2),
                     origin_cov: Matrix3::identity(),
-                    head_rotation: rot,
+                    head_rotation: Some(rot),
                 };
                 samples.push(FitSample { ray, target_mm });
             }
@@ -1590,11 +1595,12 @@ mod tests {
         let observed_head = head_angles + design(&head_angles) * th;
         let probe_ray = GazeRay {
             side: Some(Side::Right),
+            timestamp: eye_core::Timestamp::from_nanos(0),
             origin,
             direction: probe_rot * direction_from_yaw_pitch(&observed_head),
             angular_cov: Matrix2::identity() * 1.0_f64.to_radians().powi(2),
             origin_cov: Matrix3::identity(),
-            head_rotation: probe_rot,
+            head_rotation: Some(probe_rot),
         };
         let corrected = profile.correct(&probe_ray);
         let corrected_angles = yaw_pitch_from_direction(&corrected.direction);

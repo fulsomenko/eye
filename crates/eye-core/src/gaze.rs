@@ -13,6 +13,9 @@ string_id!(
 pub struct GazeRay {
     /// `None` for a cyclopean or fused ray.
     pub side: Option<Side>,
+    /// The instant this ray describes: the observed frame's time, or the alignment time for a
+    /// ray built from observations of more than one frame.
+    pub timestamp: Timestamp,
     /// Eye centre.
     pub origin: Point3<f64>,
     pub direction: Unit<Vector3<f64>>,
@@ -21,9 +24,9 @@ pub struct GazeRay {
     pub angular_cov: Matrix2<f64>,
     /// Covariance of `origin`, mm².
     pub origin_cov: Matrix3<f64>,
-    /// Screen-frame orientation of the head at this ray's frame, from PnP head pose. Identity
-    /// where the estimator has no head pose (e.g. ir-pupil).
-    pub head_rotation: UnitQuaternion<f64>,
+    /// Screen-frame head orientation from a measured PnP pose (or one lent inside the same
+    /// fused batch). `None` when no pose was measured for this ray.
+    pub head_rotation: Option<UnitQuaternion<f64>>,
 }
 
 impl GazeRay {
@@ -111,11 +114,12 @@ mod tests {
     fn valid_ray() -> GazeRay {
         GazeRay {
             side: None,
+            timestamp: Timestamp::from_nanos(0),
             origin: eye_fixture(),
             direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
             angular_cov: Matrix2::identity() * 1e-4,
             origin_cov: Matrix3::zeros(),
-            head_rotation: UnitQuaternion::identity(),
+            head_rotation: None,
         }
     }
 

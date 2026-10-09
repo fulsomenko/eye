@@ -357,7 +357,15 @@ impl FusedEstimator {
                     error = %e,
                     "stereo failed"
                 ),
-                Ok(t) => match stereo_ray(side, &t, eye, &params, &frame.viewer, rgb_cam) {
+                Ok(t) => match stereo_ray(
+                    side,
+                    &t,
+                    eye,
+                    &params,
+                    &frame.viewer,
+                    rgb_cam,
+                    frame.timestamp,
+                ) {
                     Some(ray) => return Ok(Some((ray, FusedSource::Stereo))),
                     None => tracing::debug!(
                         { field::REASON } = "stereo_no_root",
@@ -370,7 +378,15 @@ impl FusedEstimator {
             }
         }
 
-        let ray = gaze_ray(side, &eye.centre, ir_cam, &pupil_px, &params, &frame.viewer)?;
+        let ray = gaze_ray(
+            side,
+            &eye.centre,
+            ir_cam,
+            &pupil_px,
+            &params,
+            Some(&frame.viewer),
+            frame.timestamp,
+        )?;
         Ok(Some((ray, FusedSource::IrOnRgbEyeball)))
     }
 
@@ -431,6 +447,7 @@ fn stereo_ray(
     params: &EyeParams,
     viewer: &UnitQuaternion<f64>,
     rgb_cam: &CameraModel,
+    at: Timestamp,
 ) -> Option<GazeRay> {
     let r_p = params.rotation_to_pupil_mm;
     let o_rgb = Point3::from(rgb_cam.screen_from_camera.translation.vector);
@@ -464,11 +481,12 @@ fn stereo_ray(
     let (origin, origin_cov) = propagate_fn::<3, 6>(|z| solve(z).map(|(o, _)| o.coords), &z, &cov)?;
     Some(GazeRay {
         side: Some(side),
+        timestamp: at,
         origin: Point3::from(origin),
         direction: direction_from_yaw_pitch(&angles),
         angular_cov,
         origin_cov,
-        head_rotation: *viewer,
+        head_rotation: Some(*viewer),
     })
 }
 
@@ -503,6 +521,7 @@ pub fn fuse_inverse_covariance(a: &GazeRay, b: &GazeRay) -> Option<GazeRay> {
     let origin = origin_cov * (oa * a.origin.coords + ob * b.origin.coords);
     Some(GazeRay {
         side: a.side,
+        timestamp: a.timestamp,
         origin: Point3::from(origin),
         direction: direction_from_yaw_pitch(&theta),
         angular_cov,
@@ -633,11 +652,12 @@ mod tests {
             direction_from_yaw_pitch(&Vector2::new(yaw_deg.to_radians(), pitch_deg.to_radians()));
         GazeRay {
             side: Some(Side::Right),
+            timestamp: Timestamp::from_nanos(0),
             origin: Point3::new(155.0, 40.0, -500.0),
             direction,
             angular_cov: cov,
             origin_cov: Matrix3::zeros(),
-            head_rotation: UnitQuaternion::identity(),
+            head_rotation: None,
         }
     }
 
@@ -1073,6 +1093,58 @@ mod tests {
                 .iter()
                 .any(|(_, src, _)| *src == FusedSource::Stereo)
         );
+    }
+
+    #[test]
+    fn test_cross_chain_rays_carry_rgb_time() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+
+        let with_pupil_sigma = |mut obs: Observations| -> Observations {
+            for eye in obs.face.as_mut().expect("face present").eyes.iter_mut() {
+                eye.pupil = eye
+                    .pupil
+                    .map(|m| Measured::new(m.into_value(), 0.2).expect("valid sigma"));
+            }
+            obs
+        };
+
+        let mut ir0 = with_pupil_sigma(synthetic_ir_observation_at(&rig, centres, target, 0.0, 1));
+        ir0.timestamp = Timestamp::from_nanos(0);
+        let mut ir136 =
+            with_pupil_sigma(synthetic_ir_observation_at(&rig, centres, target, 0.0, 2));
+        ir136.timestamp = Timestamp::from_nanos(136_000_000);
+        let mut rgb68 =
+            synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.0, 1);
+        for eye in rgb68.face.as_mut().expect("face present").eyes.iter_mut() {
+            eye.iris = eye
+                .iris
+                .map(|m| Measured::new(m.into_value(), 1.0).expect("valid sigma"));
+        }
+        rgb68.timestamp = Timestamp::from_nanos(68_000_000);
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        estimator.candidates(&[ir0], &rig).expect("call 1 succeeds");
+        let candidates2 = estimator
+            .candidates(&[ir136, rgb68], &rig)
+            .expect("call 2 succeeds");
+
+        for (_, source, ray) in &candidates2 {
+            match source {
+                FusedSource::Stereo | FusedSource::InverseCovariance | FusedSource::RgbOnly => {
+                    assert_eq!(ray.timestamp, Timestamp::from_nanos(68_000_000));
+                    assert!(ray.head_rotation.is_some());
+                }
+                FusedSource::IrOnly => {
+                    assert_eq!(ray.timestamp, Timestamp::from_nanos(68_000_000));
+                    assert_eq!(ray.head_rotation, None);
+                }
+                FusedSource::IrOnRgbEyeball => {}
+            }
+        }
     }
 
     #[test]

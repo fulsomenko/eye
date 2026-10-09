@@ -282,16 +282,19 @@ impl GazeEstimator for FixedRayEstimator {
         "test-fixed-ray"
     }
 
-    fn estimate(&mut self, _obs: &[Observations], _rig: &Rig) -> Result<Vec<GazeRay>, StageError> {
+    fn estimate(&mut self, obs: &[Observations], _rig: &Rig) -> Result<Vec<GazeRay>, StageError> {
         let direction =
             Unit::new_normalize(Point3::new(self.toward.x, self.toward.y, 0.0) - self.origin);
         Ok(vec![GazeRay {
             side: None,
+            timestamp: obs
+                .first()
+                .map_or(Timestamp::from_nanos(0), |o| o.timestamp),
             origin: self.origin,
             direction,
             origin_cov: Matrix3::zeros(),
             angular_cov: Matrix2::identity() * 1e-6,
-            head_rotation: UnitQuaternion::identity(),
+            head_rotation: None,
         }])
     }
 }
@@ -422,11 +425,14 @@ impl GazeEstimator for KappaRayEstimator {
         );
         Ok(vec![GazeRay {
             side: None,
+            timestamp: obs
+                .first()
+                .map_or(Timestamp::from_nanos(0), |o| o.timestamp),
             origin: self.eye,
             direction,
             origin_cov: Matrix3::zeros(),
             angular_cov: Matrix2::identity() * 1e-6,
-            head_rotation: UnitQuaternion::identity(),
+            head_rotation: None,
         }])
     }
 }

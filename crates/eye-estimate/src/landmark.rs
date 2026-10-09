@@ -128,7 +128,7 @@ impl LandmarkEstimator {
         );
         let eyes: Vec<LandmarkEye> = [Side::Right, Side::Left]
             .into_iter()
-            .filter_map(|side| self.eye(side, face, &pose, cam, &viewer))
+            .filter_map(|side| self.eye(side, face, &pose, cam, &viewer, obs.timestamp))
             .collect();
         for eye in &eyes {
             trace_ray(Self::NAME, &eye.ray);
@@ -194,6 +194,7 @@ impl LandmarkEstimator {
         pose: &Pose,
         cam: &CameraModel,
         viewer: &UnitQuaternion<f64>,
+        at: Timestamp,
     ) -> Option<LandmarkEye> {
         let (inner_idx, outer_idx) = match side {
             Side::Right => (133usize, 33usize),
@@ -282,7 +283,7 @@ impl LandmarkEstimator {
                 ..self.params
             }
         };
-        let ray = gaze_ray(side, &centre, cam, &iris_px, &params, viewer)
+        let ray = gaze_ray(side, &centre, cam, &iris_px, &params, Some(viewer), at)
             .inspect_err(|e| {
                 tracing::debug!(
                     { field::REASON } = "gaze_ray_failed",
@@ -1022,5 +1023,33 @@ mod tests {
             })
             .expect("no_iris logged");
         assert_eq!(rec2.fields["side"], Value::Str("right".into()));
+    }
+
+    #[test]
+    fn test_landmark_ray_timestamp_is_observation_timestamp() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let mut obs = synthetic_rgb_observation(
+            &rig,
+            &screen_from_head,
+            1.0,
+            Point2::new(155.0, 85.0),
+            0.0,
+            0.0,
+            1,
+        );
+        obs.timestamp = Timestamp::from_nanos(68_000_000);
+        let mut estimator = LandmarkEstimator::new(LandmarkOptions::default());
+
+        let frame = estimator
+            .estimate_frame(&obs, &rig)
+            .expect("estimate succeeds")
+            .expect("frame is recovered");
+
+        assert!(!frame.eyes.is_empty());
+        for eye in &frame.eyes {
+            assert_eq!(eye.ray.timestamp, obs.timestamp);
+            assert_eq!(eye.ray.head_rotation, Some(frame.viewer));
+        }
     }
 }

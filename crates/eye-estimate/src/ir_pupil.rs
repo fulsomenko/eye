@@ -4,7 +4,7 @@ use eye_core::{CameraModel, GazeRay, Measured, Observations, Rig, ScreenModel, S
 use eye_geometry::camera::pixel_ray;
 use eye_geometry::eyeball::{EyeCentre, EyeParams, Kappa, gaze_ray, optical_axis, ray_sphere_near};
 use eye_geometry::screen::intersect_plane;
-use nalgebra::{Matrix3, Point2, Point3, Unit, UnitQuaternion, Vector3};
+use nalgebra::{Matrix3, Point2, Point3, Unit, Vector3};
 use serde::Deserialize;
 
 use crate::EstimateError;
@@ -201,7 +201,6 @@ impl IrPupilEstimator {
         };
         let a = self.options.anchor_sigma_mm;
         let cov = Matrix3::from_diagonal(&Vector3::new(a * a, a * a, 9.0 * a * a));
-        let viewer = UnitQuaternion::identity();
         let ray_for = |side: Side, position: Point3<f64>, px: &Measured<Point2<f64>>| {
             gaze_ray(
                 side,
@@ -209,7 +208,8 @@ impl IrPupilEstimator {
                 cam,
                 px,
                 &params,
-                &viewer,
+                None,
+                pair.timestamp,
             )
             .inspect_err(|e| {
                 tracing::debug!(
@@ -857,5 +857,24 @@ mod tests {
             Value::Str("off_screen".into())
         );
         assert!(matches!(rec_offscreen.fields["hit_x_mm"], Value::F64(_)));
+    }
+
+    #[test]
+    fn test_ir_pupil_rays_have_pair_timestamp_and_no_pose() {
+        let rig = test_rig();
+        let mut obs =
+            synthetic_ir_observation(&rig, Point2::new(155.0, 85.0), Vector3::zeros(), 0.0, 1);
+        obs.timestamp = eye_core::Timestamp::from_nanos(68_000_000);
+        let mut estimator = IrPupilEstimator::new(IrPupilOptions::default());
+
+        let rays = estimator
+            .estimate_rays(std::slice::from_ref(&obs), &rig)
+            .expect("estimate succeeds");
+
+        assert_eq!(rays.len(), 2);
+        for ray in &rays {
+            assert_eq!(ray.timestamp, obs.timestamp);
+            assert_eq!(ray.head_rotation, None);
+        }
     }
 }

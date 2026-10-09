@@ -106,7 +106,7 @@ mod tests {
     use eye_core::{CameraId, GazeRay, OutputId, ScreenModel, Side};
     use eye_geometry::angles::direction_from_yaw_pitch;
     use eye_geometry::synth::SplitMix64;
-    use nalgebra::{Matrix2, Matrix3, Point2, Point3, Unit, UnitQuaternion, Vector2, Vector3};
+    use nalgebra::{Matrix2, Matrix3, Point2, Point3, Unit, Vector2, Vector3};
 
     use super::*;
     use crate::correction::{AngularCorrection, CorrectionModel, EyeKey};
@@ -440,11 +440,12 @@ foo = 1
                 );
                 let ray = GazeRay {
                     side: Some(Side::Right),
+                    timestamp: eye_core::Timestamp::from_nanos(0),
                     origin,
                     direction: direction_from_yaw_pitch(&noisy),
                     angular_cov: Matrix2::identity() * 1.0_f64.to_radians().powi(2),
                     origin_cov: Matrix3::identity(),
-                    head_rotation: UnitQuaternion::identity(),
+                    head_rotation: None,
                 };
                 samples.push(FitSample { ray, target_mm });
             }
@@ -468,11 +469,12 @@ foo = 1
 
         let probe = GazeRay {
             side: Some(Side::Right),
+            timestamp: eye_core::Timestamp::from_nanos(0),
             origin: Point3::new(155.0, 85.0, -500.0),
             direction: Unit::new_normalize(Vector3::new(0.1, -0.05, 1.0)),
             angular_cov: Matrix2::identity() * 1e-4,
             origin_cov: Matrix3::zeros(),
-            head_rotation: UnitQuaternion::identity(),
+            head_rotation: None,
         };
         assert_eq!(profile.correct(&probe), reloaded.correct(&probe));
         let _ = std::fs::remove_dir_all(&dir);

@@ -118,6 +118,7 @@ mod tests {
     ) -> GazeRay {
         GazeRay {
             side: None,
+            timestamp: Timestamp::from_nanos(0),
             origin: Point3::new(155.0, 85.0, -500.0),
             direction: direction_from_yaw_pitch(&Vector2::new(
                 yaw_deg.to_radians(),
@@ -125,7 +126,7 @@ mod tests {
             )),
             angular_cov,
             origin_cov,
-            head_rotation: nalgebra::UnitQuaternion::identity(),
+            head_rotation: None,
         }
     }
 

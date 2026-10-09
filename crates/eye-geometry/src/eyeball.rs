@@ -4,7 +4,7 @@
 
 use std::f64::consts::PI;
 
-use eye_core::{CameraModel, GazeRay, Measured, Side};
+use eye_core::{CameraModel, GazeRay, Measured, Side, Timestamp};
 use nalgebra::{Point2, Point3, Unit, UnitQuaternion, Vector2, Vector3, Vector5};
 
 use crate::GeometryError;
@@ -146,8 +146,12 @@ pub fn gaze_ray(
     camera: &CameraModel,
     pupil_px: &Measured<Point2<f64>>,
     params: &EyeParams,
-    screen_from_viewer: &UnitQuaternion<f64>,
+    screen_from_viewer: Option<&UnitQuaternion<f64>>,
+    at: Timestamp,
 ) -> Result<GazeRay, GeometryError> {
+    let viewer = screen_from_viewer
+        .copied()
+        .unwrap_or_else(UnitQuaternion::identity);
     let g = |th: &Vector5<f64>| -> Option<Vector2<f64>> {
         let e = Point3::new(th[0], th[1], th[2]);
         let (o, d) = pixel_ray(camera, &Point2::new(th[3], th[4])).ok()?;
@@ -157,7 +161,7 @@ pub fn gaze_ray(
             &opt,
             &params.kappa,
             side,
-            screen_from_viewer,
+            &viewer,
         )))
     };
     let px = pupil_px.value();
@@ -173,11 +177,12 @@ pub fn gaze_ray(
         propagate_fn(g, &th, &cov_in).ok_or(GeometryError::Degenerate("gaze ray"))?;
     Ok(GazeRay {
         side: Some(side),
+        timestamp: at,
         origin: centre.position,
         direction: direction_from_yaw_pitch(&angles),
         angular_cov,
         origin_cov: centre.cov,
-        head_rotation: *screen_from_viewer,
+        head_rotation: screen_from_viewer.copied(),
     })
 }
 
@@ -322,7 +327,16 @@ mod tests {
         let pupil_px = Measured::new(pupil_pixel, 0.3).unwrap();
         let r_v = UnitQuaternion::identity();
 
-        let ray = gaze_ray(Side::Right, &centre, &cam, &pupil_px, &params, &r_v).unwrap();
+        let ray = gaze_ray(
+            Side::Right,
+            &centre,
+            &cam,
+            &pupil_px,
+            &params,
+            Some(&r_v),
+            Timestamp::from_nanos(0),
+        )
+        .unwrap();
 
         assert_abs_diff_eq!(ray.direction, axis, epsilon = 1e-9);
 
@@ -352,9 +366,17 @@ mod tests {
             cov: e_cov,
         };
         let pupil_px = Measured::new(pupil_pixel, sigma_px).unwrap();
-        let predicted = gaze_ray(Side::Right, &centre, &cam, &pupil_px, &params, &r_v)
-            .unwrap()
-            .angular_cov;
+        let predicted = gaze_ray(
+            Side::Right,
+            &centre,
+            &cam,
+            &pupil_px,
+            &params,
+            Some(&r_v),
+            Timestamp::from_nanos(0),
+        )
+        .unwrap()
+        .angular_cov;
 
         let n = 5_000;
         let mut rng = SplitMix64::new(9);
@@ -375,7 +397,16 @@ mod tests {
                 cov: Matrix3::zeros(),
             };
             let trial_px = Measured::new(noisy_px, 1e-12).unwrap();
-            let ray = gaze_ray(Side::Right, &trial_centre, &cam, &trial_px, &params, &r_v).unwrap();
+            let ray = gaze_ray(
+                Side::Right,
+                &trial_centre,
+                &cam,
+                &trial_px,
+                &params,
+                Some(&r_v),
+                Timestamp::from_nanos(0),
+            )
+            .unwrap();
             let angles = yaw_pitch_from_direction(&ray.direction);
             sum += angles;
             samples.push(angles);
@@ -432,7 +463,16 @@ mod tests {
             cov: Matrix3::from_diagonal(&Vector3::new(1.0, 0.0, 0.0)),
         };
         let pupil_px = Measured::new(pupil_pixel, 1e-9).unwrap();
-        let ray = gaze_ray(Side::Right, &centre, &cam, &pupil_px, &params, &r_v).unwrap();
+        let ray = gaze_ray(
+            Side::Right,
+            &centre,
+            &cam,
+            &pupil_px,
+            &params,
+            Some(&r_v),
+            Timestamp::from_nanos(0),
+        )
+        .unwrap();
         let sigma_yaw = ray.angular_cov[(0, 0)].sqrt();
         assert_abs_diff_eq!(sigma_yaw, 1.0 / 10.46, epsilon = 0.15 * (1.0 / 10.46));
     }
@@ -457,9 +497,63 @@ mod tests {
             cov: e_cov,
         };
         let pupil_px = Measured::new(pupil_pixel, 0.3).unwrap();
-        let ray = gaze_ray(Side::Right, &centre, &cam, &pupil_px, &params, &r_v).unwrap();
+        let ray = gaze_ray(
+            Side::Right,
+            &centre,
+            &cam,
+            &pupil_px,
+            &params,
+            Some(&r_v),
+            Timestamp::from_nanos(0),
+        )
+        .unwrap();
         assert_eq!(ray.origin_cov, e_cov);
         assert_eq!(ray.side, Some(Side::Right));
+    }
+
+    #[test]
+    fn test_gaze_ray_carries_timestamp_and_optional_pose() {
+        let cam = fixture_camera();
+        let params = zero_kappa_params();
+        let e = Point3::new(185.0, 60.0, -500.0);
+        let target = Point3::new(100.0, 50.0, 0.0);
+        let axis = Unit::new_normalize(target - e);
+        let p = e + axis.into_inner() * params.rotation_to_pupil_mm;
+        let pupil_cam = cam.screen_from_camera.inverse_transform_point(&p);
+        let pupil_pixel = Intrinsics::from_camera_model(&cam)
+            .project(&pupil_cam)
+            .unwrap();
+        let centre = EyeCentre {
+            position: e,
+            cov: Matrix3::zeros(),
+        };
+        let pupil_px = Measured::new(pupil_pixel, 0.3).unwrap();
+        let rot = UnitQuaternion::identity();
+
+        let with_pose = gaze_ray(
+            Side::Right,
+            &centre,
+            &cam,
+            &pupil_px,
+            &params,
+            Some(&rot),
+            Timestamp::from_nanos(42),
+        )
+        .unwrap();
+        assert_eq!(with_pose.timestamp, Timestamp::from_nanos(42));
+        assert_eq!(with_pose.head_rotation, Some(rot));
+
+        let without_pose = gaze_ray(
+            Side::Right,
+            &centre,
+            &cam,
+            &pupil_px,
+            &params,
+            None,
+            Timestamp::from_nanos(42),
+        )
+        .unwrap();
+        assert_eq!(without_pose.head_rotation, None);
     }
 
     #[test]

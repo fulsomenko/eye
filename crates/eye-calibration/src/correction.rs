@@ -160,7 +160,14 @@ impl GazeCorrection for UserProfile {
             CorrectionModel::HeadFrame => {
                 let th = SVector::<f64, 6>::from(c.theta);
                 let cov_theta = SMatrix::<f64, 6, 6>::from_fn(|r, k| c.cov[r][k]);
-                let rot = ray.head_rotation;
+                let Some(rot) = ray.head_rotation else {
+                    tracing::trace!(
+                        eye = eye_label(eye),
+                        { field::REASON } = "no_head_pose",
+                        "ray uncorrected"
+                    );
+                    return ray.clone();
+                };
                 let x = SVector::<f64, 8>::from_fn(|i, _| if i < 2 { a[i] } else { th[i - 2] });
                 let cov8 = block_diag::<2, 6, 8>(&ray.angular_cov, &cov_theta);
                 let f = move |x: &SVector<f64, 8>| -> Option<SVector<f64, 2>> {
@@ -317,11 +324,12 @@ mod tests {
     fn straight_ray(side: Option<eye_core::Side>) -> GazeRay {
         GazeRay {
             side,
+            timestamp: eye_core::Timestamp::from_nanos(0),
             origin: Point3::new(155.0, 85.0, -500.0),
             direction: Unit::new_normalize(Vector3::new(0.1, -0.05, 1.0)),
             angular_cov: Matrix2::identity() * 1e-4,
             origin_cov: nalgebra::Matrix3::zeros(),
-            head_rotation: UnitQuaternion::identity(),
+            head_rotation: Some(UnitQuaternion::identity()),
         }
     }
 
@@ -506,17 +514,17 @@ mod tests {
         let profile = single_eye_profile(CorrectionModel::HeadFrame, theta);
 
         let mut ray = straight_ray(Some(eye_core::Side::Right));
-        ray.head_rotation =
+        let head_rotation =
             UnitQuaternion::from_axis_angle(&Vector3::x_axis(), 60.0_f64.to_radians());
+        ray.head_rotation = Some(head_rotation);
         let corrected = yaw_pitch_from_direction(&profile.correct(&ray).direction);
 
         let th = SVector::<f64, 6>::from(theta);
-        let dir_head = ray.head_rotation.inverse() * ray.direction;
+        let dir_head = head_rotation.inverse() * ray.direction;
         let a_head = yaw_pitch_from_direction(&dir_head);
         let corrected_head = a_head + design(&a_head) * th;
-        let expected = yaw_pitch_from_direction(
-            &(ray.head_rotation * direction_from_yaw_pitch(&corrected_head)),
-        );
+        let expected =
+            yaw_pitch_from_direction(&(head_rotation * direction_from_yaw_pitch(&corrected_head)));
 
         assert_abs_diff_eq!(corrected.x, expected.x, epsilon = 1e-9);
         assert_abs_diff_eq!(corrected.y, expected.y, epsilon = 1e-9);

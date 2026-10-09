@@ -44,7 +44,7 @@ pub trait GazeFilter: Send {
 
 #[cfg(test)]
 mod tests {
-    use nalgebra::{Matrix2, Matrix3, Point3, Unit, UnitQuaternion, Vector3};
+    use nalgebra::{Matrix2, Matrix3, Point3, Unit, Vector3};
 
     use super::*;
     use crate::{CameraId, CameraModel, Frame, FrameHeader, OutputId, ScreenModel, Timestamp};
@@ -97,11 +97,12 @@ mod tests {
             }
             Ok(vec![GazeRay {
                 side: None,
+                timestamp: obs[0].timestamp,
                 origin: Point3::new(155.0, 85.0, -500.0),
                 direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
                 angular_cov: Matrix2::zeros(),
                 origin_cov: Matrix3::zeros(),
-                head_rotation: UnitQuaternion::identity(),
+                head_rotation: None,
             }])
         }
     }
