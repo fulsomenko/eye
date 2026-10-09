@@ -85,9 +85,17 @@ pub fn extension_units(d: &[u8]) -> Result<Vec<ExtensionUnit>, ProbeError> {
             }
             0x24 if len >= 3 && desc[2] == 0x06 => {
                 if let Some(interface) = vc_interface {
-                    units.push(
-                        parse_xu(interface, desc).ok_or_else(|| err(i, "short extension unit"))?,
+                    let unit =
+                        parse_xu(interface, desc).ok_or_else(|| err(i, "short extension unit"))?;
+                    tracing::trace!(
+                        interface = unit.interface,
+                        unit_id = unit.unit_id,
+                        guid = %unit.guid,
+                        num_controls = unit.num_controls,
+                        selectors = unit.selectors.len(),
+                        "extension unit parsed"
                     );
+                    units.push(unit);
                 }
             }
             _ => {}
@@ -236,5 +244,37 @@ mod tests {
         ]);
         let result = extension_units(&buf);
         assert_eq!(result.expect("parses"), vec![]);
+    }
+
+    #[test]
+    fn test_logs_extension_unit_parsed_at_trace() {
+        use eye_log::Value;
+
+        let (units, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            extension_units(FIXTURE).expect("fixture parses")
+        });
+        assert_eq!(units.len(), 5);
+
+        let parsed: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "extension unit parsed")
+            .collect();
+        assert_eq!(parsed.len(), 5);
+
+        let target = parsed
+            .iter()
+            .find(|r| {
+                r.fields.get("interface") == Some(&Value::U64(2))
+                    && r.fields.get("unit_id") == Some(&Value::U64(4))
+            })
+            .expect("interface 2 unit 4 parsed");
+        assert_eq!(target.level, eye_log::Level::Trace);
+        assert_eq!(target.fields.get("selectors"), Some(&Value::U64(2)));
+        assert_eq!(
+            target.fields.get("guid"),
+            Some(&Value::Str(
+                "{0f3f95dc-2632-4c4e-92c9-a04782f43bc8}".to_string()
+            ))
+        );
     }
 }

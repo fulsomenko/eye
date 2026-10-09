@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use eye_core::log::field;
+
 use crate::error::ProbeError;
 
 const DEFAULT_DMI_DIR: &str = "/sys/class/dmi/id";
@@ -25,9 +27,17 @@ impl DmiInfo {
     }
 
     pub fn read_from(dir: &Path) -> Result<Self, ProbeError> {
+        let sys_vendor = read_trimmed(&dir.join("sys_vendor"))?;
+        let product_name = read_trimmed(&dir.join("product_name"))?;
+        tracing::debug!(
+            dir = %dir.display(),
+            sys_vendor = %sys_vendor,
+            product_name = %product_name,
+            "dmi read"
+        );
         Ok(Self {
-            sys_vendor: read_trimmed(&dir.join("sys_vendor"))?,
-            product_name: read_trimmed(&dir.join("product_name"))?,
+            sys_vendor,
+            product_name,
         })
     }
 }
@@ -101,10 +111,33 @@ pub fn match_profile<'a>(
     let vendor = dmi.sys_vendor.trim();
     let product_lower = dmi.product_name.trim().to_ascii_lowercase();
     let product_words: Vec<&str> = product_lower.split_whitespace().collect();
-    profiles.iter().find(|p| {
+    let found = profiles.iter().find(|p| {
         p.sys_vendor.trim().eq_ignore_ascii_case(vendor)
             && is_word_subsequence(&product_words, &p.product_match.to_ascii_lowercase())
-    })
+    });
+    match found {
+        Some(p) => tracing::info!(
+            id = %p.id,
+            verified = p.verified,
+            cameras = p.cameras.len(),
+            sys_vendor = vendor,
+            product_name = %dmi.product_name.trim(),
+            "hardware profile matched"
+        ),
+        None => {
+            let vendor_known = profiles
+                .iter()
+                .any(|p| p.sys_vendor.trim().eq_ignore_ascii_case(vendor));
+            tracing::debug!(
+                sys_vendor = vendor,
+                product_name = %dmi.product_name.trim(),
+                profiles = profiles.len(),
+                { field::REASON } = if vendor_known { "product_mismatch" } else { "unknown_vendor" },
+                "no hardware profile for this machine"
+            );
+        }
+    }
+    found
 }
 
 fn is_word_subsequence(haystack_words: &[&str], needle: &str) -> bool {
@@ -116,6 +149,8 @@ fn is_word_subsequence(haystack_words: &[&str], needle: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use eye_core::log::field;
+
     use super::*;
 
     #[test]
@@ -187,6 +222,114 @@ mod tests {
         let dmi = DmiInfo::read_from(&dir).expect("reads");
         assert_eq!(dmi.sys_vendor, "Dell Inc.");
         assert_eq!(dmi.product_name, "Latitude 7420");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_logs_hardware_profile_matched_at_info() {
+        use eye_log::Value;
+
+        let dmi = DmiInfo {
+            sys_vendor: "Dell Inc.".to_string(),
+            product_name: "Latitude 7420".to_string(),
+        };
+        let (matched, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            match_profile(builtin_profiles(), &dmi)
+        });
+        assert!(matched.is_some());
+
+        let record = records
+            .iter()
+            .find(|r| r.message == "hardware profile matched")
+            .expect("hardware profile matched logged");
+        assert_eq!(record.level, eye_log::Level::Info);
+        assert_eq!(
+            record.fields.get("id"),
+            Some(&Value::Str("dell-latitude-7420".to_string()))
+        );
+        assert!(matches!(
+            record.fields.get("verified"),
+            Some(Value::Bool(_))
+        ));
+    }
+
+    #[test]
+    fn test_logs_no_profile_at_debug_with_reason() {
+        use eye_log::Value;
+
+        let unknown_vendor = DmiInfo {
+            sys_vendor: "LENOVO".to_string(),
+            product_name: "ThinkPad X1".to_string(),
+        };
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            match_profile(builtin_profiles(), &unknown_vendor)
+        });
+        let record = records
+            .iter()
+            .find(|r| r.message == "no hardware profile for this machine")
+            .expect("no profile logged");
+        assert_eq!(record.level, eye_log::Level::Debug);
+        assert_eq!(
+            record.fields.get(field::REASON),
+            Some(&Value::Str("unknown_vendor".to_string()))
+        );
+
+        let product_mismatch = DmiInfo {
+            sys_vendor: "Dell Inc.".to_string(),
+            product_name: "XPS 13".to_string(),
+        };
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            match_profile(builtin_profiles(), &product_mismatch)
+        });
+        let record = records
+            .iter()
+            .find(|r| r.message == "no hardware profile for this machine")
+            .expect("no profile logged");
+        assert_eq!(record.level, eye_log::Level::Debug);
+        assert_eq!(
+            record.fields.get(field::REASON),
+            Some(&Value::Str("product_mismatch".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_logs_dmi_read_at_debug() {
+        use eye_log::Value;
+
+        let dir = std::env::temp_dir().join(format!(
+            "eye-dmi-log-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("sys_vendor"), "Dell Inc.\n").unwrap();
+        fs::write(dir.join("product_name"), "Latitude 7420\n").unwrap();
+
+        let (result, records) =
+            eye_log::testing::capture_logs(tracing::Level::TRACE, || DmiInfo::read_from(&dir));
+        result.expect("reads");
+
+        let record = records
+            .iter()
+            .find(|r| r.message == "dmi read")
+            .expect("dmi read logged");
+        assert_eq!(record.level, eye_log::Level::Debug);
+        assert_eq!(
+            record.fields.get("sys_vendor"),
+            Some(&Value::Str("Dell Inc.".to_string()))
+        );
+        assert_eq!(
+            record.fields.get("product_name"),
+            Some(&Value::Str("Latitude 7420".to_string()))
+        );
+        assert_eq!(
+            record.fields.get("dir"),
+            Some(&Value::Str(dir.display().to_string()))
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }

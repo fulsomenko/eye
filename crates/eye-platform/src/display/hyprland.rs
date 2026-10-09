@@ -4,6 +4,8 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use eye_core::log::field;
+
 use crate::session::SessionInfo;
 use crate::{DisplayProbe, OutputInfo, ProbeError, Transform};
 
@@ -48,6 +50,12 @@ pub(crate) fn request(
     stream.shutdown(Shutdown::Write).map_err(io)?;
     let mut reply = String::new();
     stream.read_to_string(&mut reply).map_err(io)?;
+    tracing::debug!(
+        socket = %socket.display(),
+        command,
+        reply_bytes = reply.len(),
+        "hyprland ipc request"
+    );
     Ok(reply)
 }
 
@@ -60,7 +68,16 @@ pub(crate) fn parse_monitors(json: &str) -> Result<Vec<OutputInfo>, ProbeError> 
     let monitors: Vec<HyprMonitor> = serde_json::from_str(json)?;
     monitors
         .into_iter()
-        .filter(|m| !m.disabled)
+        .filter(|m| {
+            if m.disabled {
+                tracing::debug!(
+                    output = %m.name,
+                    { field::REASON } = "disabled",
+                    "disabled monitor skipped"
+                );
+            }
+            !m.disabled
+        })
         .map(HyprMonitor::into_output_info)
         .collect()
 }
@@ -102,7 +119,7 @@ impl HyprMonitor {
             Some((self.physical_width, self.physical_height))
         };
         let mode_px = (self.width, self.height);
-        Ok(OutputInfo {
+        let info = OutputInfo {
             name: self.name,
             make: self.make,
             model: self.model,
@@ -113,7 +130,9 @@ impl HyprMonitor {
             transform,
             logical_position: (self.x, self.y),
             logical_size: crate::display::logical_size(mode_px, self.scale, transform),
-        })
+        };
+        crate::display::log_output(&info, "hyprland");
+        Ok(info)
     }
 }
 
@@ -265,6 +284,68 @@ mod tests {
             Err(ProbeError::OutputNotFound { ref available, .. })
                 if available == &["eDP-1".to_string()]
         ));
+    }
+
+    #[test]
+    fn test_logs_output_probed_at_info() {
+        use eye_log::Value;
+
+        let (outputs, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            parse_monitors(REAL_FIXTURE).unwrap()
+        });
+        assert_eq!(outputs.len(), 1);
+
+        let record = records
+            .iter()
+            .find(|r| r.message == "output probed")
+            .expect("output probed logged");
+        assert_eq!(record.level, eye_log::Level::Info);
+        assert_eq!(
+            record.fields.get("backend"),
+            Some(&Value::Str("hyprland".to_string()))
+        );
+        assert_eq!(
+            record.fields.get("output"),
+            Some(&Value::Str("eDP-1".to_string()))
+        );
+        assert_eq!(record.fields.get("mode_w"), Some(&Value::U64(3840)));
+        assert_eq!(record.fields.get("physical_w_mm"), Some(&Value::U64(310)));
+        assert_eq!(record.fields.get("scale"), Some(&Value::F64(2.0)));
+        assert_eq!(record.fields.get("logical_w"), Some(&Value::U64(1920)));
+    }
+
+    #[test]
+    fn test_logs_disabled_monitor_skipped_at_debug() {
+        use eye_log::Value;
+
+        let (outputs, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            parse_monitors(SYNTHETIC_FIXTURE).unwrap()
+        });
+        assert_eq!(outputs.len(), 2);
+
+        let skipped: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "disabled monitor skipped")
+            .collect();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].level, eye_log::Level::Debug);
+        assert_eq!(
+            skipped[0].fields.get("output"),
+            Some(&Value::Str("HDMI-A-1".to_string()))
+        );
+        assert_eq!(
+            skipped[0].fields.get("reason"),
+            Some(&Value::Str("disabled".to_string()))
+        );
+
+        let probed: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "output probed")
+            .collect();
+        assert_eq!(probed.len(), 2);
+        for r in &probed {
+            assert_eq!(r.level, eye_log::Level::Info);
+        }
     }
 
     #[test]

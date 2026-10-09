@@ -50,11 +50,23 @@ impl SessionInfo {
             Some(instance_signature) => Compositor::Hyprland { instance_signature },
             None => Compositor::Unknown,
         };
+        let wayland_display = get("WAYLAND_DISPLAY");
+        let runtime_dir = get("XDG_RUNTIME_DIR").map(PathBuf::from);
+        tracing::debug!(
+            session_type = ?session_type,
+            wayland = wayland_display.is_some(),
+            compositor = match &compositor {
+                Compositor::Hyprland { .. } => "hyprland",
+                Compositor::Unknown => "unknown",
+            },
+            runtime_dir = runtime_dir.is_some(),
+            "session detected"
+        );
         Self {
             session_type,
-            wayland_display: get("WAYLAND_DISPLAY"),
+            wayland_display,
             compositor,
-            runtime_dir: get("XDG_RUNTIME_DIR").map(PathBuf::from),
+            runtime_dir,
         }
     }
 
@@ -184,6 +196,28 @@ mod tests {
         assert_eq!(
             table["compositor"]["hyprland"]["instance_signature"].as_str(),
             Some("78e2f9b6d17c11100f60c1316b8824ef10a10af3_1790868721_1848945805")
+        );
+    }
+
+    #[test]
+    fn test_logs_session_detected_at_debug() {
+        use eye_log::Value;
+
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            SessionInfo::from_lookup(env(&[
+                ("WAYLAND_DISPLAY", "wayland-1"),
+                ("HYPRLAND_INSTANCE_SIGNATURE", "s"),
+            ]))
+        });
+        let record = records
+            .iter()
+            .find(|r| r.message == "session detected")
+            .expect("session detected logged");
+        assert_eq!(record.level, eye_log::Level::Debug);
+        assert_eq!(record.fields.get("wayland"), Some(&Value::Bool(true)));
+        assert_eq!(
+            record.fields.get("compositor"),
+            Some(&Value::Str("hyprland".to_string()))
         );
     }
 

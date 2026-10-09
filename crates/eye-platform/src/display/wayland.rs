@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use eye_core::log::field;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput;
@@ -72,7 +73,7 @@ pub(crate) fn to_output_info(s: &WlOutputSnapshot) -> Result<OutputInfo, ProbeEr
         reason: format!("output {name} has no current mode"),
     })?;
     let mode_px = (mw as u32, mh as u32);
-    let (scale, resolved_logical_size) = match s.logical_size {
+    let (scale, resolved_logical_size, scale_source) = match s.logical_size {
         Some((lw, lh)) if lw > 0 && lh > 0 => {
             let tw = if transform.swaps_axes() {
                 mode_px.1
@@ -80,18 +81,28 @@ pub(crate) fn to_output_info(s: &WlOutputSnapshot) -> Result<OutputInfo, ProbeEr
                 mode_px.0
             };
             let raw = f64::from(tw) / f64::from(lw);
-            ((raw * 120.0).round() / 120.0, (lw as u32, lh as u32))
+            (
+                (raw * 120.0).round() / 120.0,
+                (lw as u32, lh as u32),
+                "xdg_output",
+            )
         }
         _ => {
             let scale = f64::from(s.scale_factor.max(1));
-            (scale, logical_size(mode_px, scale, transform))
+            (scale, logical_size(mode_px, scale, transform), "wl_output")
         }
     };
+    tracing::debug!(
+        output = %name,
+        scale,
+        source = scale_source,
+        "output scale resolved"
+    );
     let physical_mm = match s.physical_size {
         (w, h) if w > 0 && h > 0 => Some((w as u32, h as u32)),
         _ => None,
     };
-    Ok(OutputInfo {
+    let info = OutputInfo {
         name,
         make: s.make.clone(),
         model: s.model.clone(),
@@ -102,7 +113,9 @@ pub(crate) fn to_output_info(s: &WlOutputSnapshot) -> Result<OutputInfo, ProbeEr
         transform,
         logical_position: s.logical_position.unwrap_or((0, 0)),
         logical_size: resolved_logical_size,
-    })
+    };
+    crate::display::log_output(&info, "wayland");
+    Ok(info)
 }
 
 struct ProbeState {
@@ -175,10 +188,40 @@ impl DisplayProbe for SelectedDisplayProbe {
 pub fn select_display_probe(session: &SessionInfo) -> Result<SelectedDisplayProbe, ProbeError> {
     session.require_wayland()?;
     match session.hyprland_socket() {
-        Ok(socket) if socket.exists() => Ok(SelectedDisplayProbe::Hyprland(
-            HyprlandDisplayProbe::with_socket(socket, Duration::from_secs(1)),
-        )),
-        _ => Ok(SelectedDisplayProbe::Wayland(WaylandDisplayProbe::new())),
+        Ok(socket) if socket.exists() => {
+            tracing::info!(
+                backend = "hyprland",
+                { field::REASON } = "hyprland_socket_exists",
+                "display probe selected"
+            );
+            Ok(SelectedDisplayProbe::Hyprland(
+                HyprlandDisplayProbe::with_socket(socket, Duration::from_secs(1)),
+            ))
+        }
+        Ok(_) => {
+            tracing::info!(
+                backend = "wayland",
+                { field::REASON } = "no_hyprland_socket",
+                "display probe selected"
+            );
+            Ok(SelectedDisplayProbe::Wayland(WaylandDisplayProbe::new()))
+        }
+        Err(ProbeError::NotHyprland) => {
+            tracing::info!(
+                backend = "wayland",
+                { field::REASON } = "not_hyprland",
+                "display probe selected"
+            );
+            Ok(SelectedDisplayProbe::Wayland(WaylandDisplayProbe::new()))
+        }
+        Err(_) => {
+            tracing::info!(
+                backend = "wayland",
+                { field::REASON } = "no_runtime_dir",
+                "display probe selected"
+            );
+            Ok(SelectedDisplayProbe::Wayland(WaylandDisplayProbe::new()))
+        }
     }
 }
 
@@ -350,6 +393,105 @@ mod tests {
             select_display_probe(&session),
             Err(ProbeError::NotWayland)
         ));
+    }
+
+    #[test]
+    fn test_logs_output_scale_resolved_at_debug() {
+        use eye_log::Value;
+
+        let (info, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            to_output_info(&latitude()).unwrap()
+        });
+        let record = records
+            .iter()
+            .find(|r| r.message == "output scale resolved")
+            .expect("output scale resolved logged");
+        assert_eq!(record.level, eye_log::Level::Debug);
+        assert_eq!(
+            record.fields.get("source"),
+            Some(&Value::Str("xdg_output".to_string()))
+        );
+        assert_eq!(info.scale, 2.0);
+
+        let output_probed = records
+            .iter()
+            .find(|r| r.message == "output probed")
+            .expect("output probed logged");
+        assert_eq!(output_probed.level, eye_log::Level::Info);
+        assert_eq!(
+            output_probed.fields.get("backend"),
+            Some(&Value::Str("wayland".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_logs_display_probe_selected_at_info() {
+        use eye_log::Value;
+
+        let dir = temp_dir();
+        let sig = "some-signature";
+        let hypr_dir = dir.join("hypr").join(sig);
+        std::fs::create_dir_all(&hypr_dir).unwrap();
+        let socket_path = hypr_dir.join(".socket.sock");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+        let runtime_dir = dir.to_string_lossy().into_owned();
+        let session = SessionInfo::from_lookup(move |k| match k {
+            "WAYLAND_DISPLAY" => Some("wayland-1".into()),
+            "HYPRLAND_INSTANCE_SIGNATURE" => Some(sig.into()),
+            "XDG_RUNTIME_DIR" => Some(runtime_dir.clone().into()),
+            _ => None,
+        });
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            select_display_probe(&session)
+        });
+        let record = records
+            .iter()
+            .find(|r| r.message == "display probe selected")
+            .expect("display probe selected logged");
+        assert_eq!(record.level, eye_log::Level::Info);
+        assert_eq!(
+            record.fields.get("reason"),
+            Some(&Value::Str("hyprland_socket_exists".to_string()))
+        );
+
+        let dir2 = temp_dir();
+        let sig2 = "stale-signature";
+        let runtime_dir2 = dir2.to_string_lossy().into_owned();
+        let session2 = SessionInfo::from_lookup(move |k| match k {
+            "WAYLAND_DISPLAY" => Some("wayland-1".into()),
+            "HYPRLAND_INSTANCE_SIGNATURE" => Some(sig2.into()),
+            "XDG_RUNTIME_DIR" => Some(runtime_dir2.clone().into()),
+            _ => None,
+        });
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            select_display_probe(&session2)
+        });
+        let record = records
+            .iter()
+            .find(|r| r.message == "display probe selected")
+            .expect("display probe selected logged");
+        assert_eq!(record.level, eye_log::Level::Info);
+        assert_eq!(
+            record.fields.get("reason"),
+            Some(&Value::Str("no_hyprland_socket".to_string()))
+        );
+
+        let session3 = SessionInfo::from_lookup(|k| match k {
+            "WAYLAND_DISPLAY" => Some("wayland-1".into()),
+            _ => None,
+        });
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            select_display_probe(&session3)
+        });
+        let record = records
+            .iter()
+            .find(|r| r.message == "display probe selected")
+            .expect("display probe selected logged");
+        assert_eq!(record.level, eye_log::Level::Info);
+        assert_eq!(
+            record.fields.get("reason"),
+            Some(&Value::Str("not_hyprland".to_string()))
+        );
     }
 
     #[test]

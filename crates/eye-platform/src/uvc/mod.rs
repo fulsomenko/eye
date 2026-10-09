@@ -79,6 +79,14 @@ fn meta_format_io(node: &Path, set: Option<[u8; 4]>) -> Result<[u8; 4], XuError>
         })?;
     sys::meta_format(file.as_fd(), set.map(u32::from_le_bytes))
         .map(u32::to_le_bytes)
+        .inspect(|bytes| {
+            tracing::debug!(
+                path = %node.display(),
+                set = set.is_some(),
+                fourcc = %String::from_utf8_lossy(bytes),
+                "metadata format"
+            );
+        })
         .map_err(|errno| XuError::MetaFormat {
             path: node.to_owned(),
             errno,
@@ -102,12 +110,15 @@ pub trait XuTransport {
     }
 
     fn get(&self, unit: u8, selector: u8, query: XuQuery) -> Result<Vec<u8>, XuError> {
-        let mut buf = vec![0u8; usize::from(self.len(unit, selector)?)];
+        let len = usize::from(self.len(unit, selector)?);
+        tracing::trace!(unit, selector, query = ?query, len, "xu get");
+        let mut buf = vec![0u8; len];
         self.query(unit, selector, query, &mut buf)?;
         Ok(buf)
     }
 
     fn set_cur(&self, unit: u8, selector: u8, data: &[u8]) -> Result<(), XuError> {
+        tracing::trace!(unit, selector, len = data.len(), "xu set_cur");
         let mut buf = data.to_vec();
         self.query(unit, selector, XuQuery::SetCur, &mut buf)
     }
@@ -148,6 +159,14 @@ impl XuTransport for UvcXuDevice {
     ) -> Result<(), XuError> {
         let len = data.len();
         sys::ctrl_query(self.file.as_fd(), unit, selector, query as u8, data).map_err(|errno| {
+            tracing::debug!(
+                path = %self.path.display(),
+                unit,
+                selector,
+                query = ?query,
+                %errno,
+                "xu query failed"
+            );
             match errno {
                 nix::errno::Errno::ENOENT => XuError::NotFound { unit, selector },
                 nix::errno::Errno::EOVERFLOW => XuError::TooLong { len },
@@ -376,6 +395,28 @@ mod tests {
             *b"UVCM"
         );
         assert_eq!(meta_format(Path::new("/dev/video3")).unwrap(), *b"UVCM");
+    }
+
+    #[test]
+    fn test_logs_xu_get_at_trace() {
+        use eye_log::Value;
+
+        let fake = ir_fake();
+        let (result, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            fake.get(4, 6, XuQuery::GetCur)
+        });
+        assert_eq!(result.unwrap(), vec![1, 3, 1, 0, 0, 0, 0, 0, 0]);
+
+        let record = records
+            .iter()
+            .find(|r| r.message == "xu get")
+            .expect("xu get logged");
+        assert_eq!(record.level, eye_log::Level::Trace);
+        assert_eq!(
+            record.fields.get("query"),
+            Some(&Value::Str("GetCur".to_string()))
+        );
+        assert_eq!(record.fields.get("len"), Some(&Value::U64(9)));
     }
 
     #[test]

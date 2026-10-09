@@ -93,6 +93,28 @@ pub trait DisplayProbe {
     }
 }
 
+pub(crate) fn log_output(info: &OutputInfo, backend: &'static str) {
+    let (physical_w_mm, physical_h_mm) = info.physical_mm.unwrap_or((0, 0));
+    tracing::info!(
+        backend,
+        output = %info.name,
+        make = %info.make,
+        model = %info.model,
+        mode_w = info.mode_px.0,
+        mode_h = info.mode_px.1,
+        refresh_hz = info.refresh_hz,
+        physical_w_mm,
+        physical_h_mm,
+        scale = info.scale,
+        transform = ?info.transform,
+        logical_x = info.logical_position.0,
+        logical_y = info.logical_position.1,
+        logical_w = info.logical_size.0,
+        logical_h = info.logical_size.1,
+        "output probed"
+    );
+}
+
 /// Logical size from mode pixels: divide by scale, round, swap for 90/270 transforms.
 pub(crate) fn logical_size(mode_px: (u32, u32), scale: f64, transform: Transform) -> (u32, u32) {
     let (w, h) = mode_px;

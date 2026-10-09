@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::Path;
 
+use eye_core::log::field;
+
 use crate::ProbeError;
 use crate::camera::UsbIdentity;
 use crate::camera::usb_desc::{self, ExtensionUnit};
@@ -58,6 +60,15 @@ pub(crate) fn scan(sysfs_class: &Path) -> Result<Vec<SysfsNode>, ProbeError> {
             _ => Vec::new(),
         };
 
+        tracing::debug!(
+            node = %name,
+            number,
+            card = %card,
+            usb = usb.is_some(),
+            extension_units = extension_units.len(),
+            "sysfs node scanned"
+        );
+
         nodes.push(SysfsNode {
             name,
             number,
@@ -76,20 +87,49 @@ pub(crate) fn usb_identity(
     let device_link = class_entry.join("device");
     let interface_dir = match fs::canonicalize(&device_link) {
         Ok(path) => path,
-        Err(_) => return Ok(None),
+        Err(_) => {
+            tracing::trace!(
+                node = %class_entry.display(),
+                { field::REASON } = "no_device_link",
+                "node has no usb identity"
+            );
+            return Ok(None);
+        }
     };
 
     let interface = match read_trimmed(&interface_dir.join("bInterfaceNumber"))? {
         Some(text) => match u8::from_str_radix(text.trim(), 16) {
             Ok(n) => n,
-            Err(_) => return Ok(None),
+            Err(_) => {
+                tracing::trace!(
+                    node = %class_entry.display(),
+                    { field::REASON } = "bad_interface_number",
+                    text = %text,
+                    "node has no usb identity"
+                );
+                return Ok(None);
+            }
         },
-        None => return Ok(None),
+        None => {
+            tracing::trace!(
+                node = %class_entry.display(),
+                { field::REASON } = "no_interface_number",
+                "node has no usb identity"
+            );
+            return Ok(None);
+        }
     };
 
     let sysfs_device = match interface_dir.parent() {
         Some(parent) => parent.to_path_buf(),
-        None => return Ok(None),
+        None => {
+            tracing::trace!(
+                node = %class_entry.display(),
+                { field::REASON } = "no_parent_dir",
+                "node has no usb identity"
+            );
+            return Ok(None);
+        }
     };
 
     let vendor_id = parse_hex_u16(&sysfs_device.join("idVendor"))?;
@@ -280,5 +320,83 @@ mod tests {
             .expect("video9 present");
         assert_eq!(video9.usb, None);
         assert_eq!(video9.extension_units, vec![]);
+    }
+
+    #[test]
+    fn test_logs_sysfs_node_scanned_at_debug() {
+        use eye_log::Value;
+
+        let fixture = Fixture::build();
+        fixture.add_non_usb_node("video9");
+        let video8_dir = fixture.class_dir().join("video8");
+        fs::create_dir_all(&video8_dir).unwrap();
+        fs::write(video8_dir.join("name"), "No link\n").unwrap();
+        fs::write(video8_dir.join("index"), "0\n").unwrap();
+
+        let (nodes, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            scan(&fixture.class_dir()).expect("scan succeeds")
+        });
+        assert_eq!(nodes.len(), 6);
+
+        let scanned: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "sysfs node scanned")
+            .collect();
+        assert_eq!(scanned.len(), 6);
+        for r in &scanned {
+            assert_eq!(r.level, eye_log::Level::Debug);
+        }
+
+        let video2 = scanned
+            .iter()
+            .find(|r| r.fields.get("node") == Some(&Value::Str("video2".to_string())))
+            .expect("video2 scanned");
+        assert_eq!(video2.fields.get("usb"), Some(&Value::Bool(true)));
+        assert_eq!(video2.fields.get("extension_units"), Some(&Value::U64(2)));
+
+        for name in ["video8", "video9"] {
+            let r = scanned
+                .iter()
+                .find(|r| r.fields.get("node") == Some(&Value::Str(name.to_string())))
+                .unwrap_or_else(|| panic!("{name} scanned"));
+            assert_eq!(r.fields.get("usb"), Some(&Value::Bool(false)));
+        }
+
+        let no_identity: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "node has no usb identity")
+            .collect();
+        assert_eq!(no_identity.len(), 2);
+        for r in &no_identity {
+            assert_eq!(r.level, eye_log::Level::Trace);
+        }
+
+        let video9_trace = no_identity
+            .iter()
+            .find(|r| {
+                r.fields
+                    .get("node")
+                    .map(|v| matches!(v, Value::Str(s) if s.ends_with("video9")))
+                    .unwrap_or(false)
+            })
+            .expect("video9 no-identity trace");
+        assert_eq!(
+            video9_trace.fields.get("reason"),
+            Some(&Value::Str("no_interface_number".to_string()))
+        );
+
+        let video8_trace = no_identity
+            .iter()
+            .find(|r| {
+                r.fields
+                    .get("node")
+                    .map(|v| matches!(v, Value::Str(s) if s.ends_with("video8")))
+                    .unwrap_or(false)
+            })
+            .expect("video8 no-identity trace");
+        assert_eq!(
+            video8_trace.fields.get("reason"),
+            Some(&Value::Str("no_device_link".to_string()))
+        );
     }
 }

@@ -3,6 +3,7 @@ pub mod usb_desc;
 
 use std::path::{Path, PathBuf};
 
+use eye_core::log::field;
 use v4l::prelude::*;
 use v4l::video::Capture;
 use v4l::{capability::Flags, format::description::Description as FormatDescription};
@@ -21,6 +22,16 @@ pub enum CameraKind {
     Rgb,
     Ir,
     Other,
+}
+
+impl CameraKind {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            CameraKind::Rgb => "rgb",
+            CameraKind::Ir => "ir",
+            CameraKind::Other => "other",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -98,6 +109,7 @@ impl Default for V4l2CameraProbe {
 impl CameraProbe for V4l2CameraProbe {
     fn cameras(&self) -> Result<Vec<CameraDevice>, ProbeError> {
         let nodes = sysfs::scan(&self.sysfs_class)?;
+        let node_count = nodes.len();
 
         let mut opened: Vec<(SysfsNode, Device, v4l::capability::Capabilities)> = Vec::new();
         for node in nodes {
@@ -128,12 +140,35 @@ impl CameraProbe for V4l2CameraProbe {
         let mut cameras = Vec::new();
         for (node, device, caps) in &opened {
             if !caps.capabilities.contains(Flags::VIDEO_CAPTURE) {
+                tracing::debug!(
+                    node = %node.name,
+                    meta_capture = caps.capabilities.contains(Flags::META_CAPTURE),
+                    { field::REASON } = "no_video_capture",
+                    "node skipped, not video capture"
+                );
                 continue;
             }
 
             let formats = enumerate_formats(device, &node.name);
+            let sizes: usize = formats.iter().map(|f| f.sizes.len()).sum();
             let kind = classify(&formats);
             let metadata_node = metadata_node_for(node, &meta_nodes, &self.dev_dir);
+
+            tracing::info!(
+                node = %self.dev_dir.join(&node.name).display(),
+                card = %caps.card,
+                driver = %caps.driver,
+                bus = %caps.bus,
+                kind = kind.name(),
+                formats = formats.len(),
+                sizes,
+                usb = node.usb.is_some(),
+                vendor_id = node.usb.as_ref().map(|u| u.vendor_id),
+                product_id = node.usb.as_ref().map(|u| u.product_id),
+                extension_units = node.extension_units.len(),
+                metadata_node = metadata_node.is_some(),
+                "camera probed"
+            );
 
             cameras.push(CameraDevice {
                 node: self.dev_dir.join(&node.name),
@@ -147,6 +182,13 @@ impl CameraProbe for V4l2CameraProbe {
                 metadata_node,
             });
         }
+
+        tracing::debug!(
+            nodes = node_count,
+            opened = opened.len(),
+            cameras = cameras.len(),
+            "camera probe finished"
+        );
 
         Ok(cameras)
     }
@@ -169,6 +211,12 @@ fn enumerate_formats(device: &Device, node_name: &str) -> Vec<FormatInfo> {
                 Err(_) => return None,
             };
             let sizes = enumerate_sizes(device, desc.fourcc, node_name);
+            tracing::trace!(
+                node = node_name,
+                fourcc = %fourcc,
+                sizes = sizes.len(),
+                "format enumerated"
+            );
             Some(FormatInfo { fourcc, sizes })
         })
         .collect()
@@ -493,5 +541,57 @@ mod tests {
                 .iter()
                 .all(|c| c.node != Path::new("/dev/video1") && c.node != Path::new("/dev/video3"))
         );
+    }
+
+    #[test]
+    #[ignore = "needs hardware"]
+    fn test_logs_camera_probed_at_info() {
+        use eye_log::Value;
+
+        let (cameras, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            V4l2CameraProbe::new().cameras().expect("probe succeeds")
+        });
+        assert_eq!(cameras.len(), 2);
+
+        let probed: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "camera probed")
+            .collect();
+        assert_eq!(probed.len(), 2);
+        let video0 = probed
+            .iter()
+            .find(|r| r.fields.get("node") == Some(&Value::Str("/dev/video0".to_string())))
+            .expect("video0 probed");
+        assert_eq!(video0.level, eye_log::Level::Info);
+        assert_eq!(
+            video0.fields.get("kind"),
+            Some(&Value::Str("rgb".to_string()))
+        );
+        let video2 = probed
+            .iter()
+            .find(|r| r.fields.get("node") == Some(&Value::Str("/dev/video2".to_string())))
+            .expect("video2 probed");
+        assert_eq!(video2.level, eye_log::Level::Info);
+        assert_eq!(
+            video2.fields.get("kind"),
+            Some(&Value::Str("ir".to_string()))
+        );
+        assert_eq!(video2.fields.get("extension_units"), Some(&Value::U64(2)));
+
+        let skipped: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "node skipped, not video capture")
+            .collect();
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped.iter().all(|r| r.level == eye_log::Level::Debug
+            && r.fields.get("meta_capture") == Some(&Value::Bool(true))));
+
+        let finished = records
+            .iter()
+            .find(|r| r.message == "camera probe finished")
+            .expect("camera probe finished logged");
+        assert_eq!(finished.level, eye_log::Level::Debug);
+        assert_eq!(finished.fields.get("cameras"), Some(&Value::U64(2)));
+        assert_eq!(finished.fields.get("nodes"), Some(&Value::U64(4)));
     }
 }

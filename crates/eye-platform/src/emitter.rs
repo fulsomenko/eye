@@ -30,13 +30,21 @@ pub struct EmitterControl {
 
 /// The first MSXU unit that advertises the face-authentication selector.
 pub fn find_face_auth_control(units: &[ExtensionUnit]) -> Option<EmitterControl> {
-    units
+    let found = units
         .iter()
         .find(|u| u.guid == MSXU_GUID && u.selectors.contains(&MSXU_FACE_AUTH_SELECTOR))
         .map(|u| EmitterControl {
             unit: u.unit_id,
             selector: MSXU_FACE_AUTH_SELECTOR,
-        })
+        });
+    if let Some(control) = found {
+        tracing::debug!(
+            unit = control.unit,
+            selector = control.selector,
+            "msxu face-auth control found"
+        );
+    }
+    found
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +110,15 @@ impl<T: XuTransport> MsxuIrEmitter<T> {
                 info: info.0,
             });
         }
+        tracing::debug!(
+            unit = control.unit,
+            selector = control.selector,
+            len,
+            info = info.0,
+            get = info.supports_get(),
+            set = info.supports_set(),
+            "xu control inspected"
+        );
         Ok(Self {
             xu,
             control,
@@ -143,9 +160,19 @@ impl<T: XuTransport> MsxuIrEmitter<T> {
             });
         }
         let mut payload = self.xu.get(unit, selector, XuQuery::GetCur)?;
+        let prior_mode = payload[MODE_BYTE];
         payload[MODE_BYTE] = mode;
         self.xu.set_cur(unit, selector, &payload)?;
         let actual = self.mode()?;
+        tracing::debug!(
+            unit,
+            selector,
+            requested = mode,
+            max,
+            prior_mode,
+            actual,
+            "emitter mode written"
+        );
         if actual != mode {
             return Err(EmitterError::NotApplied {
                 requested: mode,
@@ -160,7 +187,26 @@ impl<T: XuTransport> MsxuIrEmitter<T> {
         let EmitterControl { unit, selector } = self.control;
         self.xu.set_cur(unit, selector, payload)?;
         let actual = self.payload()?;
-        if actual != payload {
+        let restored = actual == payload;
+        tracing::debug!(
+            unit,
+            selector,
+            len = payload.len(),
+            expected_mode = payload[MODE_BYTE],
+            actual_mode = actual[MODE_BYTE],
+            restored,
+            b0 = actual.first().copied(),
+            b1 = actual.get(1).copied(),
+            b2 = actual.get(2).copied(),
+            b3 = actual.get(3).copied(),
+            b4 = actual.get(4).copied(),
+            b5 = actual.get(5).copied(),
+            b6 = actual.get(6).copied(),
+            b7 = actual.get(7).copied(),
+            b8 = actual.get(8).copied(),
+            "emitter payload restored"
+        );
+        if !restored {
             return Err(EmitterError::NotRestored {
                 expected: payload.to_vec(),
                 actual,
@@ -228,6 +274,25 @@ impl<T: XuTransport> EmitterGuard<T> {
             open,
         };
         emitter.set_mode(mode)?;
+        let p = &guard.prior;
+        tracing::info!(
+            node = %guard.node.display(),
+            unit = control.unit,
+            selector = control.selector,
+            mode,
+            prior_mode = p[MODE_BYTE],
+            prior_len = p.len(),
+            b0 = p.first().copied(),
+            b1 = p.get(1).copied(),
+            b2 = p.get(2).copied(),
+            b3 = p.get(3).copied(),
+            b4 = p.get(4).copied(),
+            b5 = p.get(5).copied(),
+            b6 = p.get(6).copied(),
+            b7 = p.get(7).copied(),
+            b8 = p.get(8).copied(),
+            "ir emitter guard applied"
+        );
         Ok(guard)
     }
 
@@ -272,11 +337,27 @@ impl<T: XuTransport> std::fmt::Debug for EmitterGuard<T> {
 
 impl<T: XuTransport> Drop for EmitterGuard<T> {
     fn drop(&mut self) {
-        if let Err(err) = self
+        let prior_mode = self.prior[MODE_BYTE];
+        match self
             .emitter()
             .and_then(|mut e| e.restore_payload(&self.prior))
         {
-            tracing::warn!(node = %self.node.display(), prior = ?self.prior, %err, "could not restore the IR emitter");
+            Ok(()) => {
+                tracing::info!(
+                    node = %self.node.display(),
+                    prior_mode,
+                    "ir emitter restored"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    node = %self.node.display(),
+                    prior_mode,
+                    prior_len = self.prior.len(),
+                    %error,
+                    "could not restore the IR emitter"
+                );
+            }
         }
     }
 }
@@ -605,6 +686,155 @@ mod tests {
                 selector: 6
             }
         );
+    }
+
+    #[test]
+    fn test_logs_xu_control_inspected_at_debug() {
+        use eye_log::Value;
+
+        let xu = ir_fake();
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            MsxuIrEmitter::with_transport(xu.clone(), IR).unwrap()
+        });
+        let record = records
+            .iter()
+            .find(|r| r.message == "xu control inspected")
+            .expect("xu control inspected logged");
+        assert_eq!(record.level, eye_log::Level::Debug);
+        assert_eq!(record.fields.get("len"), Some(&Value::U64(9)));
+        assert_eq!(record.fields.get("info"), Some(&Value::U64(3)));
+        assert_eq!(record.fields.get("get"), Some(&Value::Bool(true)));
+        assert_eq!(record.fields.get("set"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_logs_emitter_mode_written_at_debug() -> Result<(), EmitterError> {
+        use eye_log::Value;
+
+        let xu = ir_fake();
+        let (result, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut e = MsxuIrEmitter::with_transport(xu.clone(), IR)?;
+            e.set_enabled(true)
+        });
+        result?;
+
+        let record = records
+            .iter()
+            .find(|r| r.message == "emitter mode written")
+            .expect("emitter mode written logged");
+        assert_eq!(record.level, eye_log::Level::Debug);
+        assert_eq!(record.fields.get("requested"), Some(&Value::U64(2)));
+        assert_eq!(record.fields.get("max"), Some(&Value::U64(3)));
+        assert_eq!(record.fields.get("prior_mode"), Some(&Value::U64(1)));
+        assert_eq!(record.fields.get("actual"), Some(&Value::U64(2)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_logs_emitter_payload_restored_at_debug() -> Result<(), EmitterError> {
+        use eye_log::Value;
+
+        let xu = ir_fake();
+        xu.update(4, 6, |c| {
+            c.cur = vec![1, 3, 1, 7, 0, 0, 0, 0, 5];
+            c.def = vec![1, 3, 1, 7, 0, 0, 0, 0, 5];
+        });
+        let guard = EmitterGuard::with_opener(
+            PathBuf::from("/dev/video2"),
+            IR,
+            MODE_ON_DEFAULT,
+            opener(&xu),
+        )?;
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || drop(guard));
+
+        let restored = records
+            .iter()
+            .find(|r| r.message == "emitter payload restored")
+            .expect("emitter payload restored logged");
+        assert_eq!(restored.level, eye_log::Level::Debug);
+        assert_eq!(restored.fields.get("restored"), Some(&Value::Bool(true)));
+        assert_eq!(restored.fields.get("expected_mode"), Some(&Value::U64(1)));
+
+        let info = records
+            .iter()
+            .find(|r| r.message == "ir emitter restored")
+            .expect("ir emitter restored logged");
+        assert_eq!(info.level, eye_log::Level::Info);
+        Ok(())
+    }
+
+    #[test]
+    fn test_logs_emitter_restore_failed_at_warn() -> Result<(), EmitterError> {
+        use eye_log::Value;
+
+        let xu = ir_fake();
+        let guard = EmitterGuard::with_opener(
+            PathBuf::from("/dev/video2"),
+            IR,
+            MODE_ON_DEFAULT,
+            opener(&xu),
+        )?;
+        xu.update(4, 6, |c| c.ignore_writes = true);
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || drop(guard));
+
+        let warnings: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "could not restore the IR emitter")
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        let warning = warnings[0];
+        assert_eq!(warning.level, eye_log::Level::Warn);
+        assert_eq!(warning.fields.get("prior_mode"), Some(&Value::U64(1)));
+        match warning.fields.get("error") {
+            Some(Value::Str(s)) => assert!(s.contains("after restoring")),
+            other => panic!("expected error field, got {other:?}"),
+        }
+        assert!(!warning.fields.contains_key("prior"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_logs_ir_emitter_guard_applied_at_info() -> Result<(), EmitterError> {
+        use eye_log::Value;
+
+        let xu = ir_fake();
+        xu.update(4, 6, |c| {
+            c.cur = vec![1, 3, 1, 7, 0, 0, 0, 0, 5];
+            c.def = vec![1, 3, 1, 7, 0, 0, 0, 0, 5];
+        });
+        let (guard, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            EmitterGuard::with_opener(
+                PathBuf::from("/dev/video2"),
+                IR,
+                MODE_ON_DEFAULT,
+                opener(&xu),
+            )
+        });
+        let _guard = guard?;
+
+        let applied = records
+            .iter()
+            .find(|r| r.message == "ir emitter guard applied")
+            .expect("ir emitter guard applied logged");
+        assert_eq!(applied.level, eye_log::Level::Info);
+        assert_eq!(applied.target, "eye_platform::emitter");
+        let applied_all: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "ir emitter guard applied")
+            .collect();
+        assert_eq!(applied_all.len(), 1);
+        assert_eq!(applied.fields.get("mode"), Some(&Value::U64(2)));
+        assert_eq!(applied.fields.get("prior_mode"), Some(&Value::U64(1)));
+        assert_eq!(applied.fields.get("prior_len"), Some(&Value::U64(9)));
+        assert_eq!(applied.fields.get("b3"), Some(&Value::U64(7)));
+        assert_eq!(applied.fields.get("b8"), Some(&Value::U64(5)));
+        assert!(!applied.fields.contains_key("b9"));
+        for value in applied.fields.values() {
+            if let Value::Str(s) = value {
+                assert!(!s.contains('['));
+            }
+        }
+        Ok(())
     }
 
     #[test]
