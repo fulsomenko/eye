@@ -156,9 +156,9 @@ fn parse_hex_u16(path: &Path) -> Result<u16, ProbeError> {
         path: path.to_path_buf(),
         source,
     })?;
-    u16::from_str_radix(text.trim(), 16).map_err(|_| ProbeError::Descriptor {
-        offset: 0,
-        reason: "bad idVendor/idProduct",
+    u16::from_str_radix(text.trim(), 16).map_err(|_| ProbeError::Sysfs {
+        path: path.to_path_buf(),
+        reason: "not a hexadecimal u16",
     })
 }
 
@@ -398,5 +398,20 @@ mod tests {
             video8_trace.fields.get("reason"),
             Some(&Value::Str("no_device_link".to_string()))
         );
+    }
+
+    #[test]
+    fn test_parse_hex_u16_reports_sysfs_path_on_garbage() {
+        let fixture = Fixture::build();
+        let path = fixture.root.join("idVendor");
+        fs::write(&path, "zz\n").unwrap();
+
+        let err = parse_hex_u16(&path).expect_err("garbage hex fails to parse");
+        assert!(
+            matches!(&err, ProbeError::Sysfs { path: p, reason: "not a hexadecimal u16" } if p.ends_with("idVendor"))
+        );
+        let message = err.to_string();
+        assert!(message.starts_with("sysfs "));
+        assert!(!message.contains("descriptor"));
     }
 }

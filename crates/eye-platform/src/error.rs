@@ -14,6 +14,8 @@ pub enum ProbeError {
         #[source]
         source: std::io::Error,
     },
+    #[error("sysfs {path}: {reason}")]
+    Sysfs { path: PathBuf, reason: &'static str },
     #[error("Hyprland IPC replied with non-JSON: {reply:?}")]
     Hyprland { reply: String },
     #[error("Hyprland IPC JSON: {0}")]
