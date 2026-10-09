@@ -85,13 +85,16 @@ pub fn mask_glint(
     glint: &Point2<f64>,
     plateau: u8,
 ) -> Result<GrayImage, DetectError> {
+    const RADIUS: f64 = 1.5;
     let (w, h) = (diff.width(), diff.height());
     let mut data = diff.data().to_vec();
-    for y in 0..h {
-        for x in 0..w {
-            let (cx, cy) = (f64::from(x) + 0.5, f64::from(y) + 0.5);
-            let d = ((cx - glint.x).powi(2) + (cy - glint.y).powi(2)).sqrt();
-            if d <= 1.5 {
+    // Pixel centres within 1.5 px of a sub-pixel glint g all satisfy
+    // floor(g) - 2 <= x <= floor(g) + 2, so a half-width of 2 contains the whole disc.
+    let roi = Roi::around(glint, 2, w, h);
+    for y in roi.y..roi.y + roi.height {
+        for x in roi.x..roi.x + roi.width {
+            let (dx, dy) = (f64::from(x) + 0.5 - glint.x, f64::from(y) + 0.5 - glint.y);
+            if dx * dx + dy * dy <= RADIUS * RADIUS {
                 data[(y * w + x) as usize] = plateau;
             }
         }
@@ -363,6 +366,51 @@ mod tests {
                     assert!(peak < plateau + 15, "peak {peak} plateau {plateau}");
                 }
                 other => panic!("unexpected field types: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_mask_glint_only_changes_pixels_within_radius() {
+        let diff = GrayImage::new(16, 16, vec![0u8; 16 * 16]).unwrap();
+        // 7.65, not 7.6: at 7.6 the pixel (9, 8) sits exactly on the disc boundary
+        // (1.2^2 + 0.9^2 = 2.25) and the old sqrt(..) <= 1.5, the new dx*dx + dy*dy <= 2.25,
+        // and this test's hypot(..) <= 1.5 agree there only by floating-point luck; at 7.65
+        // no pixel centre is within 1e-6 of the boundary.
+        let glint = Point2::new(8.3, 7.65);
+        let plateau = 200u8;
+        let masked = mask_glint(diff.view(), &glint, plateau).unwrap();
+        for y in 0..16u32 {
+            for x in 0..16u32 {
+                let (cx, cy) = (f64::from(x) + 0.5, f64::from(y) + 0.5);
+                let inside = (cx - glint.x).hypot(cy - glint.y) <= 1.5;
+                let got = masked.view().get(x, y);
+                if inside {
+                    assert_eq!(got, plateau, "expected ({x},{y}) inside disc to be masked");
+                } else {
+                    assert_eq!(got, 0, "expected ({x},{y}) outside disc to be unmasked");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_mask_glint_handles_glint_at_image_edge() {
+        let diff = GrayImage::new(16, 16, vec![0u8; 16 * 16]).unwrap();
+        let plateau = 200u8;
+        for glint in [Point2::new(0.4, 0.4), Point2::new(15.6, 15.6)] {
+            let masked = mask_glint(diff.view(), &glint, plateau).unwrap();
+            for y in 0..16u32 {
+                for x in 0..16u32 {
+                    let (cx, cy) = (f64::from(x) + 0.5, f64::from(y) + 0.5);
+                    let inside = (cx - glint.x).hypot(cy - glint.y) <= 1.5;
+                    let got = masked.view().get(x, y);
+                    if inside {
+                        assert_eq!(got, plateau, "expected ({x},{y}) inside disc to be masked");
+                    } else {
+                        assert_eq!(got, 0, "expected ({x},{y}) outside disc to be unmasked");
+                    }
+                }
             }
         }
     }
