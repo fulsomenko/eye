@@ -151,7 +151,7 @@ impl Default for OutputConfig {
             kind: "layer-shell".to_string(),
             target: None,
             mode: OutputMode::Point,
-            grid: [3, 3],
+            grid: [4, 4],
             easing_ms: 80,
             hide_margin_px: 24.0,
             hide_below_confidence: 0.2,
@@ -449,6 +449,34 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_default_sections_equal_struct_defaults() {
+        let c = Config::builtin_default();
+        assert_eq!(c.capture, CaptureConfig::default());
+        assert_eq!(c.tracker, TrackerConfig::default());
+        assert_eq!(
+            OutputConfig {
+                target: None,
+                ..c.output.clone()
+            },
+            OutputConfig::default()
+        );
+    }
+
+    #[test]
+    fn test_builtin_default_filter_resolves_to_one_euro_default() {
+        let c = Config::builtin_default();
+        assert_eq!(c.filter.kind, "one-euro");
+        assert!(c.filter.options.is_empty());
+        let resolved: eye_filter::one_euro::OneEuroConfig = c
+            .filter
+            .options
+            .clone()
+            .try_into()
+            .expect("empty table resolves");
+        assert_eq!(resolved, eye_filter::one_euro::OneEuroConfig::default());
+    }
+
+    #[test]
     fn test_rig_section_is_kept_opaque() {
         let base = minimal_valid_toml();
         let with_rig = format!("{base}\n[rig]\nfov_deg = 80.0\n");
@@ -549,7 +577,7 @@ mod tests {
                 kind: "layer-shell".to_string(),
                 target: None,
                 mode: OutputMode::Point,
-                grid: [3, 3],
+                grid: [4, 4],
                 easing_ms: 80,
                 hide_margin_px: 24.0,
                 hide_below_confidence: 0.2,

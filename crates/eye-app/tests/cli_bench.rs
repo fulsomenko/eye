@@ -1,4 +1,5 @@
 use assert_cmd::cargo::cargo_bin_cmd;
+use eye::config::{Config, EnvOverrides};
 use eye_bench::testing::{FOUR_BY_FOUR_CENTRES, SyntheticSession, write_synthetic_session};
 use predicates::prelude::*;
 
@@ -100,6 +101,21 @@ fn test_bench_synthetic_session_writes_report() {
         rows.iter().filter(|r| r["kind"] == "aggregate").collect();
     assert_eq!(aggregate_rows.len(), 1);
     assert_eq!(aggregate_rows[0]["pipeline"], "eye");
+}
+
+#[test]
+fn test_baseline_pipeline_filters_equal_builtin_default() {
+    let builtin = Config::builtin_default();
+    for path in [
+        "../../bench/baseline/rgb.toml",
+        "../../bench/baseline/ir.toml",
+        "../../bench/baseline/fused.toml",
+    ] {
+        let config = Config::load_with(Some(std::path::Path::new(path)), &EnvOverrides::default())
+            .expect("loads baseline config")
+            .config;
+        assert_eq!(config.filter, builtin.filter, "{path}");
+    }
 }
 
 #[test]

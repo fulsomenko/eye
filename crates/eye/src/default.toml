@@ -12,6 +12,7 @@ size = [640, 360]
 emitter = "msxu"          # read by eye-app / eye-lab, which hold EmitterGuard
 
 [capture]
+channel_capacity = 2
 rgb_offset_ns = 3_000_000
 
 [detect]
@@ -22,10 +23,16 @@ ir = "ir-classic"
 kind = "fused"
 
 [filter]
-kind = "one-euro"
+kind = "one-euro"         # numbers: eye_filter::one_euro::OneEuroConfig::default(), the benched filter
+
+[tracker]
+max_consecutive_stage_errors = 30
 
 [output]
 kind = "layer-shell"
 target = "eDP-1"          # optional; defaults to the rig's screen output
 mode = "point"            # or "region"
 grid = [4, 4]
+easing_ms = 80
+hide_margin_px = 24.0
+hide_below_confidence = 0.2
