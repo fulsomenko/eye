@@ -5,6 +5,10 @@ name = "ir"
 config = "ir.toml"
 
 [[pipeline]]
+name = "ir-pccr"
+config = "ir-pccr.toml"
+
+[[pipeline]]
 name = "rgb"
 config = "rgb.toml"
 

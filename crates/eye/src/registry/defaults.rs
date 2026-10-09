@@ -26,6 +26,11 @@ pub(super) fn register_defaults(r: &mut Registry) -> Result<(), ConfigError> {
             eye_estimate::ir_pupil::IrPupilEstimator::from_config(o, rig)?,
         ))
     })?;
+    r.register_estimator("pccr", |o, rig| {
+        Ok(Box::new(eye_estimate::pccr::PccrEstimator::from_config(
+            o, rig,
+        )?))
+    })?;
     r.register_estimator("landmark", |o, rig| {
         Ok(Box::new(
             eye_estimate::landmark::LandmarkEstimator::from_config(o, rig)?,
@@ -136,7 +141,7 @@ mod tests {
         let registry = Registry::with_defaults();
         assert_eq!(
             registry.names(StageKind::Estimator),
-            vec!["fused", "ir-pupil", "landmark"]
+            vec!["fused", "ir-pupil", "landmark", "pccr"]
         );
         assert_eq!(
             registry.names(StageKind::Filter),
@@ -179,6 +184,49 @@ mod tests {
                 .names(StageKind::Detector)
                 .contains(&"mediapipe-ort")
         );
+    }
+
+    #[test]
+    fn test_every_estimator_name_is_registered() {
+        let registry = Registry::with_defaults();
+        let mut expected = vec![
+            eye_estimate::fused::FusedEstimator::NAME,
+            eye_estimate::ir_pupil::IrPupilEstimator::NAME,
+            eye_estimate::landmark::LandmarkEstimator::NAME,
+            eye_estimate::pccr::PccrEstimator::NAME,
+        ];
+        expected.sort_unstable();
+        assert_eq!(registry.names(StageKind::Estimator), expected);
+    }
+
+    #[test]
+    fn test_pccr_builds_from_empty_options() {
+        let registry = Registry::with_defaults();
+        let rig = nominal_rig();
+        let estimator = registry
+            .estimator(&section("pccr", toml::Table::new()), &rig)
+            .unwrap();
+        assert_eq!(estimator.name(), "pccr");
+    }
+
+    #[test]
+    fn test_pccr_rejects_unknown_option() {
+        let registry = Registry::with_defaults();
+        let rig = nominal_rig();
+        let mut options = toml::Table::new();
+        options.insert("bogus".to_string(), toml::Value::Integer(1));
+
+        let Err(e) = registry.estimator(&section("pccr", options), &rig) else {
+            panic!("must fail")
+        };
+        match &e {
+            ConfigError::Stage { kind, name, .. } => {
+                assert_eq!(*kind, StageKind::Estimator);
+                assert_eq!(name, "pccr");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(e.to_string().contains("bogus"));
     }
 
     #[test]
