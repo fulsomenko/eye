@@ -9,7 +9,8 @@ use nalgebra::{Point2, Vector2};
 use crate::canvas::{Canvas, Rgba};
 use crate::ellipse::{K95, confidence_ellipse, cov_mm_to_logical_px};
 use crate::fade::{FADE_START, fade};
-use crate::scene::{Scene, Schedule};
+use crate::scene::{PresentedAt, Scene, Schedule};
+use crate::stats::PresentStats;
 
 /// Display-rate easing toward the latest sample. `tau` is the time constant of the
 /// exponential approach; `snap_px` ends the animation when the drawn point (and, for the
@@ -113,6 +114,17 @@ pub struct PointScene {
     last_step: Option<Instant>,
     hide: HideRules,
     hidden_offscreen: bool,
+    present: PresentStats,
+    /// `timestamp.as_nanos()` of the latest sample whose first on-target commit has not
+    /// been handed out as a presentation mark yet. A newer sample replaces an unmarked
+    /// older one: the dot never reached it, nothing to measure. `render` takes this (sets
+    /// it to `None`) the moment `drawn` catches up to `target`, so a sample is marked at
+    /// most once even if `render` runs again before `on_presented` arrives.
+    pending_mark: Option<u64>,
+    /// The mark for the current commit, or `None` if this commit carries no mark. Reset
+    /// to `None` at the top of every `render` and set at most once per sample, from
+    /// `pending_mark`, when `drawn` catches up to `target`.
+    mark_ready: Option<u64>,
 }
 
 impl PointScene {
@@ -131,11 +143,19 @@ impl PointScene {
             last_step: None,
             hide: HideRules::default(),
             hidden_offscreen: false,
+            present: PresentStats::default(),
+            pending_mark: None,
+            mark_ready: None,
         }
     }
 
     pub fn with_hide_rules(mut self, hide: HideRules) -> Self {
         self.hide = hide;
+        self
+    }
+
+    pub fn with_present_stats(mut self, stats: PresentStats) -> Self {
+        self.present = stats;
         self
     }
 
@@ -222,6 +242,7 @@ impl Scene for PointScene {
             self.last_step = Some(now);
         }
         self.target = Some(target);
+        self.pending_mark = Some(msg.timestamp.as_nanos());
         self.latest = Some((msg, now));
     }
 
@@ -237,10 +258,15 @@ impl Scene for PointScene {
             .last_step
             .map_or(Duration::ZERO, |t| now.saturating_duration_since(t));
         self.last_step = Some(now);
-        self.ease_toward_target(dt)
+        let before = self.drawn;
+        let moving = self.ease_toward_target(dt);
+        // The settling step snaps `drawn` to `target` and reports `moving == false`;
+        // the surface must still draw this frame to present the settled point.
+        moving || self.drawn != before
     }
 
     fn render(&mut self, canvas: &mut Canvas<'_>, now: Instant) -> Schedule {
+        self.mark_ready = None;
         let Some((p, received)) = &self.latest else {
             return Schedule::Idle;
         };
@@ -278,6 +304,9 @@ impl Scene for PointScene {
         let Some(drawn) = self.drawn else {
             return Schedule::Idle;
         };
+        if self.drawn == self.target {
+            self.mark_ready = self.pending_mark.take();
+        }
         let max_axis = f64::from(w).hypot(f64::from(h));
         if let Some(ellipse) = drawn.ellipse {
             let axes = (
@@ -306,6 +335,26 @@ impl Scene for PointScene {
         } else {
             Schedule::NextFrame
         }
+    }
+
+    fn presentation_mark(&self) -> Option<u64> {
+        self.mark_ready
+    }
+
+    fn on_presented(&mut self, mark: u64, at: PresentedAt, _now: Instant) -> Schedule {
+        let presented = match at {
+            PresentedAt::Presentation(t) | PresentedAt::Commit(t) => t,
+        };
+        if let Some(d) = presented.0.checked_sub(Duration::from_nanos(mark)) {
+            self.present.record(d);
+            tracing::debug!(
+                capture_to_present_us = d.as_micros() as u64,
+                clock = at.clock_name(),
+                { field::TS_NS } = mark,
+                "gaze point presented"
+            );
+        }
+        Schedule::Idle
     }
 }
 
@@ -518,9 +567,15 @@ mod tests {
         });
         scene.last_step = Some(now);
 
-        let moving = scene.step(now + Duration::from_millis(80));
-        assert!(!moving);
+        let redraw = scene.step(now + Duration::from_millis(80));
+        assert!(
+            redraw,
+            "the settling step snaps drawn and must still be drawn"
+        );
         assert_eq!(scene.drawn.unwrap().center, scene.target.unwrap().center);
+
+        let redraw_again = scene.step(now + Duration::from_millis(160));
+        assert!(!redraw_again, "already settled, nothing changed to redraw");
     }
 
     #[test]
@@ -826,6 +881,192 @@ mod tests {
             Value::U64(v) => assert!(v >= 900_000, "age_us = {v}"),
             ref other => panic!("expected U64, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_point_scene_marks_first_on_target_commit() {
+        let (w, h) = (200u32, 100u32);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let now = Instant::now();
+        let mut scene = PointScene::with_easing(
+            Vector2::new(1.0, 1.0),
+            [255, 64, 64],
+            Easing {
+                tau: Duration::from_millis(80),
+                snap_px: 0.5,
+                reset_after: Duration::from_secs(1),
+            },
+        );
+        // The scene teleports to the first sample it ever sees (nothing to ease from),
+        // so settle a baseline point before sending the sample under test.
+        let mut baseline = point_at_xy(now, Point2::new(0.0, 0.0), Matrix2::zeros(), 1.0).0;
+        baseline.timestamp = eye_core::Timestamp::from_nanos(500_000);
+        scene.on_msg(baseline, now);
+        {
+            let mut canvas = Canvas::new(&mut buf, (w, h), 1).expect("size");
+            scene.render(&mut canvas, now);
+        }
+
+        let mut p = point_at_xy(now, Point2::new(100.0, 0.0), Matrix2::zeros(), 1.0).0;
+        p.timestamp = eye_core::Timestamp::from_nanos(1_000_000);
+        scene.on_msg(p, now);
+
+        {
+            let mut canvas = Canvas::new(&mut buf, (w, h), 1).expect("size");
+            scene.render(&mut canvas, now);
+        }
+        assert_eq!(
+            scene.presentation_mark(),
+            None,
+            "still easing toward target, nothing settled yet"
+        );
+
+        // Mirror surface.rs's frame loop: only draw when `step` says this frame changed.
+        let mut redraw = true;
+        let mut t = now;
+        while redraw {
+            t += Duration::from_millis(16);
+            redraw = scene.step(t);
+            if redraw {
+                let mut canvas = Canvas::new(&mut buf, (w, h), 1).expect("size");
+                scene.render(&mut canvas, t);
+            }
+        }
+        assert_eq!(scene.presentation_mark(), Some(1_000_000));
+    }
+
+    #[test]
+    fn test_point_scene_without_easing_marks_first_render() {
+        let mut buf = vec![0u8; 4];
+        let now = Instant::now();
+        let mut scene = PointScene::with_easing(
+            Vector2::new(1.0, 1.0),
+            [255, 64, 64],
+            Easing::from_millis(0),
+        );
+        let mut p = point_at_xy(now, Point2::new(0.0, 0.0), Matrix2::zeros(), 1.0).0;
+        p.timestamp = eye_core::Timestamp::from_nanos(2_000_000);
+        scene.on_msg(p, now);
+
+        let mut canvas = Canvas::new(&mut buf, (1, 1), 1).expect("size");
+        scene.render(&mut canvas, now);
+        assert_eq!(scene.presentation_mark(), Some(2_000_000));
+    }
+
+    #[test]
+    fn test_hidden_render_clears_stale_mark() {
+        let mut buf = vec![0u8; 4];
+        let now = Instant::now();
+        let mut scene = PointScene::with_easing(
+            Vector2::new(1.0, 1.0),
+            [255, 64, 64],
+            Easing::from_millis(0),
+        );
+        let mut a = point_at_xy(now, Point2::new(0.0, 0.0), Matrix2::zeros(), 1.0).0;
+        a.timestamp = eye_core::Timestamp::from_nanos(1_000_000);
+        scene.on_msg(a, now);
+        {
+            let mut canvas = Canvas::new(&mut buf, (1, 1), 1).expect("size");
+            scene.render(&mut canvas, now);
+        }
+        assert_eq!(scene.presentation_mark(), Some(1_000_000));
+
+        let mut b = point_at_xy(now, Point2::new(0.0, 0.0), Matrix2::zeros(), 0.0).0;
+        b.timestamp = eye_core::Timestamp::from_nanos(2_000_000);
+        scene.on_msg(b, now);
+        {
+            let mut canvas = Canvas::new(&mut buf, (1, 1), 1).expect("size");
+            scene.render(&mut canvas, now);
+        }
+        assert_eq!(scene.presentation_mark(), None);
+    }
+
+    #[test]
+    fn test_newer_sample_replaces_unmarked_pending() {
+        let (w, h) = (200u32, 100u32);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let now = Instant::now();
+        let mut scene = PointScene::with_easing(
+            Vector2::new(1.0, 1.0),
+            [255, 64, 64],
+            Easing {
+                tau: Duration::from_millis(80),
+                snap_px: 0.5,
+                reset_after: Duration::from_secs(1),
+            },
+        );
+        let mut p0 = point_at_xy(now, Point2::new(0.0, 0.0), Matrix2::zeros(), 1.0).0;
+        p0.timestamp = eye_core::Timestamp::from_nanos(1_000_000);
+        scene.on_msg(p0, now);
+
+        let mut p1 = point_at_xy(now, Point2::new(50.0, 0.0), Matrix2::zeros(), 1.0).0;
+        p1.timestamp = eye_core::Timestamp::from_nanos(2_000_000);
+        scene.on_msg(p1, now);
+
+        let mut redraw = true;
+        let mut t = now;
+        while redraw {
+            t += Duration::from_millis(16);
+            redraw = scene.step(t);
+            if redraw {
+                let mut canvas = Canvas::new(&mut buf, (w, h), 1).expect("size");
+                scene.render(&mut canvas, t);
+            }
+        }
+        assert_eq!(scene.presentation_mark(), Some(2_000_000));
+    }
+
+    #[test]
+    fn test_settled_rerender_before_presented_does_not_remark() {
+        let mut buf = vec![0u8; 4];
+        let now = Instant::now();
+        let mut scene = PointScene::with_easing(
+            Vector2::new(1.0, 1.0),
+            [255, 64, 64],
+            Easing::from_millis(0),
+        );
+        let mut p = point_at_xy(now, Point2::new(0.0, 0.0), Matrix2::zeros(), 1.0).0;
+        p.timestamp = eye_core::Timestamp::from_nanos(1_000_000);
+        scene.on_msg(p, now);
+
+        let mut canvas = Canvas::new(&mut buf, (1, 1), 1).expect("size");
+        scene.render(&mut canvas, now);
+        assert_eq!(scene.presentation_mark(), Some(1_000_000));
+
+        scene.render(&mut canvas, now);
+        assert_eq!(
+            scene.presentation_mark(),
+            None,
+            "the mark was already handed out; a re-render before on_presented must not hand it out again"
+        );
+    }
+
+    #[test]
+    fn test_point_scene_records_capture_to_present_from_presentation_time() {
+        let mut buf = vec![0u8; 4];
+        let now = Instant::now();
+        let mut scene = PointScene::with_easing(
+            Vector2::new(1.0, 1.0),
+            [255, 64, 64],
+            Easing::from_millis(0),
+        );
+        let mut p = point_at_xy(now, Point2::new(0.0, 0.0), Matrix2::zeros(), 1.0).0;
+        p.timestamp = eye_core::Timestamp::from_nanos(1_000_000);
+        scene.on_msg(p, now);
+
+        let mut canvas = Canvas::new(&mut buf, (1, 1), 1).expect("size");
+        scene.render(&mut canvas, now);
+        let mark = scene.presentation_mark().expect("marked");
+
+        scene.on_presented(
+            mark,
+            PresentedAt::Presentation(eye_core::Timestamp::from_nanos(41_000_000)),
+            now,
+        );
+
+        let summary = scene.present.summary();
+        assert_eq!(summary.count, 1);
+        assert_eq!(summary.p50, Duration::from_millis(40));
     }
 
     #[test]

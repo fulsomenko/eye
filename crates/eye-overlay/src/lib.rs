@@ -10,5 +10,6 @@ pub mod point;
 pub mod region;
 pub mod scene;
 pub mod sink;
+pub mod stats;
 pub mod surface;
 pub mod targets;

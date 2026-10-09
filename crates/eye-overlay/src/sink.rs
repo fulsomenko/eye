@@ -11,6 +11,7 @@ use crate::error::OverlayError;
 use crate::handle::OverlayHandle;
 use crate::point::{Easing, HideRules, PointScene};
 use crate::region::RegionScene;
+use crate::stats::PresentStats;
 use crate::surface::{SurfaceOptions, spawn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +47,7 @@ impl OverlayOptions {
 pub struct LayerShellOverlay {
     handle: OverlayHandle<GazePoint>,
     output: OutputId,
+    present: PresentStats,
 }
 
 impl LayerShellOverlay {
@@ -54,11 +56,13 @@ impl LayerShellOverlay {
             output: Some(options.output.as_str().to_owned()),
             namespace: "eye-overlay",
         };
+        let present = PresentStats::default();
         let handle = match options.mode {
             OverlayMode::Point => spawn(
                 surface,
                 PointScene::with_easing(options.px_per_mm, options.color, options.easing)
-                    .with_hide_rules(options.hide),
+                    .with_hide_rules(options.hide)
+                    .with_present_stats(present.clone()),
             )?,
             OverlayMode::Region { cols, rows } => {
                 let grid = Grid::new(cols, rows).ok_or(OverlayError::InvalidGrid { cols, rows })?;
@@ -87,6 +91,7 @@ impl LayerShellOverlay {
         Ok(Self {
             handle,
             output: options.output,
+            present,
         })
     }
 
@@ -95,9 +100,17 @@ impl LayerShellOverlay {
         self.handle.close()
     }
 
+    pub fn present_stats(&self) -> PresentStats {
+        self.present.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn from_parts(handle: OverlayHandle<GazePoint>, output: OutputId) -> Self {
-        Self { handle, output }
+        Self {
+            handle,
+            output,
+            present: PresentStats::default(),
+        }
     }
 }
 
