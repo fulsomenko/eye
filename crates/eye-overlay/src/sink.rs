@@ -133,6 +133,10 @@ impl GazeSink for LayerShellOverlay {
             .send(point.clone())
             .map_err(|_| SinkError::Closed)
     }
+
+    fn dropped(&self) -> u64 {
+        self.handle.dropped()
+    }
 }
 
 #[cfg(test)]
@@ -226,6 +230,19 @@ mod tests {
             overlay.push(&point_for("eDP-1")),
             Err(SinkError::Closed)
         ));
+    }
+
+    #[test]
+    fn test_overlay_sink_reports_handle_drops() {
+        let (tx, _rx) = calloop::channel::sync_channel::<GazePoint>(2);
+        let mut overlay =
+            LayerShellOverlay::from_parts(OverlayHandle::detached(tx), OutputId::from("eDP-1"));
+        for _ in 0..5 {
+            overlay
+                .push(&point_for("eDP-1"))
+                .expect("full queue is not an error");
+        }
+        assert_eq!(overlay.dropped(), 3);
     }
 
     #[test]

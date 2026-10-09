@@ -76,8 +76,10 @@ impl<M: Send + 'static> OverlayHandle<M> {
 impl<M: Send + 'static> Drop for OverlayHandle<M> {
     fn drop(&mut self) {
         self.tx.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(thread) = self.thread.take()
+            && let Ok(Err(e)) = thread.join()
+        {
+            tracing::warn!(error = %e, "overlay thread ended with an error");
         }
     }
 }

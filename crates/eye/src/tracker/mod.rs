@@ -214,6 +214,7 @@ impl Tracker {
         };
         let cameras = worker.captures.len();
         let sinks = worker.sinks.len();
+        tracker.shared.with_stats(|s| s.counts.sinks = sinks);
         let parent = tracing::Span::current();
         let handle = std::thread::Builder::new()
             .name("eye-pipeline".into())
@@ -532,6 +533,25 @@ mod tests {
         }
         assert_eq!(pushes.load(Ordering::SeqCst), 1);
         assert_eq!(t.stats().sinks, 0);
+    }
+
+    #[test]
+    fn test_tracker_stats_sinks_counted_at_start() {
+        let frames = (0..5u64)
+            .map(|seq| Ok(testkit::frame("ir", seq, seq, Illumination::IrLit)))
+            .collect();
+        let sink = FakeSink {
+            pushes: Arc::new(AtomicUsize::new(0)),
+            fail_on: usize::MAX,
+            dropped: 0,
+        };
+        let t = start(
+            script_source(frames),
+            32,
+            vec![Box::new(sink)],
+            Box::new(FakeDetector::new("fake")),
+        );
+        assert_eq!(t.stats().sinks, 1);
     }
 
     #[test]

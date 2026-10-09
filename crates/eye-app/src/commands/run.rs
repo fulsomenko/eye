@@ -2,12 +2,14 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use eye::config::{OutputConfig, OutputMode};
+use eye::registry::Registry;
 use eye::tracker::{Tracker, TrackerStats};
 use eye_calibration::correction::{UserProfile, rig_fingerprint};
 use eye_calibration::store::ProfileStore;
 use eye_core::stage::GazeCorrection;
-use eye_core::{GazePoint, GazeSink, Rig};
+use eye_core::{GazePoint, Rig};
 use eye_overlay::sink::{LayerShellOverlay, OverlayMode, OverlayOptions};
+use eye_overlay::stats::PresentSummary;
 use eye_platform::EmitterGuard;
 
 use crate::commands::emitter::emitter_guards;
@@ -135,9 +137,15 @@ pub fn select_profile(
     Ok((Some(profile), warnings))
 }
 
-pub fn stats_line(stats: &TrackerStats, window: Duration, points_before: u64) -> String {
+pub fn stats_line(
+    stats: &TrackerStats,
+    present: &PresentSummary,
+    window: Duration,
+    points_before: u64,
+) -> String {
     let points = stats.points_emitted - points_before;
     let frames_dropped: u64 = stats.frames_dropped.values().sum();
+    let sink_drops: u64 = stats.sink_drops.values().sum();
     let secs = window.as_secs_f64();
     let rate = if secs > 0.0 {
         points as f64 / secs
@@ -145,10 +153,11 @@ pub fn stats_line(stats: &TrackerStats, window: Duration, points_before: u64) ->
         0.0
     };
     format!(
-        "{points} points in {secs:.1} s ({rate:.1}/s), latency p50 {p50:.1} ms, p95 {p95:.1} ms, max {max:.1} ms, {frames_dropped} frames dropped",
-        p50 = stats.capture_to_emit.p50.as_secs_f64() * 1000.0,
-        p95 = stats.capture_to_emit.p95.as_secs_f64() * 1000.0,
-        max = stats.capture_to_emit.max.as_secs_f64() * 1000.0,
+        "{points} points in {secs:.1} s ({rate:.1}/s), emit p50 {emit_p50:.1} ms, p95 {emit_p95:.1} ms, present p50 {present_p50:.1} ms, p95 {present_p95:.1} ms, {frames_dropped} frames dropped, {sink_drops} sink drops",
+        emit_p50 = stats.capture_to_emit.p50.as_secs_f64() * 1000.0,
+        emit_p95 = stats.capture_to_emit.p95.as_secs_f64() * 1000.0,
+        present_p50 = present.p50.as_secs_f64() * 1000.0,
+        present_p95 = present.p95.as_secs_f64() * 1000.0,
     )
 }
 
@@ -175,12 +184,18 @@ impl StatsTicker {
     }
 
     /// Restarts the window; returns `stats_line(..)` if `log`.
-    pub fn report(&mut self, stats: &TrackerStats, now: Instant) -> Option<String> {
+    pub fn report(
+        &mut self,
+        stats: &TrackerStats,
+        present: &PresentSummary,
+        now: Instant,
+    ) -> Option<String> {
         let window = now.duration_since(self.last);
         let points_before = self.last_points;
         self.last = now;
         self.last_points = stats.points_emitted;
-        self.log.then(|| stats_line(stats, window, points_before))
+        self.log
+            .then(|| stats_line(stats, present, window, points_before))
     }
 }
 
@@ -193,28 +208,25 @@ pub enum LoopEnd {
 
 pub fn run_loop(
     points: &Receiver<GazePoint>,
-    sink: &mut dyn GazeSink,
     shutdown: &Receiver<()>,
     ticker: &mut StatsTicker,
     stats: &dyn Fn() -> TrackerStats,
+    present: &dyn Fn() -> PresentSummary,
     now: &dyn Fn() -> Instant,
 ) -> LoopEnd {
     loop {
         crossbeam_channel::select! {
             recv(shutdown) -> _ => return LoopEnd::Shutdown,
-            recv(points) -> msg => match msg {
-                Ok(point) => {
-                    if let Err(err) = sink.push(&point) {
-                        return LoopEnd::OverlayClosed(err.to_string());
-                    }
-                }
-                Err(_) => return LoopEnd::TrackerStopped,
-            },
+            recv(points) -> msg => if msg.is_err() { return LoopEnd::TrackerStopped },
             default(Duration::from_millis(100)) => {}
+        }
+        let s = stats();
+        if s.sinks == 0 {
+            return LoopEnd::OverlayClosed("overlay sink removed".into());
         }
         let t = now();
         if ticker.due(t)
-            && let Some(line) = ticker.report(&stats(), t)
+            && let Some(line) = ticker.report(&s, &present(), t)
         {
             tracing::info!("{line}");
         }
@@ -252,26 +264,31 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         margin_px: config.output.hide_margin_px,
         min_confidence: config.output.hide_below_confidence,
     };
-    let mut overlay = LayerShellOverlay::spawn(overlay_options)?;
-    let tracker = Tracker::from_config(&config, rig, correction)?;
+    let overlay = LayerShellOverlay::spawn(overlay_options)?;
+    let present = overlay.present_stats();
+    let tracker = Tracker::from_config_with(
+        &Registry::with_defaults(),
+        &config,
+        rig,
+        correction,
+        vec![Box::new(overlay)],
+    )?;
     let points = tracker.subscribe();
     let mut ticker = StatsTicker::new(args.stats, Duration::from_secs(5), Instant::now());
     let end = run_loop(
         &points,
-        &mut overlay,
         &shutdown,
         &mut ticker,
         &|| tracker.stats(),
+        &|| present.summary(),
         &Instant::now,
     );
     drop(points);
     let tracker_result = tracker.shutdown();
-    let overlay_result = overlay.shutdown();
     drop(guards);
     match end {
         LoopEnd::Shutdown => {
             tracker_result?;
-            overlay_result?;
             Ok(())
         }
         LoopEnd::TrackerStopped => match tracker_result {
@@ -287,50 +304,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use eye_bench::testing::synthetic_rig;
-    use eye_core::{OutputId, SinkError, Timestamp};
-    use nalgebra::{Matrix2, Point2};
 
     use super::*;
-
-    struct FakeSink {
-        points: Vec<GazePoint>,
-        closed: bool,
-    }
-
-    impl FakeSink {
-        fn new(closed: bool) -> Self {
-            Self {
-                points: Vec::new(),
-                closed,
-            }
-        }
-    }
-
-    impl GazeSink for FakeSink {
-        fn name(&self) -> &'static str {
-            "fake"
-        }
-
-        fn push(&mut self, point: &GazePoint) -> Result<(), SinkError> {
-            if self.closed {
-                return Err(SinkError::Closed);
-            }
-            self.points.push(point.clone());
-            Ok(())
-        }
-    }
-
-    fn point(ts_ms: u64) -> GazePoint {
-        GazePoint {
-            timestamp: Timestamp::from_nanos(ts_ms * 1_000_000),
-            output: OutputId::from("eDP-1"),
-            mm: Point2::new(0.0, 0.0),
-            px_physical: Point2::new(0.0, 0.0),
-            px_logical: Point2::new(0.0, 0.0),
-            cov_mm: Matrix2::identity(),
-            confidence: 1.0,
-        }
-    }
 
     #[test]
     fn test_parse_grid_accepts_cols_x_rows() {
@@ -480,34 +455,71 @@ mod tests {
     }
 
     #[test]
-    fn test_run_loop_forwards_points_until_tracker_stops() {
-        let (points_tx, points_rx) = crossbeam_channel::unbounded();
-        let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
-        points_tx.send(point(1)).unwrap();
-        points_tx.send(point(2)).unwrap();
-        points_tx.send(point(3)).unwrap();
-        drop(points_tx);
+    fn test_run_loop_does_not_end_before_first_point_with_one_sink() {
+        let (_points_tx, points_rx) = crossbeam_channel::unbounded();
+        let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            shutdown_tx.send(()).unwrap();
+        });
 
-        let mut sink = FakeSink::new(false);
         let mut ticker = StatsTicker::new(false, Duration::from_secs(5), Instant::now());
         let end = run_loop(
             &points_rx,
-            &mut sink,
+            &shutdown_rx,
+            &mut ticker,
+            &|| TrackerStats {
+                sinks: 1,
+                ..Default::default()
+            },
+            &PresentSummary::default,
+            &Instant::now,
+        );
+
+        assert_eq!(end, LoopEnd::Shutdown);
+    }
+
+    #[test]
+    fn test_run_loop_ends_when_sinks_reach_zero() {
+        let (_points_tx, points_rx) = crossbeam_channel::unbounded();
+        let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+
+        let mut ticker = StatsTicker::new(false, Duration::from_secs(5), Instant::now());
+        let end = run_loop(
+            &points_rx,
             &shutdown_rx,
             &mut ticker,
             &TrackerStats::default,
+            &PresentSummary::default,
+            &Instant::now,
+        );
+
+        assert_eq!(
+            end,
+            LoopEnd::OverlayClosed("overlay sink removed".to_string())
+        );
+    }
+
+    #[test]
+    fn test_run_loop_tracker_stopped_when_signal_closes() {
+        let (points_tx, points_rx) = crossbeam_channel::unbounded::<GazePoint>();
+        drop(points_tx);
+        let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+
+        let mut ticker = StatsTicker::new(false, Duration::from_secs(5), Instant::now());
+        let end = run_loop(
+            &points_rx,
+            &shutdown_rx,
+            &mut ticker,
+            &|| TrackerStats {
+                sinks: 1,
+                ..Default::default()
+            },
+            &PresentSummary::default,
             &Instant::now,
         );
 
         assert_eq!(end, LoopEnd::TrackerStopped);
-        assert_eq!(
-            sink.points.iter().map(|p| p.timestamp).collect::<Vec<_>>(),
-            vec![
-                Timestamp::from_nanos(1_000_000),
-                Timestamp::from_nanos(2_000_000),
-                Timestamp::from_nanos(3_000_000),
-            ]
-        );
     }
 
     #[test]
@@ -516,51 +528,37 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
         shutdown_tx.send(()).unwrap();
 
-        let mut sink = FakeSink::new(false);
         let mut ticker = StatsTicker::new(false, Duration::from_secs(5), Instant::now());
         let end = run_loop(
             &points_rx,
-            &mut sink,
             &shutdown_rx,
             &mut ticker,
             &TrackerStats::default,
+            &PresentSummary::default,
             &Instant::now,
         );
 
         assert_eq!(end, LoopEnd::Shutdown);
-        assert!(sink.points.is_empty());
-    }
-
-    #[test]
-    fn test_run_loop_overlay_closed_ends_loop() {
-        let (points_tx, points_rx) = crossbeam_channel::unbounded();
-        let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
-        points_tx.send(point(1)).unwrap();
-
-        let mut sink = FakeSink::new(true);
-        let mut ticker = StatsTicker::new(false, Duration::from_secs(5), Instant::now());
-        let end = run_loop(
-            &points_rx,
-            &mut sink,
-            &shutdown_rx,
-            &mut ticker,
-            &TrackerStats::default,
-            &Instant::now,
-        );
-
-        assert_eq!(end, LoopEnd::OverlayClosed(SinkError::Closed.to_string()));
     }
 
     #[test]
     fn test_stats_ticker_logs_only_with_flag() {
         let t0 = Instant::now();
         let stats = TrackerStats::default();
+        let present = PresentSummary::default();
 
         let mut ticker = StatsTicker::new(false, Duration::from_secs(5), t0);
-        assert_eq!(ticker.report(&stats, t0 + Duration::from_secs(6)), None);
+        assert_eq!(
+            ticker.report(&stats, &present, t0 + Duration::from_secs(6)),
+            None
+        );
 
         let mut ticker = StatsTicker::new(true, Duration::from_secs(5), t0);
-        assert!(ticker.report(&stats, t0 + Duration::from_secs(6)).is_some());
+        assert!(
+            ticker
+                .report(&stats, &present, t0 + Duration::from_secs(6))
+                .is_some()
+        );
 
         let ticker = StatsTicker::new(true, Duration::from_secs(5), t0);
         assert!(!ticker.due(t0 + Duration::from_secs(4)));
@@ -568,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stats_line_format() {
+    fn test_stats_line_includes_present_latency_and_sink_drops() {
         let stats = TrackerStats {
             points_emitted: 242,
             capture_to_emit: eye::tracker::LatencySummary {
@@ -577,12 +575,19 @@ mod tests {
                 p95: Duration::from_millis(44),
                 max: Duration::from_millis(61),
             },
+            sink_drops: BTreeMap::from([("layer-shell", 3)]),
             ..Default::default()
         };
-        let line = stats_line(&stats, Duration::from_secs(5), 100);
+        let present = PresentSummary {
+            count: 142,
+            p50: Duration::from_millis(48),
+            p95: Duration::from_millis(61),
+            max: Duration::from_millis(80),
+        };
+        let line = stats_line(&stats, &present, Duration::from_secs(5), 100);
         assert_eq!(
             line,
-            "142 points in 5.0 s (28.4/s), latency p50 31.0 ms, p95 44.0 ms, max 61.0 ms, 0 frames dropped"
+            "142 points in 5.0 s (28.4/s), emit p50 31.0 ms, p95 44.0 ms, present p50 48.0 ms, p95 61.0 ms, 0 frames dropped, 3 sink drops"
         );
 
         let mut stats = stats;
@@ -590,7 +595,7 @@ mod tests {
             (eye_core::CameraId::from("ir"), 3),
             (eye_core::CameraId::from("rgb"), 2),
         ]);
-        let line = stats_line(&stats, Duration::from_secs(5), 100);
-        assert!(line.ends_with("5 frames dropped"));
+        let line = stats_line(&stats, &present, Duration::from_secs(5), 100);
+        assert!(line.ends_with("5 frames dropped, 3 sink drops"));
     }
 }
