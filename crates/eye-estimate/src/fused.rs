@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use eye_core::log::field;
 use eye_core::observation::{SCHEME_IR_PUPIL_PAIR, SCHEME_MEDIAPIPE_478};
 use eye_core::stage::{GazeEstimator, StageError};
 use eye_core::{
@@ -20,6 +21,7 @@ use serde::Deserialize;
 use crate::EstimateError;
 use crate::ir_pupil::{IrPupilEstimator, IrPupilOptions};
 use crate::landmark::{LandmarkEstimator, LandmarkEye, LandmarkFrame, LandmarkOptions};
+use crate::log::{side_str, trace_ray};
 use crate::options::parse_options;
 use crate::pccr::{PccrEstimator, PccrOptions};
 
@@ -80,6 +82,31 @@ pub enum FusedSource {
     InverseCovariance,
     RgbOnly,
     IrOnly,
+}
+
+impl FusedSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stereo => "stereo",
+            Self::IrOnRgbEyeball => "ir-on-rgb-eyeball",
+            Self::InverseCovariance => "inverse-covariance",
+            Self::RgbOnly => "rgb-only",
+            Self::IrOnly => "ir-only",
+        }
+    }
+}
+
+/// `fuse_inverse_covariance` with the singular case logged.
+fn fuse_or_log(side: Side, rgb: &GazeRay, ir: &GazeRay) -> Option<GazeRay> {
+    let fused = fuse_inverse_covariance(rgb, ir);
+    if fused.is_none() {
+        tracing::debug!(
+            { field::REASON } = "singular_cov",
+            side = side_str(side),
+            "fusion skipped"
+        );
+    }
+    fused
 }
 
 #[derive(Debug)]
@@ -190,9 +217,11 @@ impl FusedEstimator {
                 };
 
                 if let Some((x_ray, source)) = self.cross_chain(eye, &frame, aligned_obs, rig)? {
+                    trace_ray(source.as_str(), &x_ray);
                     out.push((side, source, x_ray));
                 }
-                if let Some(fused) = fuse_inverse_covariance(&eye.ray, i_ray) {
+                if let Some(fused) = fuse_or_log(side, &eye.ray, i_ray) {
+                    trace_ray(FusedSource::InverseCovariance.as_str(), &fused);
                     out.push((side, FusedSource::InverseCovariance, fused));
                 }
             }
@@ -216,23 +245,53 @@ impl FusedEstimator {
             .iter()
             .filter(|o| o.timestamp >= t)
             .min_by_key(|o| o.timestamp);
-        if let (Some(prev), Some(next)) = (prev, next) {
-            let bracket_ms = next.timestamp.nanos_since(prev.timestamp) as f64 / 1e6;
-            if bracket_ms <= self.options.max_bracket_ms
-                && let Some(interpolated) = interpolate_ir(prev, next, t)
-            {
-                return Some(interpolated);
+        let bracket_ms = match (prev, next) {
+            (Some(prev), Some(next)) => {
+                let bracket_ms = next.timestamp.nanos_since(prev.timestamp) as f64 / 1e6;
+                if bracket_ms <= self.options.max_bracket_ms
+                    && let Some(interpolated) = interpolate_ir(prev, next, t)
+                {
+                    let offset_ms = t.nanos_since(prev.timestamp) as f64 / 1e6;
+                    tracing::debug!(
+                        { field::REASON } = "bracket",
+                        bracket_ms,
+                        offset_ms,
+                        "ir aligned"
+                    );
+                    return Some(interpolated);
+                }
+                Some(bracket_ms)
+            }
+            _ => None,
+        };
+
+        let nearest = ir_pairs
+            .iter()
+            .min_by_key(|o| o.timestamp.nanos_since(t).unsigned_abs());
+        let nearest_skew_ms =
+            nearest.map(|o| o.timestamp.nanos_since(t).unsigned_abs() as f64 / 1e6);
+        match (nearest, nearest_skew_ms) {
+            (Some(o), Some(skew_ms)) if skew_ms <= self.options.max_skew_ms => {
+                tracing::debug!(
+                    { field::REASON } = "nearest",
+                    skew_ms,
+                    bracket_ms,
+                    "ir aligned"
+                );
+                Some(o.clone())
+            }
+            _ => {
+                tracing::debug!(
+                    { field::REASON } = "none",
+                    bracket_ms,
+                    nearest_skew_ms,
+                    max_bracket_ms = self.options.max_bracket_ms,
+                    max_skew_ms = self.options.max_skew_ms,
+                    "ir not aligned"
+                );
+                None
             }
         }
-
-        ir_pairs
-            .iter()
-            .min_by_key(|o| o.timestamp.nanos_since(t).unsigned_abs())
-            .filter(|o| {
-                let skew_ms = o.timestamp.nanos_since(t).unsigned_abs() as f64 / 1e6;
-                skew_ms <= self.options.max_skew_ms
-            })
-            .cloned()
     }
 
     fn eye_params(&self) -> EyeParams {
@@ -265,6 +324,11 @@ impl FusedEstimator {
             .and_then(|e| e.pupil)
             .map(|m| m.map(|ellipse| ellipse.center()))
         else {
+            tracing::debug!(
+                { field::REASON } = "no_ir_pupil",
+                side = side_str(side),
+                "cross chain skipped"
+            );
             return Ok(None);
         };
         let ir_cam = rig
@@ -275,20 +339,35 @@ impl FusedEstimator {
             .ok_or_else(|| EstimateError::UnknownCamera(frame.camera.to_string()))?;
         let params = self.eye_params();
 
-        if self.options.stereo
-            && let Ok(t) = triangulate(
-                &View {
+        if self.options.stereo {
+            let views = (
+                View {
                     camera: rgb_cam,
                     pixel: eye.iris_px,
                 },
-                &View {
+                View {
                     camera: ir_cam,
                     pixel: pupil_px,
                 },
-            )
-            && let Some(ray) = stereo_ray(side, &t, eye, &params, &frame.viewer, rgb_cam)
-        {
-            return Ok(Some((ray, FusedSource::Stereo)));
+            );
+            match triangulate(&views.0, &views.1) {
+                Err(e) => tracing::debug!(
+                    { field::REASON } = "triangulate_failed",
+                    side = side_str(side),
+                    error = %e,
+                    "stereo failed"
+                ),
+                Ok(t) => match stereo_ray(side, &t, eye, &params, &frame.viewer, rgb_cam) {
+                    Some(ray) => return Ok(Some((ray, FusedSource::Stereo))),
+                    None => tracing::debug!(
+                        { field::REASON } = "stereo_no_root",
+                        side = side_str(side),
+                        rms_px = t.rms_px,
+                        parallax_rad = t.parallax_rad,
+                        "stereo failed"
+                    ),
+                },
+            }
         }
 
         let ray = gaze_ray(side, &eye.centre, ir_cam, &pupil_px, &params, &frame.viewer)?;
@@ -302,8 +381,11 @@ impl FusedEstimator {
         rig: &Rig,
     ) -> Result<Vec<(FusedSource, GazeRay)>, EstimateError> {
         let candidates = self.candidates(obs, rig)?;
+        let observations = obs.len() as u64;
+        let mut counts: HashMap<Side, u64> = HashMap::new();
         let mut best: HashMap<Side, (FusedSource, GazeRay, f64)> = HashMap::new();
         for (side, source, ray) in candidates {
+            *counts.entry(side).or_default() += 1;
             let det = ray.angular_cov.determinant();
             let replace = match best.get(&side) {
                 None => true,
@@ -313,10 +395,23 @@ impl FusedEstimator {
                 best.insert(side, (source, ray, det));
             }
         }
+        if best.is_empty() {
+            tracing::debug!(
+                { field::REASON } = "no_candidates",
+                observations,
+                "no fused ray"
+            );
+        }
         let mut out: Vec<(FusedSource, GazeRay)> = best
             .into_iter()
-            .map(|(side, (source, ray, _))| {
-                tracing::debug!(?side, source = ?source, "fused ray");
+            .map(|(side, (source, ray, det))| {
+                tracing::debug!(
+                    side = side_str(side),
+                    source = source.as_str(),
+                    angular_cov_det = det,
+                    candidates = counts[&side],
+                    "fused ray selected"
+                );
                 (source, ray)
             })
             .collect();
@@ -496,6 +591,8 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use eye_core::{CameraId, Measured};
     use eye_geometry::eyeball::EyeParams;
+    use eye_log::testing::capture_logs;
+    use eye_log::{Level, Value};
     use nalgebra::{Isometry3, Matrix2, Point2, Translation3, Vector2, Vector3};
     use proptest::prelude::*;
 
@@ -1307,5 +1404,276 @@ mod tests {
             FusedEstimator::from_config(&bad_nested, &rig),
             Err(StageError::Config(_))
         ));
+    }
+
+    #[test]
+    fn test_logs_ir_aligned_at_debug() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+
+        let with_pupil_sigma = |mut obs: Observations| -> Observations {
+            for eye in obs.face.as_mut().expect("face present").eyes.iter_mut() {
+                eye.pupil = eye
+                    .pupil
+                    .map(|m| Measured::new(m.into_value(), 0.2).expect("valid sigma"));
+            }
+            obs
+        };
+
+        let mut ir0 = with_pupil_sigma(synthetic_ir_observation_at(&rig, centres, target, 0.0, 1));
+        ir0.timestamp = Timestamp::from_nanos(0);
+        let mut ir136 =
+            with_pupil_sigma(synthetic_ir_observation_at(&rig, centres, target, 0.0, 2));
+        ir136.timestamp = Timestamp::from_nanos(136_000_000);
+        let rgb_timestamp = Timestamp::from_nanos(68_000_000);
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        estimator.candidates(&[ir0], &rig).expect("call 1 succeeds");
+
+        let (_, logs) = capture_logs(tracing::Level::DEBUG, || {
+            estimator.aligned_ir(std::slice::from_ref(&ir136), rgb_timestamp)
+        });
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "ir aligned")
+            .expect("ir aligned record present");
+        assert_eq!(rec.level, Level::Debug);
+        assert_eq!(rec.fields[field::REASON], Value::Str("bracket".into()));
+        assert_eq!(rec.fields["bracket_ms"], Value::F64(136.0));
+        assert_eq!(rec.fields["offset_ms"], Value::F64(68.0));
+
+        let mut ir_single =
+            with_pupil_sigma(synthetic_ir_observation_at(&rig, centres, target, 0.0, 1));
+        ir_single.timestamp = Timestamp::from_nanos(30_000_000);
+
+        let tight = FusedEstimator::new(FusedOptions {
+            max_skew_ms: 20.0,
+            ..fused_options_no_kappa()
+        });
+        let (_, logs_tight) = capture_logs(tracing::Level::DEBUG, || {
+            tight.aligned_ir(std::slice::from_ref(&ir_single), Timestamp::from_nanos(0))
+        });
+        let rec_tight = logs_tight
+            .iter()
+            .find(|r| r.message == "ir not aligned")
+            .expect("ir not aligned record present");
+        assert_eq!(rec_tight.level, Level::Debug);
+        assert_eq!(rec_tight.fields[field::REASON], Value::Str("none".into()));
+        assert_eq!(rec_tight.fields["nearest_skew_ms"], Value::F64(30.0));
+        assert_eq!(rec_tight.fields["max_skew_ms"], Value::F64(20.0));
+        assert!(!rec_tight.fields.contains_key("bracket_ms"));
+
+        let wide = FusedEstimator::new(FusedOptions {
+            max_skew_ms: 40.0,
+            ..fused_options_no_kappa()
+        });
+        let (_, logs_wide) = capture_logs(tracing::Level::DEBUG, || {
+            wide.aligned_ir(std::slice::from_ref(&ir_single), Timestamp::from_nanos(0))
+        });
+        let rec_wide = logs_wide
+            .iter()
+            .find(|r| r.message == "ir aligned")
+            .expect("ir aligned record present");
+        assert_eq!(rec_wide.level, Level::Debug);
+        assert_eq!(rec_wide.fields[field::REASON], Value::Str("nearest".into()));
+        assert_eq!(rec_wide.fields["skew_ms"], Value::F64(30.0));
+    }
+
+    #[test]
+    fn test_logs_fused_ray_selected_at_debug() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+
+        let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 1.0, 3);
+        let mut ir = synthetic_ir_observation_at(&rig, centres, target, 0.2, 3);
+        ir.timestamp = rgb.timestamp;
+
+        let mut reference = FusedEstimator::new(fused_options_no_kappa());
+        let candidates = reference
+            .candidates(&[rgb.clone(), ir.clone()], &rig)
+            .expect("estimate succeeds");
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        let (_, logs) = capture_logs(tracing::Level::DEBUG, || {
+            estimator
+                .estimate_detailed(&[rgb, ir], &rig)
+                .expect("estimate succeeds")
+        });
+
+        let recs: Vec<_> = logs
+            .iter()
+            .filter(|r| r.message == "fused ray selected")
+            .collect();
+        assert_eq!(recs.len(), 2);
+        for rec in recs {
+            assert_eq!(rec.level, Level::Debug);
+            let side = match &rec.fields["side"] {
+                Value::Str(s) if s == "right" => Side::Right,
+                Value::Str(s) if s == "left" => Side::Left,
+                other => panic!("unexpected side {other:?}"),
+            };
+            assert_eq!(rec.fields["candidates"], Value::U64(4));
+            let best = candidates
+                .iter()
+                .filter(|(s, _, _)| *s == side)
+                .min_by(|(_, _, a), (_, _, b)| {
+                    a.angular_cov
+                        .determinant()
+                        .total_cmp(&b.angular_cov.determinant())
+                })
+                .expect("at least one candidate");
+            assert_eq!(rec.fields["source"], Value::Str(best.1.as_str().into()));
+            match rec.fields["angular_cov_det"] {
+                Value::F64(d) => {
+                    assert_abs_diff_eq!(d, best.2.angular_cov.determinant(), epsilon = 1e-18)
+                }
+                ref other => panic!("expected F64, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_logs_fused_candidates_at_trace() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+
+        let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 1.0, 3);
+        let mut ir = synthetic_ir_observation_at(&rig, centres, target, 0.2, 3);
+        ir.timestamp = rgb.timestamp;
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        let (_, logs) = capture_logs(tracing::Level::TRACE, || {
+            estimator
+                .candidates(&[rgb, ir], &rig)
+                .expect("estimate succeeds")
+        });
+
+        let gaze_rays: Vec<_> = logs.iter().filter(|r| r.message == "gaze ray").collect();
+        for rec in &gaze_rays {
+            assert_eq!(rec.level, Level::Trace);
+        }
+        let count_source = |s: &str| {
+            gaze_rays
+                .iter()
+                .filter(|r| r.fields["source"] == Value::Str(s.into()))
+                .count()
+        };
+        assert_eq!(count_source("stereo"), 2);
+        assert_eq!(count_source("inverse-covariance"), 2);
+        assert_eq!(count_source("ir-pupil"), 2);
+        assert_eq!(count_source("landmark"), 2);
+        assert_eq!(count_source("rgb-only"), 0);
+        assert_eq!(count_source("ir-only"), 0);
+
+        let aligned = logs
+            .iter()
+            .find(|r| r.message == "ir aligned")
+            .expect("ir aligned record present");
+        assert_eq!(aligned.level, Level::Debug);
+        assert_eq!(aligned.fields[field::REASON], Value::Str("nearest".into()));
+        assert_eq!(aligned.fields["skew_ms"], Value::F64(0.0));
+        assert_eq!(aligned.fields["bracket_ms"], Value::F64(0.0));
+    }
+
+    #[test]
+    fn test_logs_no_candidates_at_debug() {
+        let rig = test_rig();
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        let (_, logs) = capture_logs(tracing::Level::DEBUG, || {
+            estimator
+                .estimate_detailed(&[], &rig)
+                .expect("estimate succeeds")
+        });
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "no fused ray")
+            .expect("no fused ray record present");
+        assert_eq!(rec.level, Level::Debug);
+        assert_eq!(
+            rec.fields[field::REASON],
+            Value::Str("no_candidates".into())
+        );
+        assert_eq!(rec.fields["observations"], Value::U64(0));
+        let keys: Vec<&String> = rec.fields.keys().collect();
+        assert_eq!(keys, vec!["observations", field::REASON]);
+    }
+
+    #[test]
+    fn test_logs_fusion_skipped_at_debug() {
+        let a = yaw_pitch_ray(0.0, 0.0, Matrix2::identity());
+        let b = yaw_pitch_ray(1.0, 0.0, Matrix2::zeros());
+
+        let (fused, logs) =
+            capture_logs(tracing::Level::DEBUG, || fuse_or_log(Side::Right, &a, &b));
+
+        assert!(fused.is_none());
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "fusion skipped")
+            .expect("fusion skipped record present");
+        assert_eq!(rec.level, Level::Debug);
+        assert_eq!(rec.fields[field::REASON], Value::Str("singular_cov".into()));
+        assert_eq!(rec.fields["side"], Value::Str("right".into()));
+    }
+
+    #[test]
+    fn test_logs_stereo_failed_at_debug() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+
+        let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 1.0, 3);
+        let mut ir = synthetic_ir_observation_at(&rig, centres, target, 0.0, 3);
+        ir.timestamp = rgb.timestamp;
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        let (candidates, logs) = capture_logs(tracing::Level::TRACE, || {
+            estimator
+                .candidates(&[rgb, ir], &rig)
+                .expect("estimate succeeds")
+        });
+
+        let stereo_failed: Vec<_> = logs
+            .iter()
+            .filter(|r| r.message == "stereo failed")
+            .collect();
+        assert_eq!(stereo_failed.len(), 2);
+        for rec in &stereo_failed {
+            assert_eq!(rec.level, Level::Debug);
+            assert_eq!(
+                rec.fields[field::REASON],
+                Value::Str("triangulate_failed".into())
+            );
+            match &rec.fields["error"] {
+                Value::Str(s) => assert!(s.contains("zero sigma"), "error message: {s}"),
+                other => panic!("expected Str, got {other:?}"),
+            }
+        }
+        assert!(
+            !candidates
+                .iter()
+                .any(|(_, src, _)| *src == FusedSource::Stereo)
+        );
+
+        let gaze_rays: Vec<_> = logs.iter().filter(|r| r.message == "gaze ray").collect();
+        for rec in &gaze_rays {
+            assert_eq!(rec.level, Level::Trace);
+        }
+        let ir_on_rgb = gaze_rays
+            .iter()
+            .filter(|r| r.fields["source"] == Value::Str("ir-on-rgb-eyeball".into()))
+            .count();
+        assert_eq!(ir_on_rgb, 2);
     }
 }
