@@ -15,7 +15,7 @@ use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
 use eye_geometry::eyeball::{EyeParams, Kappa, gaze_ray, optical_axis, visual_axis};
 use eye_geometry::triangulation::{Triangulated, View, triangulate};
 use eye_geometry::uncertainty::{block_diag, propagate_fn};
-use nalgebra::{Matrix3, Point3, Unit, UnitQuaternion, Vector3, Vector6};
+use nalgebra::{Matrix3, Point3, Unit, UnitQuaternion, Vector2, Vector3, Vector6};
 use serde::Deserialize;
 
 use crate::EstimateError;
@@ -44,6 +44,13 @@ pub struct FusedOptions {
     pub stereo: bool,
     pub landmark: LandmarkOptions,
     pub ir_pupil: IrPupilOptions,
+    /// Mahalanobis distance squared above which a candidate is rejected against the reference
+    /// (chi-square with 2 degrees of freedom; 9.21 is the 0.99 quantile).
+    pub gate_chi2: f64,
+    /// EMA weight of the per-source bias and variance tracker.
+    pub bias_alpha: f64,
+    /// Frames a source must be observed against the reference before its bias is subtracted.
+    pub bias_warmup: u32,
 }
 
 impl Default for FusedOptions {
@@ -55,6 +62,9 @@ impl Default for FusedOptions {
             stereo: true,
             landmark: LandmarkOptions::default(),
             ir_pupil: IrPupilOptions::default(),
+            gate_chi2: 9.21,
+            bias_alpha: 0.05,
+            bias_warmup: 10,
         }
     }
 }
@@ -75,7 +85,7 @@ impl IrChain {
 }
 
 /// Which candidate produced an output ray (logged at debug level).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FusedSource {
     Stereo,
     IrOnRgbEyeball,
@@ -93,6 +103,83 @@ impl FusedSource {
             Self::RgbOnly => "rgb-only",
             Self::IrOnly => "ir-only",
         }
+    }
+
+    /// `Relative`: the ray's origin is a declared anchor, not a measurement (ir-pupil). Such a
+    /// source is never selected over an `Absolute` reference unless it passed the gate; in a
+    /// batch with no reference (IR-only) it is selected unchecked, see
+    /// `GateDecision::mahalanobis2 == None`. Documentation-only API: `estimate_detailed` keys on
+    /// `source == RgbOnly`, not on this method.
+    pub fn reference_kind(self) -> ReferenceKind {
+        match self {
+            Self::IrOnly => ReferenceKind::Relative,
+            _ => ReferenceKind::Absolute,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceKind {
+    Absolute,
+    Relative,
+}
+
+/// The outcome of gating one candidate against the side's reference ray.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GateDecision {
+    pub side: Side,
+    pub source: FusedSource,
+    /// `None` when no reference existed for the side (IR-only batch).
+    pub mahalanobis2: Option<f64>,
+    pub accepted: bool,
+    /// Bias subtracted before gating, (yaw, pitch) rad; zero before warm-up.
+    pub bias_rad: Vector2<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BiasState {
+    mean: Vector2<f64>,
+    var: Vector2<f64>,
+    n: u32,
+}
+
+impl BiasState {
+    /// First observation seeds the state (`mean = residual`, `var = 0`); afterwards an EMA of
+    /// the residual and of its squared deviation from the current mean.
+    fn update(&mut self, residual: Vector2<f64>, alpha: f64) {
+        if self.n == 0 {
+            self.mean = residual;
+            self.var = Vector2::zeros();
+        } else {
+            let d = residual - self.mean;
+            self.mean += alpha * d;
+            self.var += alpha * (d.component_mul(&d) - self.var);
+        }
+        self.n += 1;
+    }
+}
+
+/// `d^2 = delta^T (Sigma_c + Sigma_r)^-1 delta` over (yaw, pitch); `None` if the sum is
+/// singular.
+pub fn mahalanobis2(candidate: &GazeRay, reference: &GazeRay) -> Option<f64> {
+    let delta = yaw_pitch_from_direction(&candidate.direction)
+        - yaw_pitch_from_direction(&reference.direction);
+    let cov = candidate.angular_cov + reference.angular_cov;
+    let inv = cov.try_inverse()?;
+    Some((delta.transpose() * inv * delta).x)
+}
+
+/// The ray with `bias` subtracted in (yaw, pitch) and `var` added to the diagonal of
+/// `angular_cov`.
+fn debias(ray: &GazeRay, state: &BiasState) -> GazeRay {
+    let angles = yaw_pitch_from_direction(&ray.direction) - state.mean;
+    let mut angular_cov = ray.angular_cov;
+    angular_cov[(0, 0)] += state.var.x;
+    angular_cov[(1, 1)] += state.var.y;
+    GazeRay {
+        direction: direction_from_yaw_pitch(&angles),
+        angular_cov,
+        ..ray.clone()
     }
 }
 
@@ -120,6 +207,8 @@ pub struct FusedEstimator {
     /// Most recent landmark head pose and its frame time, lent to IR-only batches within
     /// `max_bracket_ms`.
     last_viewer: Option<(Timestamp, UnitQuaternion<f64>)>,
+    bias: HashMap<(FusedSource, Side), BiasState>,
+    decisions: Vec<GateDecision>,
 }
 
 impl FusedEstimator {
@@ -140,12 +229,21 @@ impl FusedEstimator {
             ir,
             prev_ir: None,
             last_viewer: None,
+            bias: HashMap::new(),
+            decisions: Vec::new(),
             options,
         }
     }
 
     pub fn from_config(table: &toml::Table, _rig: &eye_core::Rig) -> Result<Self, StageError> {
         Ok(Self::new(parse_options(Self::NAME, table)?))
+    }
+
+    /// Gate decisions of the last `estimate_detailed` call, grouped per side in the order each
+    /// side was first seen among the candidates; within a side, in candidate order, with the
+    /// recomputed `InverseCovariance` entry (when present) last.
+    pub fn decisions(&self) -> &[GateDecision] {
+        &self.decisions
     }
 
     /// Every candidate per side, before selection (tests and the bench's debug output use it).
@@ -443,17 +541,32 @@ impl FusedEstimator {
     ) -> Result<Vec<(FusedSource, GazeRay)>, EstimateError> {
         let candidates = self.candidates(obs, rig)?;
         let observations = obs.len() as u64;
+
         let mut counts: HashMap<Side, u64> = HashMap::new();
-        let mut best: HashMap<Side, (FusedSource, GazeRay, f64)> = HashMap::new();
+        let mut side_order: Vec<Side> = Vec::new();
+        let mut by_side: HashMap<Side, Vec<(FusedSource, GazeRay)>> = HashMap::new();
         for (side, source, ray) in candidates {
             *counts.entry(side).or_default() += 1;
-            let det = ray.angular_cov.determinant();
-            let replace = match best.get(&side) {
-                None => true,
-                Some((_, _, d)) => det.total_cmp(d).is_lt(),
-            };
-            if replace {
-                best.insert(side, (source, ray, det));
+            if !by_side.contains_key(&side) {
+                side_order.push(side);
+            }
+            by_side.entry(side).or_default().push((source, ray));
+        }
+
+        self.decisions.clear();
+        let mut best: HashMap<Side, (FusedSource, GazeRay, f64)> = HashMap::new();
+        for side in side_order {
+            let raw = by_side.remove(&side).unwrap_or_default();
+            let eligible = self.gate_side(side, raw);
+            for (source, ray) in eligible {
+                let det = ray.angular_cov.determinant();
+                let replace = match best.get(&side) {
+                    None => true,
+                    Some((_, _, d)) => det.total_cmp(d).is_lt(),
+                };
+                if replace {
+                    best.insert(side, (source, ray, det));
+                }
             }
         }
         if best.is_empty() {
@@ -463,6 +576,26 @@ impl FusedEstimator {
                 "no fused ray"
             );
         }
+        for decision in &self.decisions {
+            tracing::debug!(
+                side = side_str(decision.side),
+                source = decision.source.as_str(),
+                mahalanobis2 = decision.mahalanobis2,
+                accepted = decision.accepted,
+                bias_yaw_rad = decision.bias_rad.x,
+                bias_pitch_rad = decision.bias_rad.y,
+                "fused candidate gated"
+            );
+        }
+        let gated_out: HashMap<Side, u64> = {
+            let mut m: HashMap<Side, u64> = HashMap::new();
+            for decision in &self.decisions {
+                if !decision.accepted {
+                    *m.entry(decision.side).or_default() += 1;
+                }
+            }
+            m
+        };
         let mut out: Vec<(FusedSource, GazeRay)> = best
             .into_iter()
             .map(|(side, (source, ray, det))| {
@@ -471,6 +604,7 @@ impl FusedEstimator {
                     source = source.as_str(),
                     angular_cov_det = det,
                     candidates = counts[&side],
+                    gated_out = gated_out.get(&side).copied().unwrap_or(0),
                     "fused ray selected"
                 );
                 (source, ray)
@@ -482,6 +616,93 @@ impl FusedEstimator {
             None => 2,
         });
         Ok(out)
+    }
+
+    /// The candidates of one side eligible for selection: the reference (if any) plus every
+    /// candidate that passed the gate, with `InverseCovariance` recomputed from the debiased
+    /// `IrOnly` ray when that one is accepted. Appends to `self.decisions`.
+    fn gate_side(
+        &mut self,
+        side: Side,
+        raw: Vec<(FusedSource, GazeRay)>,
+    ) -> Vec<(FusedSource, GazeRay)> {
+        let reference = raw
+            .iter()
+            .find(|(source, _)| *source == FusedSource::RgbOnly)
+            .map(|(_, ray)| ray.clone());
+
+        let mut eligible: Vec<(FusedSource, GazeRay)> = Vec::new();
+        if let Some(reference) = &reference {
+            eligible.push((FusedSource::RgbOnly, reference.clone()));
+        }
+
+        let mut accepted_ir: Option<GazeRay> = None;
+        let mut ir_bias_mean = Vector2::zeros();
+        for (source, ray) in &raw {
+            if *source == FusedSource::RgbOnly || *source == FusedSource::InverseCovariance {
+                continue;
+            }
+            let Some(reference) = &reference else {
+                self.decisions.push(GateDecision {
+                    side,
+                    source: *source,
+                    mahalanobis2: None,
+                    accepted: true,
+                    bias_rad: Vector2::zeros(),
+                });
+                eligible.push((*source, ray.clone()));
+                continue;
+            };
+
+            let residual = yaw_pitch_from_direction(&ray.direction)
+                - yaw_pitch_from_direction(&reference.direction);
+            let state = self.bias.entry((*source, side)).or_default();
+            state.update(residual, self.options.bias_alpha);
+            let warmed_up = state.n > self.options.bias_warmup;
+            let bias_rad = if warmed_up {
+                state.mean
+            } else {
+                Vector2::zeros()
+            };
+            let candidate = if warmed_up {
+                debias(ray, state)
+            } else {
+                ray.clone()
+            };
+            let d2 = mahalanobis2(&candidate, reference);
+            let accepted = d2.is_some_and(|d| d <= self.options.gate_chi2);
+
+            self.decisions.push(GateDecision {
+                side,
+                source: *source,
+                mahalanobis2: d2,
+                accepted,
+                bias_rad,
+            });
+            if accepted {
+                if *source == FusedSource::IrOnly {
+                    accepted_ir = Some(candidate.clone());
+                    ir_bias_mean = bias_rad;
+                }
+                eligible.push((*source, candidate));
+            }
+        }
+
+        if let (Some(reference), Some(ir)) = (&reference, &accepted_ir)
+            && let Some(ic) = fuse_inverse_covariance(reference, ir)
+        {
+            let d2 = mahalanobis2(&ic, reference);
+            self.decisions.push(GateDecision {
+                side,
+                source: FusedSource::InverseCovariance,
+                mahalanobis2: d2,
+                accepted: true,
+                bias_rad: ir_bias_mean,
+            });
+            eligible.push((FusedSource::InverseCovariance, ic));
+        }
+
+        eligible
     }
 }
 
@@ -959,7 +1180,7 @@ mod tests {
     }
 
     #[test]
-    fn test_selection_picks_min_determinant() {
+    fn test_selection_picks_min_determinant_among_accepted() {
         let rig = test_rig();
         let screen_from_head = frontal_screen_from_head();
         let target = Point2::new(100.0, 50.0);
@@ -996,17 +1217,37 @@ mod tests {
             .estimate_detailed(&[rgb, ir], &rig)
             .expect("estimate succeeds");
 
+        for decision in estimator2.decisions() {
+            assert!(
+                decision.accepted,
+                "side {:?} source {:?} unexpectedly rejected",
+                decision.side, decision.source
+            );
+        }
+
+        let mut accepted: std::collections::HashSet<(Side, FusedSource)> = [
+            (Side::Right, FusedSource::RgbOnly),
+            (Side::Left, FusedSource::RgbOnly),
+        ]
+        .into_iter()
+        .collect();
+        for decision in estimator2.decisions() {
+            if decision.accepted {
+                accepted.insert((decision.side, decision.source));
+            }
+        }
+
         for (source, selected_ray) in &selected {
             let side = selected_ray.side.expect("per-eye ray");
             let best = candidates
                 .iter()
-                .filter(|(s, _, _)| *s == side)
+                .filter(|(s, src, _)| *s == side && accepted.contains(&(side, *src)))
                 .min_by(|(_, _, a), (_, _, b)| {
                     a.angular_cov
                         .determinant()
                         .total_cmp(&b.angular_cov.determinant())
                 })
-                .expect("at least one candidate");
+                .expect("at least one accepted candidate");
             assert_eq!(*source, best.1);
             assert_abs_diff_eq!(
                 selected_ray.angular_cov.determinant(),
@@ -1909,5 +2150,370 @@ mod tests {
             .filter(|r| r.fields["source"] == Value::Str("ir-on-rgb-eyeball".into()))
             .count();
         assert_eq!(ir_on_rgb, 2);
+    }
+
+    #[test]
+    fn test_mahalanobis2_matches_closed_form() {
+        let cov_a = Matrix2::new(1e-4, 0.0, 0.0, 4e-4);
+        let cov_b = Matrix2::new(3e-4, 0.0, 0.0, 1e-4);
+        let reference = yaw_pitch_ray(0.0, 0.0, cov_b);
+        let candidate = yaw_pitch_ray(0.02f64.to_degrees(), 0.01f64.to_degrees(), cov_a);
+
+        let d2 = mahalanobis2(&candidate, &reference).expect("covariance sum is invertible");
+
+        assert_abs_diff_eq!(d2, 1.2, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_bias_state_seeds_then_tracks() {
+        let mut state = BiasState::default();
+        let five_deg = Vector2::new(5f64.to_radians(), 5f64.to_radians());
+        state.update(five_deg, 0.05);
+        assert_abs_diff_eq!(state.mean, five_deg, epsilon = 1e-12);
+        assert_eq!(state.n, 1);
+
+        let seven_deg = Vector2::new(7f64.to_radians(), 7f64.to_radians());
+        state.update(seven_deg, 0.05);
+        let expected_mean = five_deg + 0.05 * (seven_deg - five_deg);
+        let d = seven_deg - five_deg;
+        let expected_var = 0.05 * d.component_mul(&d);
+        assert_abs_diff_eq!(state.mean, expected_mean, epsilon = 1e-12);
+        assert_abs_diff_eq!(state.var, expected_var, epsilon = 1e-12);
+        assert_eq!(state.n, 2);
+    }
+
+    #[test]
+    fn test_gate_rejects_wandering_ir_candidate_and_keeps_it_out_of_selection() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+
+        let rgb0 = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 1.0, 3);
+        let mut ir0 = synthetic_ir_observation_at(&rig, centres, target, 0.05, 3);
+        ir0.timestamp = rgb0.timestamp;
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        estimator
+            .estimate_detailed(&[rgb0, ir0], &rig)
+            .expect("calibrating call succeeds");
+
+        let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 1.0, 4);
+        let ir_target = Point2::new(target.x + 90.0, target.y);
+        let mut ir = synthetic_ir_observation_at(&rig, centres, ir_target, 0.05, 4);
+        ir.timestamp = Timestamp::from_nanos(1_000_000);
+        let rgb = Observations {
+            timestamp: ir.timestamp,
+            ..rgb
+        };
+        let selected = estimator
+            .estimate_detailed(&[rgb.clone(), ir], &rig)
+            .expect("estimate succeeds");
+
+        for (source, _) in &selected {
+            assert!(
+                !matches!(source, FusedSource::IrOnly | FusedSource::InverseCovariance),
+                "wandering ir candidate contaminated selection via {source:?}"
+            );
+        }
+
+        let ir_decision = estimator
+            .decisions()
+            .iter()
+            .find(|d| d.source == FusedSource::IrOnly)
+            .expect("IrOnly decision present");
+        assert!(!ir_decision.accepted);
+        assert!(
+            ir_decision.mahalanobis2.expect("mahalanobis2 computed") > 9.21,
+            "{:?}",
+            ir_decision.mahalanobis2
+        );
+
+        let mut reference = LandmarkEstimator::new(LandmarkOptions {
+            apply_kappa: false,
+            ..Default::default()
+        });
+        let frame = reference
+            .estimate_frame(&rgb, &rig)
+            .expect("estimate succeeds")
+            .expect("frame present");
+        for (source, selected_ray) in &selected {
+            let side = selected_ray.side.expect("per-eye ray");
+            let rgb_ref = frame
+                .eyes
+                .iter()
+                .find(|e| e.side == side)
+                .expect("rgb reference for side")
+                .ray
+                .clone();
+            let d2 = mahalanobis2(selected_ray, &rgb_ref).expect("mahalanobis2 computed");
+            assert!(
+                d2 <= 9.21,
+                "side {side:?} source {source:?}: selection pulled away from the RgbOnly \
+                 reference by the wandering ir candidate (d2 = {d2})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gate_accepts_consistent_ir_candidate() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+
+        let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 1.0, 3);
+        let mut ir = synthetic_ir_observation_at(&rig, centres, target, 0.2, 3);
+        ir.timestamp = rgb.timestamp;
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        let selected = estimator
+            .estimate_detailed(&[rgb, ir], &rig)
+            .expect("estimate succeeds");
+
+        for decision in estimator.decisions() {
+            assert!(decision.accepted, "{decision:?} not accepted");
+        }
+        for (source, _) in &selected {
+            assert!(
+                matches!(
+                    source,
+                    FusedSource::Stereo
+                        | FusedSource::IrOnRgbEyeball
+                        | FusedSource::InverseCovariance
+                ),
+                "unexpected source {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bias_warmup_gates_then_debiases() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+        let ir_target = Point2::new(target.x + 500.0 * 12f64.to_radians().tan(), target.y);
+
+        let calibrate = |estimator: &mut FusedEstimator| {
+            let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 1.0, 0);
+            let mut ir = synthetic_ir_observation_at(&rig, centres, target, 0.2, 1000);
+            ir.timestamp = rgb.timestamp;
+            estimator
+                .candidates(&[rgb, ir], &rig)
+                .expect("calibrating call succeeds");
+        };
+
+        let mut probe = FusedEstimator::new(fused_options_no_kappa());
+        calibrate(&mut probe);
+        let probe_rgb = Observations {
+            timestamp: Timestamp::from_nanos(1_000_000),
+            ..synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 1.0, 0)
+        };
+        let mut probe_ir = synthetic_ir_observation_at(&rig, centres, ir_target, 0.2, 1000);
+        probe_ir.timestamp = probe_rgb.timestamp;
+        let probe_candidates = probe
+            .candidates(&[probe_rgb.clone(), probe_ir.clone()], &rig)
+            .expect("estimate succeeds");
+        let probe_reference = probe_candidates
+            .iter()
+            .find(|(s, src, _)| *s == Side::Right && *src == FusedSource::RgbOnly)
+            .expect("reference present")
+            .2
+            .clone();
+        let probe_ir_ray = probe_candidates
+            .iter()
+            .find(|(s, src, _)| *s == Side::Right && *src == FusedSource::IrOnly)
+            .expect("ir candidate present")
+            .2
+            .clone();
+        let expected_offset = yaw_pitch_from_direction(&probe_ir_ray.direction)
+            - yaw_pitch_from_direction(&probe_reference.direction);
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        calibrate(&mut estimator);
+        let mut right_decisions = Vec::new();
+        for i in 0..40u64 {
+            let mut rgb =
+                synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 1.0, i);
+            let mut ir = synthetic_ir_observation_at(&rig, centres, ir_target, 0.2, i + 1000);
+            rgb.timestamp = Timestamp::from_nanos((i + 1) * 1_000_000);
+            ir.timestamp = rgb.timestamp;
+            estimator
+                .estimate_detailed(&[rgb, ir], &rig)
+                .expect("estimate succeeds");
+            let decision = *estimator
+                .decisions()
+                .iter()
+                .find(|d| d.source == FusedSource::IrOnly && d.side == Side::Right)
+                .expect("IrOnly decision present");
+            right_decisions.push(decision);
+        }
+
+        for (i, d) in right_decisions.iter().take(10).enumerate() {
+            assert_eq!(d.bias_rad, Vector2::zeros(), "decision {}", i + 1);
+            assert!(!d.accepted, "decision {} unexpectedly accepted", i + 1);
+        }
+        for (i, d) in right_decisions.iter().skip(10).enumerate() {
+            assert!(
+                (d.bias_rad.x - expected_offset.x).abs() <= 0.15 * expected_offset.x.abs(),
+                "decision {}: bias {} expected {}",
+                i + 11,
+                d.bias_rad.x,
+                expected_offset.x
+            );
+            assert!(d.accepted, "decision {} not accepted", i + 11);
+        }
+    }
+
+    #[test]
+    fn test_selected_ray_tracks_reference_after_debias() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+        let ir_target = Point2::new(target.x + 500.0 * 12f64.to_radians().tan(), target.y);
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        let calibrate_rgb =
+            synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.05, 0);
+        let mut calibrate_ir = synthetic_ir_observation_at(&rig, centres, target, 0.02, 1000);
+        calibrate_ir.timestamp = calibrate_rgb.timestamp;
+        estimator
+            .candidates(&[calibrate_rgb, calibrate_ir], &rig)
+            .expect("calibrating call succeeds");
+
+        let mut selected = Vec::new();
+        let mut last_rgb = None;
+        let mut last_ir = None;
+        for i in 0..40u64 {
+            let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.05, i);
+            let mut ir = synthetic_ir_observation_at(&rig, centres, ir_target, 0.02, i + 1000);
+            ir.timestamp = Timestamp::from_nanos((i + 1) * 1_000_000);
+            let rgb = Observations {
+                timestamp: ir.timestamp,
+                ..rgb
+            };
+            selected = estimator
+                .estimate_detailed(&[rgb.clone(), ir.clone()], &rig)
+                .expect("estimate succeeds");
+            last_rgb = Some(rgb);
+            last_ir = Some(ir);
+        }
+
+        let ic_decision = estimator
+            .decisions()
+            .iter()
+            .find(|d| d.side == Side::Right && d.source == FusedSource::InverseCovariance)
+            .expect("InverseCovariance decision present");
+        assert!(ic_decision.accepted);
+
+        let mut probe = FusedEstimator::new(fused_options_no_kappa());
+        let probe_candidates = probe
+            .candidates(
+                &[last_rgb.expect("ran once"), last_ir.expect("ran once")],
+                &rig,
+            )
+            .expect("estimate succeeds");
+        let reference_direction = probe_candidates
+            .iter()
+            .find(|(s, src, _)| *s == Side::Right && *src == FusedSource::RgbOnly)
+            .expect("reference present")
+            .2
+            .direction;
+
+        let (_, right_ray) = selected
+            .iter()
+            .find(|(_, ray)| ray.side == Some(Side::Right))
+            .expect("right ray present");
+        let error = angle_deg(&right_ray.direction, &reference_direction);
+        assert!(error < 0.5, "error {error} deg");
+    }
+
+    #[test]
+    fn test_ir_only_batch_has_no_reference_and_keeps_min_det() {
+        let rig = test_rig();
+        let target = Point2::new(155.0, 85.0);
+        let ir = synthetic_ir_observation_at(&rig, EYE_CENTRES, target, 0.0, 1);
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        let selected = estimator
+            .estimate_detailed(std::slice::from_ref(&ir), &rig)
+            .expect("estimate succeeds");
+
+        assert!(!estimator.decisions().is_empty());
+        assert!(
+            estimator
+                .decisions()
+                .iter()
+                .all(|d| d.mahalanobis2.is_none())
+        );
+
+        let mut reference = IrPupilEstimator::new(IrPupilOptions {
+            apply_kappa: false,
+            ..Default::default()
+        });
+        let rays = reference
+            .estimate_rays(&[ir], &rig)
+            .expect("estimate succeeds");
+
+        assert_eq!(selected.len(), rays.len());
+        for (source, ray) in &selected {
+            assert_eq!(*source, FusedSource::IrOnly);
+            let expected = rays
+                .iter()
+                .find(|r| r.side == ray.side)
+                .expect("matching ray");
+            assert_eq!(ray, expected);
+        }
+    }
+
+    #[test]
+    fn test_from_config_parses_gate_options() {
+        let rig = test_rig();
+        let mut table = toml::Table::new();
+        table.insert("gate_chi2".into(), 5.99.into());
+        table.insert("bias_alpha".into(), 0.1.into());
+        table.insert("bias_warmup".into(), 3.into());
+
+        let estimator = FusedEstimator::from_config(&table, &rig).expect("config parses");
+        assert_abs_diff_eq!(estimator.options.gate_chi2, 5.99, epsilon = 1e-12);
+        assert_abs_diff_eq!(estimator.options.bias_alpha, 0.1, epsilon = 1e-12);
+        assert_eq!(estimator.options.bias_warmup, 3);
+    }
+
+    #[test]
+    fn test_logs_candidate_gated_at_debug() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+
+        let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 1.0, 3);
+        let mut ir = synthetic_ir_observation_at(&rig, centres, target, 0.2, 3);
+        ir.timestamp = rgb.timestamp;
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        let (_, logs) = capture_logs(tracing::Level::DEBUG, || {
+            estimator
+                .estimate_detailed(&[rgb, ir], &rig)
+                .expect("estimate succeeds")
+        });
+
+        let recs: Vec<_> = logs
+            .iter()
+            .filter(|r| r.message == "fused candidate gated")
+            .collect();
+        assert!(!recs.is_empty());
+        for rec in &recs {
+            assert_eq!(rec.level, Level::Debug);
+            assert!(matches!(rec.fields["accepted"], Value::Bool(_)));
+            assert!(matches!(rec.fields["mahalanobis2"], Value::F64(_)));
+        }
     }
 }
