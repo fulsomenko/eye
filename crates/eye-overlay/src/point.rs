@@ -72,9 +72,12 @@ pub struct PointStyle {
     pub certainty_colors: bool,
     /// Draw the 95 % uncertainty ellipse around the dot.
     pub show_ellipse: bool,
-    /// A new sample within this many standard deviations (its own covariance, Mahalanobis)
-    /// of the current target leaves the dot where it is; `0.0` follows every sample.
+    /// Radius, in standard deviations of the sample's own covariance (Mahalanobis), of the
+    /// zone around the dot. Inside it the dot glides onto the samples with time constant
+    /// `settle`; outside it the dot is dragged so it stays on the zone's edge. `0.0`
+    /// follows every sample directly.
     pub hold_sigmas: f64,
+    pub settle: Duration,
 }
 
 impl Default for PointStyle {
@@ -82,7 +85,8 @@ impl Default for PointStyle {
         Self {
             certainty_colors: true,
             show_ellipse: false,
-            hold_sigmas: 1.5,
+            hold_sigmas: 1.0,
+            settle: Duration::from_millis(300),
         }
     }
 }
@@ -215,19 +219,27 @@ impl PointScene {
         rgba_of(self.color, alpha)
     }
 
-    fn held(&self, msg: &GazePoint) -> bool {
-        let Some(current) = self.target else {
-            return false;
-        };
+    /// Where the dot's target goes for a new sample, given the current target and the time
+    /// since the previous sample; `None` means jump to the sample.
+    fn zoned_center(&self, msg: &GazePoint, dt: Duration) -> Option<Point2<f64>> {
+        let current = self.target?;
         if self.style.hold_sigmas <= 0.0 {
-            return false;
+            return None;
         }
         let cov_px = cov_mm_to_logical_px(&msg.cov_mm, &self.px_per_mm);
-        let Some(inv) = cov_px.try_inverse() else {
-            return false;
-        };
+        let inv = cov_px.try_inverse()?;
         let d = msg.px_logical - current.center;
-        (d.transpose() * inv * d)[(0, 0)].sqrt() < self.style.hold_sigmas
+        let m = (d.transpose() * inv * d)[(0, 0)].sqrt();
+        if m > self.style.hold_sigmas {
+            return Some(msg.px_logical - d * (self.style.hold_sigmas / m));
+        }
+        let settle = self.style.settle.as_secs_f64();
+        let k = if settle > 0.0 {
+            1.0 - (-dt.as_secs_f64() / settle).exp()
+        } else {
+            1.0
+        };
+        Some(current.center + d * k)
     }
 
     fn target_for(&self, p: &GazePoint) -> Eased {
@@ -296,11 +308,16 @@ impl Scene for PointScene {
         let stale = self.latest.as_ref().is_some_and(|(_, received)| {
             now.saturating_duration_since(*received) > self.easing.reset_after
         });
-        if !stale
-            && self.held(&msg)
-            && let Some(current) = self.target
-        {
-            target.center = current.center;
+        if !stale {
+            let dt = self
+                .latest
+                .as_ref()
+                .map_or(Duration::ZERO, |(_, received)| {
+                    now.saturating_duration_since(*received)
+                });
+            if let Some(center) = self.zoned_center(&msg, dt) {
+                target.center = center;
+            }
         }
         if self.drawn.is_none() || stale || self.easing.disabled() {
             self.drawn = Some(target);
@@ -461,6 +478,7 @@ mod tests {
         certainty_colors: false,
         show_ellipse: true,
         hold_sigmas: 0.0,
+        settle: Duration::ZERO,
     };
 
     fn point_px(now: Instant, x: f64, y: f64, cov: f64, confidence: f64) -> (GazePoint, Instant) {
@@ -469,36 +487,58 @@ mod tests {
         (p, t)
     }
 
-    #[test]
-    fn test_small_move_within_hold_keeps_dot() {
-        let now = Instant::now();
-        let mut scene = PointScene::with_easing(
+    fn zoned_scene() -> PointScene {
+        PointScene::with_easing(
             Vector2::new(1.0, 1.0),
             [255, 64, 64],
             Easing::from_millis(0),
-        );
-        let (a, t) = point_px(now, 100.0, 100.0, 100.0, 0.5);
-        scene.on_msg(a, t);
-        let (b, t) = point_px(now, 112.0, 100.0, 100.0, 0.5);
-        scene.on_msg(b, t);
-        scene.step(t);
-        assert_eq!(scene.drawn.unwrap().center, Point2::new(100.0, 100.0));
+        )
     }
 
     #[test]
-    fn test_move_beyond_hold_follows() {
+    fn test_small_move_within_zone_does_not_jump() {
         let now = Instant::now();
-        let mut scene = PointScene::with_easing(
-            Vector2::new(1.0, 1.0),
-            [255, 64, 64],
-            Easing::from_millis(0),
-        );
+        let mut scene = zoned_scene();
         let (a, t) = point_px(now, 100.0, 100.0, 100.0, 0.5);
         scene.on_msg(a, t);
-        let (b, t) = point_px(now, 130.0, 100.0, 100.0, 0.5);
+        let (b, t) = point_px(now + Duration::from_millis(33), 108.0, 100.0, 100.0, 0.5);
         scene.on_msg(b, t);
         scene.step(t);
-        assert_eq!(scene.drawn.unwrap().center, Point2::new(130.0, 100.0));
+        let x = scene.drawn.unwrap().center.x;
+        assert!(x > 100.0 && x < 101.0, "x {x}");
+    }
+
+    #[test]
+    fn test_dot_settles_onto_fixation_within_zone() {
+        let now = Instant::now();
+        let mut scene = zoned_scene();
+        let (a, t) = point_px(now, 100.0, 100.0, 100.0, 0.5);
+        scene.on_msg(a, t);
+        for k in 1..=30u64 {
+            let (b, t) = point_px(
+                now + Duration::from_millis(33 * k),
+                108.0,
+                100.0,
+                100.0,
+                0.5,
+            );
+            scene.on_msg(b, t);
+        }
+        scene.step(now + Duration::from_millis(990));
+        let x = scene.drawn.unwrap().center.x;
+        assert_abs_diff_eq!(x, 108.0, epsilon = 0.5);
+    }
+
+    #[test]
+    fn test_large_move_drags_dot_to_zone_edge() {
+        let now = Instant::now();
+        let mut scene = zoned_scene();
+        let (a, t) = point_px(now, 100.0, 100.0, 100.0, 0.5);
+        scene.on_msg(a, t);
+        let (b, t) = point_px(now + Duration::from_millis(33), 130.0, 100.0, 100.0, 0.5);
+        scene.on_msg(b, t);
+        scene.step(t);
+        assert_abs_diff_eq!(scene.drawn.unwrap().center.x, 120.0, epsilon = 1e-9);
     }
 
     #[test]
