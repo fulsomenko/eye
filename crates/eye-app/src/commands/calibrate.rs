@@ -1460,6 +1460,7 @@ mod tests {
                     direction,
                     angular_cov: Matrix2::identity() * 1e-6,
                     origin_cov: Matrix3::zeros(),
+                    head_rotation: nalgebra::UnitQuaternion::identity(),
                 },
                 target_mm: bad_mm,
             });
@@ -1543,6 +1544,7 @@ mod tests {
                         direction,
                         angular_cov: Matrix2::identity() * 1e-6,
                         origin_cov: Matrix3::zeros(),
+                        head_rotation: nalgebra::UnitQuaternion::identity(),
                     },
                     target_mm: bad_mm,
                 });
