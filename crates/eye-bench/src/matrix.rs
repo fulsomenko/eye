@@ -83,6 +83,12 @@ impl BenchMatrix {
             pipeline.config = pipeline.config.take().map(|p| resolve(dir, p));
         }
         matrix.validate()?;
+        tracing::debug!(
+            path = %path.display(),
+            recordings = matrix.recordings.len() as u64,
+            pipelines = matrix.pipelines.len() as u64,
+            "bench matrix loaded"
+        );
         Ok(matrix)
     }
 

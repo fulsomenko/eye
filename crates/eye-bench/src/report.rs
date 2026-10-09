@@ -104,6 +104,12 @@ impl BenchReport {
             source,
         })?;
 
+        tracing::info!(
+            json = %json_path.display(),
+            markdown = %md_path.display(),
+            rows = self.rows.len() as u64,
+            "report written"
+        );
         Ok(())
     }
 

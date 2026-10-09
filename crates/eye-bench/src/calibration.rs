@@ -5,6 +5,7 @@ use eye::pipeline::RayBatch;
 use eye_calibration::correction::UserProfile;
 use eye_calibration::protocol::FixationWindow;
 use eye_calibration::user_fit::{DotSessionFit, FitConfig, FitSample, ProfileMeta};
+use eye_core::log::{field, span};
 use eye_core::{GazePoint, Rig};
 
 use crate::metrics::EvalInput;
@@ -62,6 +63,12 @@ pub fn loto(replayed: &mut Replayed, fitter: Fitter<'_>) -> Result<LotoOutcome, 
     if replayed.run.windows.is_empty() {
         return Err("no fixation windows".to_string());
     }
+    let _stage = tracing::debug_span!(
+        span::STAGE,
+        { field::STAGE_KIND } = "calibrate",
+        { field::STAGE_NAME } = "loto",
+    )
+    .entered();
 
     let mut warnings = Vec::new();
     let mut eval_windows = Vec::new();
@@ -83,6 +90,13 @@ pub fn loto(replayed: &mut Replayed, fitter: Fitter<'_>) -> Result<LotoOutcome, 
                     .iter()
                     .find(|w| position_key(w) == key)
                     .expect("key was derived from these windows");
+                tracing::warn!(
+                    target_px_x = held_out_window.target_px_logical.x,
+                    target_px_y = held_out_window.target_px_logical.y,
+                    train_samples = train.len() as u64,
+                    { field::REASON } = %e,
+                    "loto fold fit failed"
+                );
                 warnings.push(format!(
                     "fold ({:.0}, {:.0}): fit failed: {e}",
                     held_out_window.target_px_logical.x, held_out_window.target_px_logical.y
@@ -121,6 +135,14 @@ pub fn loto(replayed: &mut Replayed, fitter: Fitter<'_>) -> Result<LotoOutcome, 
             &held_out,
             kept.iter().map(|(batch, point)| (*batch, point)),
             Vec::new(),
+        );
+        tracing::debug!(
+            target_mm_x = held_out[0].target_mm.x,
+            target_mm_y = held_out[0].target_mm.y,
+            train_samples = train.len() as u64,
+            held_out_windows = held_out.len() as u64,
+            kept_samples = kept.len() as u64,
+            "loto fold evaluated"
         );
         eval_windows.extend(fold_input.windows);
     }
@@ -166,7 +188,9 @@ mod tests {
 
     use approx::assert_relative_eq;
     use eye_calibration::protocol::ProtocolConfig;
+    use eye_core::log::field;
     use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
+    use eye_log::testing::capture_logs;
     use nalgebra::{Point2, Point3, Unit, UnitQuaternion, Vector2};
 
     use super::*;
@@ -647,6 +671,92 @@ mod tests {
         assert!(
             tight_prior_err > 3.0,
             "a 0.001 deg offset prior should leave most of the 5 deg bias uncorrected: {tight_prior_err} deg"
+        );
+    }
+
+    #[test]
+    fn test_logs_loto_fold_evaluated_at_debug() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let config = kappa_ray_config(&FOUR_BY_FOUR_CENTRES, [3.0, -1.0], None);
+        let mut replayed = replay_session(
+            &session_dir,
+            &config,
+            &fake_registry(),
+            &ProtocolConfig::default(),
+        )
+        .unwrap();
+
+        let (result, records) = capture_logs(tracing::Level::TRACE, || {
+            loto(&mut replayed, &dot_session_fitter)
+        });
+        result.unwrap();
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "loto fold evaluated")
+            .collect();
+        assert_eq!(matches.len(), 16);
+        for rec in &matches {
+            assert_eq!(rec.level, eye_log::Level::Debug);
+            assert_eq!(
+                rec.context[field::STAGE_KIND],
+                eye_log::Value::Str("calibrate".to_string())
+            );
+            assert_eq!(
+                rec.context[field::STAGE_NAME],
+                eye_log::Value::Str("loto".to_string())
+            );
+            assert_eq!(rec.fields["held_out_windows"], eye_log::Value::U64(1));
+        }
+    }
+
+    #[test]
+    fn test_logs_loto_fold_fit_failed_at_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let config = kappa_ray_config(&FOUR_BY_FOUR_CENTRES, [3.0, -1.0], None);
+        let mut replayed = replay_session(
+            &session_dir,
+            &config,
+            &fake_registry(),
+            &ProtocolConfig::default(),
+        )
+        .unwrap();
+        let screen = synthetic_screen();
+        let failing_mm =
+            eye_geometry::screen::px_logical_to_mm(&screen, &Point2::new(240.0, 135.0));
+        let fitter = |samples: &[FitSample], rig: &Rig| {
+            if samples.iter().all(|s| s.target_mm != failing_mm) {
+                Err("too few samples".to_string())
+            } else {
+                dot_session_fitter(samples, rig)
+            }
+        };
+
+        let (result, records) =
+            capture_logs(tracing::Level::TRACE, || loto(&mut replayed, &fitter));
+        result.unwrap();
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "loto fold fit failed")
+            .collect();
+        assert_eq!(matches.len(), 1);
+        let rec = matches[0];
+        assert_eq!(rec.level, eye_log::Level::Warn);
+        assert_eq!(rec.fields["target_px_x"], eye_log::Value::F64(240.0));
+        assert_eq!(
+            rec.fields[field::REASON],
+            eye_log::Value::Str("too few samples".to_string())
         );
     }
 }

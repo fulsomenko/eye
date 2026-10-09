@@ -556,6 +556,7 @@ dependencies = [
  "eye-capture",
  "eye-core",
  "eye-geometry",
+ "eye-log",
  "nalgebra",
  "proptest",
  "serde",

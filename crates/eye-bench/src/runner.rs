@@ -10,12 +10,13 @@ use eye::registry::Registry;
 use eye_calibration::protocol::{FixationWindow, ProtocolConfig, TargetProtocol};
 use eye_calibration::store::rig_from_table;
 use eye_capture::session::{RecordedCamera, Recording};
-use eye_core::{CameraInfo, GazePoint, Rig, Timestamp};
+use eye_core::log::{field, span};
+use eye_core::{CameraInfo, Frame, FrameSet, GazePoint, Rig, Timestamp};
 use nalgebra::{Point3, Vector3};
 
 use crate::error::BenchError;
 use crate::matrix::{BenchMatrix, PipelineSpec};
-use crate::metrics::{EvalInput, EvalPoint, EvalWindow, compute};
+use crate::metrics::{EvalInput, EvalPoint, EvalWindow, Summary, compute};
 use crate::report::BenchReport;
 use crate::row::{BenchRow, CalibrationMode, RowKind, RowOutcome};
 
@@ -68,10 +69,34 @@ fn pipeline_error(e: PipelineError) -> BenchError {
     BenchError::Pipeline(Box::new(e))
 }
 
+fn step_outcome(s: &Step) -> &'static str {
+    if s.skipped {
+        "skipped"
+    } else if s.batch.is_some() {
+        "rays"
+    } else {
+        "no_gaze"
+    }
+}
+
 #[allow(clippy::result_large_err)]
-fn step(pipeline: &mut Pipeline, set: &eye_core::FrameSet) -> Result<Step, BenchError> {
+fn step(pipeline: &mut Pipeline, set: &FrameSet) -> Result<Step, BenchError> {
+    let h = set
+        .frames()
+        .iter()
+        .map(Frame::header)
+        .max_by_key(|h| h.timestamp)
+        .expect("a FrameSet is non-empty");
+    let _frame = eye_core::log::frame_span(
+        h.camera.as_str(),
+        h.seq,
+        h.timestamp.as_nanos(),
+        h.illumination.as_str(),
+        set.frames().len() as u64,
+    )
+    .entered();
     let started = Instant::now();
-    Ok(match pipeline.rays(set).map_err(pipeline_error)? {
+    let step = match pipeline.rays(set).map_err(pipeline_error)? {
         RayStep::Rays(batch) => {
             let point = pipeline.finish(&batch);
             Step {
@@ -93,7 +118,15 @@ fn step(pipeline: &mut Pipeline, set: &eye_core::FrameSet) -> Result<Step, Bench
             skipped: true,
             processing: started.elapsed(),
         },
-    })
+    };
+    tracing::trace!(
+        outcome = step_outcome(&step),
+        rays = step.batch.as_ref().map_or(0, |b| b.rays.len()) as u64,
+        point = step.point.is_some(),
+        { field::ELAPSED_US } = step.processing.as_micros() as u64,
+        "frame replayed"
+    );
+    Ok(step)
 }
 
 /// Replays one recording through a fresh pipeline without correction.
@@ -194,17 +227,40 @@ pub fn eval_input<'a>(
         })
         .collect();
     for (batch, point) in samples {
+        let ts_ns = point.timestamp.as_nanos();
         let Some(eye_mm) = mean_origin(&batch.rays) else {
+            tracing::debug!(
+                { field::TS_NS } = ts_ns,
+                { field::REASON } = "no_rays",
+                "sample dropped"
+            );
             continue;
         };
-        if let Some(i) = window_at(windows, point.timestamp) {
-            out[i].points.push(EvalPoint {
-                timestamp: point.timestamp,
-                eye_mm,
-                gaze_mm: point.mm,
-                gaze_px_logical: point.px_logical,
-            });
-        }
+        let Some(i) = window_at(windows, point.timestamp) else {
+            tracing::debug!(
+                { field::TS_NS } = ts_ns,
+                { field::REASON } = "outside_window",
+                "sample dropped"
+            );
+            continue;
+        };
+        let w = &out[i];
+        tracing::trace!(
+            { field::TS_NS } = ts_ns,
+            target_index = w.target_index as u64,
+            target_mm_x = w.target_mm.x,
+            target_mm_y = w.target_mm.y,
+            gaze_mm_x = point.mm.x,
+            gaze_mm_y = point.mm.y,
+            error_deg = crate::metrics::angle_deg(&eye_mm, &point.mm, &w.target_mm),
+            "sample"
+        );
+        out[i].points.push(EvalPoint {
+            timestamp: point.timestamp,
+            eye_mm,
+            gaze_mm: point.mm,
+            gaze_px_logical: point.px_logical,
+        });
     }
     EvalInput {
         windows: out,
@@ -309,7 +365,14 @@ fn rows_for_pipeline(
 ) -> Vec<BenchRow> {
     let config = match load_pipeline_config(spec) {
         Ok(config) => config,
-        Err(e) => return config_error_rows(spec, matrix, &e.to_string()),
+        Err(e) => {
+            tracing::warn!(
+                pipeline = %spec.name,
+                { field::REASON } = %e,
+                "pipeline config failed"
+            );
+            return config_error_rows(spec, matrix, &e.to_string());
+        }
     };
 
     let mut rows = Vec::new();
@@ -317,21 +380,27 @@ fn rows_for_pipeline(
 
     for dir in &matrix.recordings {
         let session = session_name(dir);
+        let _session = tracing::info_span!(
+            span::SESSION,
+            { field::SESSION_ID } = %session,
+            pipeline = %spec.name,
+        )
+        .entered();
         let started = Instant::now();
         match replay_session(dir, &config, registry, &matrix.evaluation.protocol) {
             Ok(mut replayed) => {
                 let step_errors = replayed.run.step_errors();
                 tracing::info!(
-                    pipeline = %spec.name,
-                    session = %session,
-                    steps = replayed.run.steps.len(),
-                    elapsed_ms = started.elapsed().as_millis(),
+                    steps = replayed.run.steps.len() as u64,
+                    step_errors = step_errors as u64,
+                    { field::ELAPSED_US } = started.elapsed().as_micros() as u64,
                     "session replayed"
                 );
                 for &mode in &matrix.evaluation.calibration {
                     match evaluate(mode, &mut replayed, matrix.evaluation.fit) {
                         Ok((input, warnings)) => {
                             let metrics = compute(&input, &matrix.evaluation.metrics);
+                            log_session_scored(mode, &metrics, warnings.len() as u64);
                             rows.push(BenchRow {
                                 pipeline: spec.name.clone(),
                                 calibration: mode,
@@ -346,6 +415,11 @@ fn rows_for_pipeline(
                             entry.1 += step_errors;
                         }
                         Err(message) => {
+                            tracing::warn!(
+                                calibration = mode.as_str(),
+                                { field::REASON } = %message,
+                                "session evaluation failed"
+                            );
                             rows.push(error_row(
                                 &spec.name,
                                 mode,
@@ -359,6 +433,7 @@ fn rows_for_pipeline(
                 }
             }
             Err(e) => {
+                tracing::warn!({ field::REASON } = %e, "session replay failed");
                 for &mode in &matrix.evaluation.calibration {
                     rows.push(error_row(
                         &spec.name,
@@ -378,6 +453,13 @@ fn rows_for_pipeline(
             Some((inputs, step_errors)) if !inputs.is_empty() => {
                 let pooled = EvalInput::concat(inputs);
                 let metrics = compute(&pooled, &matrix.evaluation.metrics);
+                log_aggregate_scored(
+                    &spec.name,
+                    mode,
+                    inputs.len() as u64,
+                    *step_errors as u64,
+                    &metrics,
+                );
                 rows.push(BenchRow {
                     pipeline: spec.name.clone(),
                     calibration: mode,
@@ -389,6 +471,12 @@ fn rows_for_pipeline(
                 });
             }
             _ => {
+                tracing::warn!(
+                    pipeline = %spec.name,
+                    calibration = mode.as_str(),
+                    { field::REASON } = "no session produced a result",
+                    "aggregate has no result"
+                );
                 rows.push(error_row(
                     &spec.name,
                     mode,
@@ -404,7 +492,78 @@ fn rows_for_pipeline(
     rows
 }
 
+fn summarize(x: &Option<Summary>, f: fn(&Summary) -> f64) -> Option<f64> {
+    x.as_ref().map(f)
+}
+
+fn log_session_scored(
+    mode: CalibrationMode,
+    metrics: &crate::metrics::SessionMetrics,
+    warnings: u64,
+) {
+    tracing::info!(
+        calibration = mode.as_str(),
+        samples = metrics.samples as u64,
+        windows = metrics.windows as u64,
+        err_mean_deg = summarize(&metrics.angular_error_deg, |s| s.mean),
+        err_p95_deg = summarize(&metrics.angular_error_deg, |s| s.p95),
+        accuracy_deg = metrics.accuracy_deg,
+        precision_deg = metrics.precision_rms_s2s_deg,
+        proc_p50_ms = summarize(&metrics.processing_ms, |s| s.p50),
+        proc_p95_ms = summarize(&metrics.processing_ms, |s| s.p95),
+        dropout_rate = metrics.dropout_rate,
+        output_rate_hz = metrics.output_rate_hz,
+        warnings,
+        "session scored"
+    );
+    for region in &metrics.regions {
+        tracing::debug!(
+            calibration = mode.as_str(),
+            cols = region.cols as u64,
+            rows = region.rows as u64,
+            windows = region.windows as u64,
+            excluded = region.excluded as u64,
+            hits = region.hits as u64,
+            hit_rate = region.hit_rate,
+            sample_hit_rate = region.sample_hit_rate,
+            "region hit rate"
+        );
+    }
+}
+
+fn log_aggregate_scored(
+    pipeline: &str,
+    mode: CalibrationMode,
+    sessions: u64,
+    step_errors: u64,
+    metrics: &crate::metrics::SessionMetrics,
+) {
+    tracing::info!(
+        pipeline = %pipeline,
+        calibration = mode.as_str(),
+        sessions,
+        step_errors,
+        samples = metrics.samples as u64,
+        windows = metrics.windows as u64,
+        err_mean_deg = summarize(&metrics.angular_error_deg, |s| s.mean),
+        err_p95_deg = summarize(&metrics.angular_error_deg, |s| s.p95),
+        accuracy_deg = metrics.accuracy_deg,
+        precision_deg = metrics.precision_rms_s2s_deg,
+        proc_p50_ms = summarize(&metrics.processing_ms, |s| s.p50),
+        proc_p95_ms = summarize(&metrics.processing_ms, |s| s.p95),
+        dropout_rate = metrics.dropout_rate,
+        output_rate_hz = metrics.output_rate_hz,
+        "aggregate scored"
+    );
+}
+
 pub fn run_matrix(matrix: &BenchMatrix, registry: &Registry) -> BenchReport {
+    tracing::info!(
+        pipelines = matrix.pipelines.len() as u64,
+        recordings = matrix.recordings.len() as u64,
+        modes = matrix.evaluation.calibration.len() as u64,
+        "bench run started"
+    );
     let mut rows = Vec::new();
     for spec in &matrix.pipelines {
         rows.extend(rows_for_pipeline(spec, matrix, registry));
@@ -414,8 +573,12 @@ pub fn run_matrix(matrix: &BenchMatrix, registry: &Registry) -> BenchReport {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use approx::assert_relative_eq;
+    use eye_core::log::field;
     use eye_core::{GazeRay, OutputId};
+    use eye_log::testing::capture_logs;
     use nalgebra::{Matrix2, Matrix3, Point2, Unit, UnitQuaternion};
 
     use super::*;
@@ -893,5 +1056,313 @@ mod tests {
         for row in session_rows {
             assert!(matches!(row.outcome, RowOutcome::Ok { .. }), "{row:?}");
         }
+    }
+
+    fn single_mode_matrix(dir: &Path, session_dir: PathBuf) -> BenchMatrix {
+        let toml_path = dir.join("fixed.toml");
+        std::fs::write(
+            &toml_path,
+            fixed_ray_toml([155.0, 85.0, -500.0], [161.458333, 94.444444]),
+        )
+        .unwrap();
+        BenchMatrix {
+            recordings: vec![session_dir],
+            pipelines: vec![crate::matrix::PipelineSpec {
+                name: "fixed".to_string(),
+                config: Some(toml_path),
+            }],
+            evaluation: crate::matrix::Evaluation {
+                calibration: vec![CalibrationMode::None],
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn test_logs_session_scored_at_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let matrix = single_mode_matrix(dir.path(), session_dir);
+
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            run_matrix(&matrix, &fake_registry())
+        });
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "session scored")
+            .collect();
+        assert_eq!(matches.len(), 1);
+        let rec = matches[0];
+        assert_eq!(rec.level, eye_log::Level::Info);
+        assert_eq!(rec.target, "eye_bench::runner");
+        assert_eq!(rec.fields["samples"], eye_log::Value::U64(384));
+        assert_eq!(
+            rec.fields["calibration"],
+            eye_log::Value::Str("none".to_string())
+        );
+        assert!(matches!(rec.fields["err_mean_deg"], eye_log::Value::F64(_)));
+        assert_eq!(
+            rec.context[field::SESSION_ID],
+            eye_log::Value::Str("s1".to_string())
+        );
+        assert_eq!(
+            rec.context["pipeline"],
+            eye_log::Value::Str("fixed".to_string())
+        );
+        let mut keys: Vec<&str> = rec.context.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["pipeline", field::SESSION_ID]);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn test_logs_frame_replayed_at_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            cameras: vec!["ir", "rgb"],
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let config = fixed_ray_config([155.0, 85.0, -500.0], [161.458333, 94.444444]);
+        let (replayed, records) = capture_logs(tracing::Level::TRACE, || {
+            replay_session(
+                &session_dir,
+                &config,
+                &fake_registry(),
+                &ProtocolConfig::default(),
+            )
+        });
+        let replayed = replayed.unwrap();
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "frame replayed")
+            .collect();
+        assert_eq!(matches.len(), replayed.run.steps.len());
+        assert_eq!(matches.len(), 61);
+        for rec in &matches {
+            assert_eq!(
+                rec.context[field::CAMERA],
+                eye_log::Value::Str("ir".to_string())
+            );
+            assert!(matches!(rec.context[field::SEQ], eye_log::Value::U64(_)));
+            assert!(matches!(rec.context[field::TS_NS], eye_log::Value::U64(_)));
+            assert_eq!(
+                rec.context[field::ILLUMINATION],
+                eye_log::Value::Str("unknown".to_string())
+            );
+            assert_eq!(rec.context[field::SET_CAMERAS], eye_log::Value::U64(1));
+            assert_eq!(
+                rec.fields["outcome"],
+                eye_log::Value::Str("rays".to_string())
+            );
+            assert!(!rec.fields.contains_key("set.cameras"));
+            assert!(matches!(
+                rec.fields[field::ELAPSED_US],
+                eye_log::Value::U64(_)
+            ));
+            assert!(!rec.context.contains_key(field::SESSION_ID));
+        }
+    }
+
+    #[test]
+    fn test_logs_sample_at_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let matrix = single_mode_matrix(dir.path(), session_dir);
+
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            run_matrix(&matrix, &fake_registry())
+        });
+        let matches: Vec<_> = records.iter().filter(|r| r.message == "sample").collect();
+        assert_eq!(matches.len(), 384);
+        for rec in &matches {
+            let error_deg = match rec.fields["error_deg"] {
+                eye_log::Value::F64(v) => v,
+                ref other => panic!("expected F64, got {other:?}"),
+            };
+            assert!(error_deg >= 0.0);
+            let target_index = match rec.fields["target_index"] {
+                eye_log::Value::U64(v) => v,
+                ref other => panic!("expected U64, got {other:?}"),
+            };
+            assert!(target_index < 16);
+            assert!(rec.fields.contains_key(field::TS_NS));
+            assert!(!rec.fields.contains_key("data"));
+            assert!(!rec.fields.contains_key("frame"));
+        }
+    }
+
+    #[test]
+    fn test_logs_sample_dropped_at_debug() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let matrix = single_mode_matrix(dir.path(), session_dir);
+
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            run_matrix(&matrix, &fake_registry())
+        });
+        let dropped: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "sample dropped")
+            .collect();
+        assert!(
+            dropped
+                .iter()
+                .any(|r| r.fields[field::REASON] == eye_log::Value::Str("outside_window".into()))
+        );
+        assert!(
+            !dropped
+                .iter()
+                .any(|r| r.fields[field::REASON] == eye_log::Value::Str("no_rays".into()))
+        );
+        for rec in &dropped {
+            assert_eq!(rec.level, eye_log::Level::Debug);
+        }
+    }
+
+    #[test]
+    fn test_logs_session_replay_failed_at_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            with_rig: false,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let matrix = single_mode_matrix(dir.path(), session_dir);
+
+        let (report, records) = capture_logs(tracing::Level::TRACE, || {
+            run_matrix(&matrix, &fake_registry())
+        });
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "session replay failed")
+            .collect();
+        assert_eq!(matches.len(), 1);
+        let rec = matches[0];
+        assert_eq!(rec.level, eye_log::Level::Warn);
+        let reason = match &rec.fields[field::REASON] {
+            eye_log::Value::Str(s) => s,
+            other => panic!("expected Str, got {other:?}"),
+        };
+        assert!(reason.contains("no [rig] snapshot"));
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Session)
+            .unwrap();
+        assert!(matches!(row.outcome, RowOutcome::Error { .. }));
+    }
+
+    #[test]
+    fn test_logs_pipeline_config_failed_at_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession::default();
+        let session_a = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let mut matrix =
+            BenchMatrix::single(Some(dir.path().join("missing.toml")), vec![session_a]);
+        matrix.evaluation.calibration = vec![CalibrationMode::None];
+
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            run_matrix(&matrix, &fake_registry())
+        });
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "pipeline config failed")
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].level, eye_log::Level::Warn);
+        assert!(matches[0].fields.contains_key("pipeline"));
+        assert!(!records.iter().any(|r| r.message == "session scored"));
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn test_logs_report_written_at_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+        let report = BenchReport::new(
+            crate::metrics::MetricParams::default(),
+            vec![BenchRow {
+                pipeline: "p".to_string(),
+                calibration: CalibrationMode::None,
+                kind: RowKind::Session,
+                session: "s".to_string(),
+                step_errors: 0,
+                warnings: Vec::new(),
+                outcome: RowOutcome::Error {
+                    message: "boom".to_string(),
+                },
+            }],
+        );
+
+        let (result, records) = capture_logs(tracing::Level::TRACE, || report.write_to(&out_dir));
+        result.unwrap();
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "report written")
+            .collect();
+        assert_eq!(matches.len(), 1);
+        let rec = matches[0];
+        assert_eq!(rec.level, eye_log::Level::Info);
+        assert_eq!(rec.fields["rows"], eye_log::Value::U64(1));
+        let json = match &rec.fields["json"] {
+            eye_log::Value::Str(s) => s,
+            other => panic!("expected Str, got {other:?}"),
+        };
+        assert!(json.ends_with("report.json"));
+    }
+
+    #[test]
+    fn test_logs_aggregate_scored_at_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            ..Default::default()
+        };
+        let session_a = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let session_b = write_synthetic_session(dir.path(), "s2", &spec).unwrap();
+        let toml_path = dir.path().join("fixed.toml");
+        std::fs::write(
+            &toml_path,
+            fixed_ray_toml([155.0, 85.0, -500.0], [161.458333, 94.444444]),
+        )
+        .unwrap();
+        let matrix = BenchMatrix {
+            recordings: vec![session_a, session_b],
+            pipelines: vec![crate::matrix::PipelineSpec {
+                name: "fixed".to_string(),
+                config: Some(toml_path),
+            }],
+            evaluation: crate::matrix::Evaluation {
+                calibration: vec![CalibrationMode::None],
+                ..Default::default()
+            },
+        };
+
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            run_matrix(&matrix, &fake_registry())
+        });
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "aggregate scored")
+            .collect();
+        assert_eq!(matches.len(), 1);
+        let rec = matches[0];
+        assert_eq!(rec.level, eye_log::Level::Info);
+        assert_eq!(rec.fields["sessions"], eye_log::Value::U64(2));
+        assert_eq!(rec.fields["samples"], eye_log::Value::U64(768));
+        assert!(!rec.context.contains_key(field::SESSION_ID));
     }
 }
