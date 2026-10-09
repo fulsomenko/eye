@@ -15,7 +15,9 @@ use eye_core::log::{field, span};
 use eye_core::session::TargetRecord;
 use eye_core::{CameraInfo, Frame, Rig, ScreenModel, Timestamp};
 use eye_geometry::screen::px_logical_to_mm;
-use eye_overlay::targets::{FeedbackSender, TargetDisplay, TargetEvent, TargetShown, TargetSpec};
+use eye_overlay::targets::{
+    AppendSender, FeedbackSender, TargetDisplay, TargetEvent, TargetShown, TargetSpec,
+};
 use eye_platform::EmitterGuard;
 
 use crate::capture::{Capture, CaptureMsg};
@@ -188,6 +190,14 @@ pub trait PumpObserver {
 
     fn attach_feedback(&mut self, _sender: FeedbackSender) {}
 
+    /// Whether `record_targets` should hand this observer an `AppendSender` for the running
+    /// `TargetDisplay`, so it can re-present a target (e.g. after an online rejection).
+    fn wants_append(&self) -> bool {
+        false
+    }
+
+    fn attach_append(&mut self, _sender: AppendSender) {}
+
     /// Called once `record_session` has resolved the rig and opened the camera sources, before
     /// any frame is pumped, so an observer that needs them (e.g. to build a `Pipeline`) can set
     /// itself up.
@@ -315,14 +325,18 @@ fn record_targets(
         .into_iter()
         .map(TargetSpec::from)
         .collect();
+    let track_append = observer.wants_append();
     let display = if observer.wants_feedback() {
         let (display, feedback) =
-            TargetDisplay::spawn_with_feedback(&output, protocol.lead_in(), specs)?;
+            TargetDisplay::spawn_with_feedback(&output, protocol.lead_in(), specs, track_append)?;
         observer.attach_feedback(feedback);
         display
     } else {
-        TargetDisplay::spawn(&output, protocol.lead_in(), specs)?
+        TargetDisplay::spawn(&output, protocol.lead_in(), specs, track_append)?
     };
+    if track_append {
+        observer.attach_append(display.appender());
+    }
     let end = pump(
         capture.frames(),
         display.events(),

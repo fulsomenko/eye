@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -7,18 +7,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use eye::config::Config;
 use eye::pipeline::{Pipeline, RayStep};
 use eye::registry::Registry;
-use eye_bench::calibration::{dot_session_fitter, fit_samples, loto, position_key};
+use eye_bench::calibration::{
+    dot_session_fitter, fit_samples, latest_presentation, loto, position_key,
+};
 use eye_bench::metrics::{MetricParams, SessionMetrics, compute};
 use eye_bench::runner::replay_session;
 use eye_calibration::correction::UserProfile;
 use eye_calibration::protocol::{ProtocolConfig, TargetProtocol, TargetTiming};
 use eye_calibration::store::ProfileStore;
-use eye_calibration::user_fit::{DotSessionFit, FitConfig, FitSample, ProfileMeta};
+use eye_calibration::user_fit::{
+    DotSessionFit, FitConfig, FitSample, ProfileMeta, TargetReject, TargetVerdict,
+};
 use eye_core::log::{field, span};
 use eye_core::{CameraInfo, Frame, Rig, Timestamp};
 use eye_geometry::screen::px_logical_to_mm;
 use eye_overlay::ellipse::{cov_mm_to_logical_px, logical_px_per_mm};
-use eye_overlay::targets::{Feedback, FeedbackSender, TargetShown};
+use eye_overlay::targets::{AppendSender, Feedback, FeedbackSender, TargetShown, TargetSpec};
 use nalgebra::Point2;
 
 use crate::commands::record::{
@@ -57,6 +61,9 @@ pub fn wants_feedback(args: &Args) -> bool {
 /// Target frame period at 30 fps; above this, `rays()` is falling behind and sets start getting skipped.
 const FRAME_PERIOD_30HZ: Duration = Duration::from_nanos(1_000_000_000 / 30);
 
+/// At most this many retries per target position before an online rejection is left standing.
+const MAX_RETRIES: u8 = 2;
+
 /// Drives a synchronous `Pipeline` alongside `pump`'s frame loop, refitting the profile after
 /// every completed target and feeding the result back to the target overlay as a `Feedback` point.
 #[derive(Debug)]
@@ -65,11 +72,13 @@ pub struct LiveFeedback {
     config: Config,
     pipeline: Option<Pipeline>,
     feedback: Option<FeedbackSender>,
+    append: Option<AppendSender>,
     timing: TargetTiming,
     fit_cfg: FitConfig,
     meta: ProfileMeta,
-    current: Option<(Timestamp, Point2<f64>)>,
+    current: Option<(Timestamp, Point2<f64>, Point2<f64>)>,
     samples: Vec<FitSample>,
+    retries: HashMap<(u64, u64), u8>,
     completed: usize,
     calibrated: bool,
     frame_period: Duration,
@@ -92,11 +101,13 @@ impl LiveFeedback {
             config,
             pipeline: None,
             feedback: None,
+            append: None,
             timing,
             fit_cfg,
             meta,
             current: None,
             samples: Vec::new(),
+            retries: HashMap::new(),
             completed: 0,
             calibrated: false,
             frame_period: FRAME_PERIOD_30HZ,
@@ -119,11 +130,13 @@ impl LiveFeedback {
             config: Config::builtin_default(),
             pipeline: Some(pipeline),
             feedback: None,
+            append: None,
             timing,
             fit_cfg,
             meta,
             current: None,
             samples: Vec::new(),
+            retries: HashMap::new(),
             completed: 0,
             calibrated: false,
             frame_period: FRAME_PERIOD_30HZ,
@@ -184,7 +197,7 @@ impl LiveFeedback {
         let RayStep::Rays(batch) = ray_step else {
             return Ok(());
         };
-        if let Some((onset, target_mm)) = self.current {
+        if let Some((onset, target_mm, _px)) = self.current {
             let elapsed =
                 Duration::from_nanos(batch.timestamp.as_nanos().saturating_sub(onset.as_nanos()));
             if elapsed >= self.timing.settle && elapsed < self.timing.settle + self.timing.window {
@@ -214,7 +227,7 @@ impl LiveFeedback {
         Ok(())
     }
 
-    fn refit(&mut self, target_index: usize) {
+    fn refit(&mut self, target_index: usize, last_target: Option<(Point2<f64>, Point2<f64>)>) {
         if self.completed < self.fit_cfg.min_targets_offset {
             return;
         }
@@ -237,8 +250,12 @@ impl LiveFeedback {
                         "live calibration refit"
                     );
                 }
+                let verdicts = outcome.verdicts();
                 pipeline.set_correction(Some(Box::new(outcome.profile)));
                 self.calibrated = true;
+                if let Some((target_mm, px_logical)) = last_target {
+                    self.handle_verdict(target_mm, px_logical, &verdicts);
+                }
             }
             Err(error) => {
                 tracing::warn!(
@@ -249,6 +266,83 @@ impl LiveFeedback {
             }
         }
     }
+
+    /// Decides whether the just-completed target (at `target_mm`/`px_logical`) should be
+    /// re-presented, looking up only its own verdict among `verdicts`.
+    fn handle_verdict(
+        &mut self,
+        target_mm: Point2<f64>,
+        px_logical: Point2<f64>,
+        verdicts: &[TargetVerdict],
+    ) {
+        let key = target_mm_key(target_mm);
+        let Some(index) = target_index_in_samples(&self.samples, target_mm) else {
+            return;
+        };
+        let verdict = verdicts.iter().find(|v| v.index == index);
+        let (rejected, reason, residual_deg) = match verdict {
+            Some(v) => (v.rejected, v.reason, v.residual_deg),
+            None => (
+                true,
+                Some(TargetReject::TooFewSamples {
+                    have: 0,
+                    need: self.fit_cfg.min_samples_per_target,
+                }),
+                0.0,
+            ),
+        };
+        if !rejected {
+            return;
+        }
+        let retries = *self.retries.get(&key).unwrap_or(&0);
+        if retries >= MAX_RETRIES {
+            return;
+        }
+        self.retries.insert(key, retries + 1);
+        match reason {
+            Some(TargetReject::TooFewSamples { have, need }) => {
+                tracing::warn!(reason = ?reason, residual_deg, have, need, "target rejected");
+            }
+            Some(TargetReject::Jitter { limit, .. })
+            | Some(TargetReject::Residual { limit, .. }) => {
+                tracing::warn!(reason = ?reason, residual_deg, limit, "target rejected");
+            }
+            None => {
+                tracing::warn!(reason = ?reason, residual_deg, "target rejected");
+            }
+        }
+        if let Some(sender) = &self.append {
+            let spec = TargetSpec {
+                px_logical,
+                timing: self.timing,
+                retry: true,
+            };
+            let _ = sender.append(spec);
+        }
+    }
+}
+
+fn target_mm_key(target_mm: Point2<f64>) -> (u64, u64) {
+    (target_mm.x.to_bits(), target_mm.y.to_bits())
+}
+
+/// The index `DotSessionFit::fit_with` would assign `target_mm` when fitting `samples`: targets
+/// are numbered by the order their first sample appears, so this must be recomputed from the
+/// current `samples` rather than cached, since dropping a retried target's stale samples can
+/// change which target's samples appear first.
+fn target_index_in_samples(samples: &[FitSample], target_mm: Point2<f64>) -> Option<u32> {
+    let key = target_mm_key(target_mm);
+    let mut next_index = 0u32;
+    let mut seen: HashMap<(u64, u64), u32> = HashMap::new();
+    for s in samples {
+        let k = target_mm_key(s.target_mm);
+        seen.entry(k).or_insert_with(|| {
+            let idx = next_index;
+            next_index += 1;
+            idx
+        });
+    }
+    seen.get(&key).copied()
 }
 
 impl PumpObserver for LiveFeedback {
@@ -258,6 +352,14 @@ impl PumpObserver for LiveFeedback {
 
     fn attach_feedback(&mut self, sender: FeedbackSender) {
         self.feedback = Some(sender);
+    }
+
+    fn wants_append(&self) -> bool {
+        true
+    }
+
+    fn attach_append(&mut self, sender: AppendSender) {
+        self.append = Some(sender);
     }
 
     fn prepare(&mut self, rig: &Rig, cameras: &[CameraInfo]) -> anyhow::Result<()> {
@@ -285,13 +387,20 @@ impl PumpObserver for LiveFeedback {
             .rig()
             .screen();
         let target_mm = px_logical_to_mm(screen, &shown.px_logical);
-        self.current = Some((shown.shown_at, target_mm));
+        let key = target_mm_key(target_mm);
+        if self.retries.contains_key(&key) {
+            self.samples.retain(|s| target_mm_key(s.target_mm) != key);
+        }
+        self.current = Some((shown.shown_at, target_mm, shown.px_logical));
     }
 
     fn on_hidden(&mut self, index: usize, _at: Timestamp) {
-        self.current = None;
+        let last_target = self.current.take().map(|(_, mm, px)| (mm, px));
         self.completed += 1;
-        self.refit(index);
+        self.refit(index, last_target);
+        if let Some(sender) = &self.append {
+            sender.settle();
+        }
     }
 }
 
@@ -369,6 +478,8 @@ pub struct FitResult {
     pub targets: usize,
     /// Leave-one-target-out estimate of the accuracy this profile gives on this pipeline; `None` if every fold failed.
     pub expected: Option<SessionMetrics>,
+    /// Targets the final offline fit excluded, merged across eyes and deduplicated.
+    pub rejected_targets: Vec<u32>,
 }
 
 pub fn fit_recording(
@@ -380,10 +491,11 @@ pub fn fit_recording(
 ) -> anyhow::Result<FitResult> {
     let mut replayed = replay_session(dir, config, registry, protocol)?;
     let run = &replayed.run;
+    let base_len = protocol.grid[0] * protocol.grid[1];
     let samples = fit_samples(
         &run.windows,
         run.steps.iter().filter_map(|s| s.batch.as_ref()),
-        |_| true,
+        latest_presentation(&run.windows, base_len),
     );
     anyhow::ensure!(
         !samples.is_empty(),
@@ -395,7 +507,15 @@ pub fn fit_recording(
         .map(position_key)
         .collect::<BTreeSet<_>>()
         .len();
-    let profile = DotSessionFit::fit_with(&samples, &run.rig, &FitConfig::default(), meta)?.profile;
+    let outcome = DotSessionFit::fit_with(&samples, &run.rig, &FitConfig::default(), meta)?;
+    let profile = outcome.profile;
+    let rejected_targets: Vec<u32> = outcome
+        .reports
+        .iter()
+        .flat_map(|r| r.targets_rejected.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let expected = match loto(&mut replayed, &dot_session_fitter) {
         Ok(estimate) => {
             for warning in &estimate.warnings {
@@ -413,6 +533,7 @@ pub fn fit_recording(
         samples: samples.len(),
         targets,
         expected,
+        rejected_targets,
     })
 }
 
@@ -462,8 +583,17 @@ pub fn summary_line(result: &FitResult) -> String {
         }
         None => "n/a".to_string(),
     };
+    let rejected = if result.rejected_targets.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; {} targets rejected: {:?}",
+            result.rejected_targets.len(),
+            result.rejected_targets
+        )
+    };
     format!(
-        "{} targets, {} samples; expected accuracy (leave-one-target-out): {accuracy}",
+        "{} targets, {} samples; expected accuracy (leave-one-target-out): {accuracy}{rejected}",
         result.targets, result.samples
     )
 }
@@ -702,6 +832,48 @@ mod tests {
     }
 
     #[test]
+    fn test_fit_recording_uses_retry_window_not_the_rejected_one() {
+        let base: Vec<(f64, f64)> = FOUR_BY_FOUR_CENTRES[..9].to_vec();
+        let bad_index = 4;
+        let mut targets = base.clone();
+        targets.push(base[bad_index]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: targets.clone(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let config = kappa_ray_config(&targets, [0.0, 0.0], Some((bad_index, [10.0, 0.0])));
+        let protocol = ProtocolConfig::default();
+        let result = fit_recording(
+            &session_dir,
+            &config,
+            &fake_registry(),
+            &protocol,
+            ProfileMeta::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.targets, 9,
+            "the retry shares a position, not a new one"
+        );
+        let frames_per_target = 24;
+        assert_eq!(
+            result.samples,
+            (targets.len() - 1) * frames_per_target,
+            "the rejected presentation's window must be dropped, not merged with the retry's"
+        );
+        assert!(
+            result.rejected_targets.is_empty(),
+            "the retry's unbiased samples replaced the rejected ones: {:?}",
+            result.rejected_targets
+        );
+    }
+
+    #[test]
     fn test_fit_recording_sets_profile_meta() {
         let dir = tempfile::tempdir().unwrap();
         let spec = SyntheticSession {
@@ -759,6 +931,17 @@ mod tests {
         p95: f64,
         hit_rate: Option<f64>,
     ) -> FitResult {
+        fit_result_rejecting(targets, samples, mean, p95, hit_rate, Vec::new())
+    }
+
+    fn fit_result_rejecting(
+        targets: usize,
+        samples: usize,
+        mean: Option<f64>,
+        p95: f64,
+        hit_rate: Option<f64>,
+        rejected_targets: Vec<u32>,
+    ) -> FitResult {
         use eye_bench::metrics::{RegionHit, Summary};
 
         let expected = mean.map(|mean| SessionMetrics {
@@ -790,6 +973,7 @@ mod tests {
             samples,
             targets,
             expected,
+            rejected_targets,
         }
     }
 
@@ -817,10 +1001,20 @@ mod tests {
             samples: 2140,
             targets: 9,
             expected: None,
+            rejected_targets: Vec::new(),
         };
         assert_eq!(
             summary_line(&no_expected),
             "9 targets, 2140 samples; expected accuracy (leave-one-target-out): n/a"
+        );
+    }
+
+    #[test]
+    fn test_summary_lists_twice_rejected_targets() {
+        let result = fit_result_rejecting(9, 2140, Some(1.84), 3.90, Some(1.0), vec![4, 7]);
+        assert_eq!(
+            summary_line(&result),
+            "9 targets, 2140 samples; expected accuracy (leave-one-target-out): mean 1.84 deg, p95 3.90 deg, 3x3 hit 100.0 %; 2 targets rejected: [4, 7]"
         );
     }
 
@@ -938,7 +1132,10 @@ mod tests {
     fn run_live_session(
         live: &mut LiveFeedback,
         messages: Vec<LiveMsg>,
-    ) -> crossbeam_channel::Receiver<Feedback> {
+    ) -> (
+        crossbeam_channel::Receiver<Feedback>,
+        crossbeam_channel::Receiver<eye_overlay::targets::AppendMsg>,
+    ) {
         let mut sink = NullSink;
         run_live_session_with_sink(live, messages, &mut sink)
     }
@@ -947,9 +1144,14 @@ mod tests {
         live: &mut LiveFeedback,
         messages: Vec<LiveMsg>,
         sink: &mut dyn RecordSink,
-    ) -> crossbeam_channel::Receiver<Feedback> {
+    ) -> (
+        crossbeam_channel::Receiver<Feedback>,
+        crossbeam_channel::Receiver<eye_overlay::targets::AppendMsg>,
+    ) {
         let (fb_tx, fb_rx) = crossbeam_channel::unbounded();
         live.attach_feedback(FeedbackSender::new(fb_tx));
+        let (append_tx, append_rx) = crossbeam_channel::unbounded();
+        live.attach_append(AppendSender::new(append_tx));
 
         let (frames_tx, frames_rx) = crossbeam_channel::bounded::<CaptureMsg>(0);
         let (targets_tx, targets_rx) = crossbeam_channel::bounded::<TargetEvent>(0);
@@ -977,7 +1179,20 @@ mod tests {
         .expect("pump finishes");
         sender.join().unwrap();
         assert_eq!(end, crate::commands::record::PumpEnd::Finished);
-        fb_rx
+        (fb_rx, append_rx)
+    }
+
+    /// Drains `rx` and keeps only the `TargetSpec`s it was told to re-present, discarding the
+    /// `Settled` acks `on_hidden` now sends after every refit.
+    fn drain_appended(
+        rx: &crossbeam_channel::Receiver<eye_overlay::targets::AppendMsg>,
+    ) -> Vec<TargetSpec> {
+        rx.try_iter()
+            .filter_map(|msg| match msg {
+                eye_overlay::targets::AppendMsg::Append(spec) => Some(spec),
+                eye_overlay::targets::AppendMsg::Settled => None,
+            })
+            .collect()
     }
 
     fn px_error(fb: &Feedback, target_px: Point2<f64>) -> f64 {
@@ -1002,7 +1217,7 @@ mod tests {
 
         let frames_per_target = (fit_cfg.min_samples_per_target * 2) as u64;
         let messages = live_session(&targets_px, timing, frames_per_target);
-        let fb_rx = run_live_session(&mut live, messages);
+        let (fb_rx, _append_rx) = run_live_session(&mut live, messages);
 
         let feedback: Vec<Feedback> = fb_rx.try_iter().collect();
         assert!(!feedback.is_empty());
@@ -1056,7 +1271,7 @@ mod tests {
 
         let frames_per_target = (fit_cfg.min_samples_per_target * 2) as u64;
         let messages = live_session(&targets_px, timing, frames_per_target);
-        let fb_rx = run_live_session(&mut live, messages);
+        let (fb_rx, _append_rx) = run_live_session(&mut live, messages);
         assert!(live.is_calibrated(), "setup: expected a successful refit");
         fb_rx.try_iter().for_each(drop);
 
@@ -1066,7 +1281,7 @@ mod tests {
         assert!(before.calibrated);
 
         live.samples.clear();
-        live.refit(99);
+        live.refit(99, None);
         assert!(
             live.is_calibrated(),
             "a failed refit must not clear an existing correction"
@@ -1123,7 +1338,7 @@ mod tests {
             .count();
 
         let mut sink = CountingSink { frames: 0 };
-        let fb_rx = run_live_session_with_sink(&mut live, messages, &mut sink);
+        let (fb_rx, _append_rx) = run_live_session_with_sink(&mut live, messages, &mut sink);
 
         assert_eq!(
             sink.frames, frame_count,
@@ -1135,6 +1350,220 @@ mod tests {
             "a slow observer must skip processing some sets ({} feedback for {} frames)",
             feedback.len(),
             frame_count
+        );
+    }
+
+    #[test]
+    fn test_rejected_target_is_represented_once() {
+        let targets_px = FOUR_BY_FOUR_CENTRES.to_vec();
+        let bad = targets_px.len() - 2;
+        let config = kappa_ray_config(&targets_px, [0.0, 0.0], Some((bad, [10.0, 0.0])));
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let timing = TargetProtocol::new(ProtocolConfig::default())
+            .unwrap()
+            .timing();
+        let fit_cfg = FitConfig::default();
+        let mut live =
+            LiveFeedback::with_pipeline(pipeline, timing, fit_cfg, ProfileMeta::default());
+
+        let frames_per_target = (fit_cfg.min_samples_per_target * 2) as u64;
+        let messages = live_session(&targets_px, timing, frames_per_target);
+        let (_fb_rx, append_rx) = run_live_session(&mut live, messages);
+
+        let appended = drain_appended(&append_rx);
+        assert_eq!(appended.len(), 1, "{appended:?}");
+        let expected_px = Point2::new(targets_px[bad].0, targets_px[bad].1);
+        assert_eq!(appended[0].px_logical, expected_px);
+        assert!(appended[0].retry);
+    }
+
+    #[test]
+    fn test_no_verdict_before_baseline() {
+        let targets_px = FOUR_BY_FOUR_CENTRES[..2].to_vec();
+        let config = kappa_ray_config(&targets_px, [0.0, 0.0], Some((0, [10.0, 0.0])));
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let timing = TargetProtocol::new(ProtocolConfig::default())
+            .unwrap()
+            .timing();
+        let fit_cfg = FitConfig::default();
+        assert!(
+            2 < fit_cfg.min_targets_offset,
+            "test assumes no baseline yet"
+        );
+        let mut live =
+            LiveFeedback::with_pipeline(pipeline, timing, fit_cfg, ProfileMeta::default());
+
+        let frames_per_target = (fit_cfg.min_samples_per_target * 2) as u64;
+        let messages = live_session(&targets_px, timing, frames_per_target);
+        let (_fb_rx, append_rx) = run_live_session(&mut live, messages);
+
+        assert!(!live.is_calibrated());
+        assert_eq!(drain_appended(&append_rx).len(), 0);
+    }
+
+    #[test]
+    fn test_retry_with_good_samples_replaces_bad_ones_and_is_not_rejected_again() {
+        use eye_core::GazeRay;
+        use nalgebra::{Matrix2, Matrix3, Point3, Unit};
+
+        let targets_px = FOUR_BY_FOUR_CENTRES.to_vec();
+        let bad = targets_px.len() - 2;
+        let config = kappa_ray_config(&targets_px, [0.0, 0.0], Some((bad, [10.0, 0.0])));
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let timing = TargetProtocol::new(ProtocolConfig::default())
+            .unwrap()
+            .timing();
+        let fit_cfg = FitConfig::default();
+        let mut live =
+            LiveFeedback::with_pipeline(pipeline, timing, fit_cfg, ProfileMeta::default());
+
+        let frames_per_target = (fit_cfg.min_samples_per_target * 2) as u64;
+        let messages = live_session(&targets_px, timing, frames_per_target);
+        let (_fb_rx, append_rx) = run_live_session(&mut live, messages);
+        let appended = drain_appended(&append_rx);
+        assert_eq!(appended.len(), 1, "setup: expected one retry request");
+
+        let bad_px = Point2::new(targets_px[bad].0, targets_px[bad].1);
+        let screen = synthetic_rig().screen().clone();
+        let bad_mm = px_logical_to_mm(&screen, &bad_px);
+
+        let shown = TargetShown {
+            index: targets_px.len(),
+            output: OutputId::from("eDP-1"),
+            px_logical: bad_px,
+            shown_at: Timestamp::from_nanos(10_000_000_000_000),
+            clock: TargetClock::Commit,
+        };
+        live.on_shown(&shown);
+        assert!(
+            !live.samples.iter().any(|s| s.target_mm == bad_mm),
+            "the rejected presentation's samples must be dropped once its retry is shown"
+        );
+
+        let eye = Point3::new(155.0, 85.0, -500.0);
+        let target_point = Point3::new(bad_mm.x, bad_mm.y, 0.0);
+        let direction = Unit::new_normalize(target_point - eye);
+        for _ in 0..(fit_cfg.min_samples_per_target * 2) {
+            live.samples.push(FitSample {
+                ray: GazeRay {
+                    side: None,
+                    origin: eye,
+                    direction,
+                    angular_cov: Matrix2::identity() * 1e-6,
+                    origin_cov: Matrix3::zeros(),
+                },
+                target_mm: bad_mm,
+            });
+        }
+        live.on_hidden(targets_px.len(), Timestamp::from_nanos(10_100_000_000_000));
+
+        assert_eq!(
+            drain_appended(&append_rx).len(),
+            0,
+            "a retry whose samples are now good must not be re-appended"
+        );
+
+        let outcome = DotSessionFit::fit_with(
+            &live.samples,
+            live.pipeline.as_ref().unwrap().rig(),
+            &fit_cfg,
+            ProfileMeta::default(),
+        )
+        .unwrap();
+        let index = target_index_in_samples(&live.samples, bad_mm).unwrap();
+        let verdict = outcome
+            .verdicts()
+            .into_iter()
+            .find(|v| v.index == index)
+            .unwrap();
+        assert!(
+            !verdict.rejected,
+            "verdict for the retried target should no longer be rejected: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn test_retries_stop_appending_at_max_retries() {
+        use eye_core::GazeRay;
+        use nalgebra::{Matrix2, Matrix3, Point3, Unit};
+
+        let targets_px = FOUR_BY_FOUR_CENTRES.to_vec();
+        let bad = targets_px.len() - 2;
+        let config = kappa_ray_config(&targets_px, [0.0, 0.0], Some((bad, [10.0, 0.0])));
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let timing = TargetProtocol::new(ProtocolConfig::default())
+            .unwrap()
+            .timing();
+        let fit_cfg = FitConfig::default();
+        let mut live =
+            LiveFeedback::with_pipeline(pipeline, timing, fit_cfg, ProfileMeta::default());
+
+        let frames_per_target = (fit_cfg.min_samples_per_target * 2) as u64;
+        let messages = live_session(&targets_px, timing, frames_per_target);
+        let (_fb_rx, append_rx) = run_live_session(&mut live, messages);
+        let appended = drain_appended(&append_rx);
+        assert_eq!(appended.len(), 1, "setup: expected the first retry request");
+        assert!(appended[0].retry);
+
+        let bad_px = Point2::new(targets_px[bad].0, targets_px[bad].1);
+        let screen = synthetic_rig().screen().clone();
+        let bad_mm = px_logical_to_mm(&screen, &bad_px);
+        let eye = Point3::new(155.0, 85.0, -500.0);
+        let target_point = Point3::new(bad_mm.x, bad_mm.y, 0.0);
+        let direction = Unit::new_normalize(target_point - eye);
+
+        let present_bad_retry = |live: &mut LiveFeedback, retry_index: usize, at_ns: u64| {
+            let shown = TargetShown {
+                index: retry_index,
+                output: OutputId::from("eDP-1"),
+                px_logical: bad_px,
+                shown_at: Timestamp::from_nanos(at_ns),
+                clock: TargetClock::Commit,
+            };
+            live.on_shown(&shown);
+            // Below `min_samples_per_target`: the fitter rejects this target as TooFewSamples
+            // on every refit, regardless of the shared `direction`.
+            for _ in 0..2 {
+                live.samples.push(FitSample {
+                    ray: GazeRay {
+                        side: None,
+                        origin: eye,
+                        direction,
+                        angular_cov: Matrix2::identity() * 1e-6,
+                        origin_cov: Matrix3::zeros(),
+                    },
+                    target_mm: bad_mm,
+                });
+            }
+            live.on_hidden(retry_index, Timestamp::from_nanos(at_ns + 100_000_000_000));
+        };
+
+        present_bad_retry(&mut live, targets_px.len(), 10_000_000_000_000);
+        let second_retry = drain_appended(&append_rx);
+        assert_eq!(
+            second_retry.len(),
+            1,
+            "the second rejection is still under MAX_RETRIES and must append once more"
+        );
+
+        present_bad_retry(&mut live, targets_px.len() + 1, 10_200_000_000_000);
+        let third_retry = drain_appended(&append_rx);
+        assert_eq!(
+            third_retry.len(),
+            0,
+            "a third rejection of the same target exceeds MAX_RETRIES and must not append"
         );
     }
 }

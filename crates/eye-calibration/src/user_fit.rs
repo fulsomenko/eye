@@ -67,6 +67,42 @@ pub struct FitOutcome {
     pub reports: Vec<EyeFitReport>,
 }
 
+impl FitOutcome {
+    /// One verdict per target index, merged across eyes: an index is `rejected` if any eye's
+    /// diagnostics rejected it. When rejected, the reported `samples`/`residual_deg`/`reason` come
+    /// from whichever rejecting eye has the most samples; when not rejected, they come from
+    /// whichever eye has the most samples.
+    pub fn verdicts(&self) -> Vec<TargetVerdict> {
+        let mut merged: BTreeMap<u32, TargetVerdict> = BTreeMap::new();
+        for report in &self.reports {
+            for v in &report.diagnostics {
+                match merged.entry(v.index) {
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        e.insert(v.clone());
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut e) => {
+                        let existing = e.get_mut();
+                        *existing = merge_verdicts(existing, v);
+                    }
+                }
+            }
+        }
+        merged.into_values().collect()
+    }
+}
+
+/// Merges two eyes' verdicts for the same target index. A rejected result always carries its
+/// `reason`/`residual_deg`/`samples` from a rejecting eye (the one with more samples, if both
+/// reject), never from an eye that accepted the target.
+fn merge_verdicts(a: &TargetVerdict, b: &TargetVerdict) -> TargetVerdict {
+    match (a.rejected, b.rejected) {
+        (true, false) => a.clone(),
+        (false, true) => b.clone(),
+        _ if b.samples > a.samples => b.clone(),
+        _ => a.clone(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EyeFitReport {
     pub key: EyeKey,
@@ -76,11 +112,35 @@ pub struct EyeFitReport {
     pub rms_before_deg: f64,
     pub rms_after_deg: f64,
     pub loo_rms_deg: f64,
+    pub diagnostics: Vec<TargetVerdict>,
+}
+
+/// Why `DotSessionFit` excluded a target from the fit. The limit named by each variant is the
+/// same threshold the fitter itself applies; this is a label on an existing decision, not a new one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TargetReject {
+    TooFewSamples { have: usize, need: usize },
+    Jitter { deg: f64, limit: f64 },
+    Residual { deg: f64, limit: f64 },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TargetVerdict {
+    pub index: u32,
+    pub samples: usize,
+    /// Diagnostic magnitude in the unit the matching `reason` was decided in: degrees of raw
+    /// angular spread for a `TooFewSamples` diagnostic (computed before any model is fit), or the
+    /// fitter's unitless covariance-weighted residual `rho` for a `Residual` diagnostic (computed
+    /// after fitting). The two are not comparable across variants.
+    pub residual_deg: f64,
+    pub rejected: bool,
+    pub reason: Option<TargetReject>,
 }
 
 #[derive(Debug, Clone)]
 struct TargetAgg {
     index: u32,
+    samples: usize,
     observed: Vector2<f64>,
     desired: Vector2<f64>,
     cov_inv: Matrix2<f64>,
@@ -154,6 +214,7 @@ impl DotSessionFit {
         for eye in eyes_present {
             let mut sample_rejected: Vec<u32> = Vec::new();
             let mut usable: Vec<TargetAgg> = Vec::new();
+            let mut diagnostics: Vec<TargetVerdict> = Vec::new();
 
             let mut target_indices: Vec<u32> = (0..target_mm_of.len() as u32)
                 .filter(|i| by_eye_target.contains_key(&(eye, *i)))
@@ -194,6 +255,17 @@ impl DotSessionFit {
                 let n_keep = keep.iter().filter(|&&k| k).count();
                 if n_keep < cfg.min_samples_per_target {
                     sample_rejected.push(idx);
+                    let spread_deg = sample_spread_deg(&es);
+                    diagnostics.push(TargetVerdict {
+                        index: idx,
+                        samples: n_keep,
+                        residual_deg: spread_deg,
+                        rejected: true,
+                        reason: Some(TargetReject::TooFewSamples {
+                            have: n_keep,
+                            need: cfg.min_samples_per_target,
+                        }),
+                    });
                     continue;
                 }
 
@@ -235,6 +307,7 @@ impl DotSessionFit {
 
                 usable.push(TargetAgg {
                     index: idx,
+                    samples: n_keep,
                     observed: o_k,
                     desired: d_k,
                     cov_inv,
@@ -252,6 +325,7 @@ impl DotSessionFit {
                     rms_before_deg: 0.0,
                     rms_after_deg: 0.0,
                     loo_rms_deg: 0.0,
+                    diagnostics,
                 });
                 continue;
             }
@@ -290,14 +364,26 @@ impl DotSessionFit {
 
             let mut rho_sorted = rho.clone();
             let median_rho = median(&mut rho_sorted);
+            let residual_limit = (cfg.target_outlier_factor * median_rho).max(3.0);
             let mut huber_rejected = Vec::new();
             let mut remaining = Vec::new();
             for (t, &r) in usable.iter().zip(&rho) {
-                if r > cfg.target_outlier_factor * median_rho && r > 3.0 {
+                let rejected = r > residual_limit;
+                if rejected {
                     huber_rejected.push(t.index);
                 } else {
                     remaining.push(t.clone());
                 }
+                diagnostics.push(TargetVerdict {
+                    index: t.index,
+                    samples: t.samples,
+                    residual_deg: r,
+                    rejected,
+                    reason: rejected.then_some(TargetReject::Residual {
+                        deg: r,
+                        limit: residual_limit,
+                    }),
+                });
             }
 
             let mut targets_rejected = sample_rejected.clone();
@@ -313,6 +399,7 @@ impl DotSessionFit {
                     rms_before_deg: 0.0,
                     rms_after_deg: 0.0,
                     loo_rms_deg: 0.0,
+                    diagnostics,
                 });
                 continue;
             }
@@ -430,6 +517,7 @@ impl DotSessionFit {
                 rms_before_deg: rms_before,
                 rms_after_deg: rms_after,
                 loo_rms_deg: loo_rms,
+                diagnostics,
             });
         }
 
@@ -466,6 +554,14 @@ fn reject_sample_outliers(es: &[Vector2<f64>], cfg: &FitConfig) -> Vec<bool> {
     es.iter()
         .map(|e| (e.x - med_x).abs() <= thresh_x && (e.y - med_y).abs() <= thresh_y)
         .collect()
+}
+
+fn sample_spread_deg(es: &[Vector2<f64>]) -> f64 {
+    let xs: Vec<f64> = es.iter().map(|e| e.x).collect();
+    let ys: Vec<f64> = es.iter().map(|e| e.y).collect();
+    let (_, mad_x) = median_mad(&xs);
+    let (_, mad_y) = median_mad(&ys);
+    (1.4826 * mad_x).hypot(1.4826 * mad_y).to_degrees()
 }
 
 fn median_mad(values: &[f64]) -> (f64, f64) {
@@ -889,6 +985,179 @@ mod tests {
         let th = right.theta;
         assert_abs_diff_eq!(deg(th[0]), -1.9048, epsilon = 0.3);
         assert_abs_diff_eq!(deg(th[3]), 1.0309, epsilon = 0.3);
+    }
+
+    #[test]
+    fn test_verdicts_match_fit_outcome_rejections() {
+        let mut samples = generate_session(&SessionConfig::default());
+        let per_target = SessionConfig::default().samples_per_target;
+        for i in 0..per_target {
+            let idx = 4 * per_target + i;
+            add_yaw_bias_deg(&mut samples[idx], 8.0);
+        }
+        let outcome = DotSessionFit::fit_with(
+            &samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap();
+        let report = outcome
+            .reports
+            .iter()
+            .find(|r| r.key == EyeKey::Right)
+            .unwrap();
+        let verdicts = outcome.verdicts();
+        for &idx in &report.targets_rejected {
+            let v = verdicts.iter().find(|v| v.index == idx).unwrap();
+            assert!(v.rejected, "target {idx}");
+            assert!(v.reason.is_some(), "target {idx}");
+        }
+        for &idx in &report.targets_used {
+            let v = verdicts.iter().find(|v| v.index == idx).unwrap();
+            assert!(!v.rejected, "target {idx}");
+            assert!(v.reason.is_none(), "target {idx}");
+        }
+    }
+
+    #[test]
+    fn test_verdict_residual_limit_equals_target_outlier_factor_times_spread() {
+        let mut samples = generate_session(&SessionConfig::default());
+        let per_target = SessionConfig::default().samples_per_target;
+        for i in 0..per_target {
+            let idx = 4 * per_target + i;
+            add_yaw_bias_deg(&mut samples[idx], 8.0);
+        }
+        let cfg = FitConfig::default();
+        let outcome =
+            DotSessionFit::fit_with(&samples, &fixture_rig(), &cfg, ProfileMeta::default())
+                .unwrap();
+        let verdicts = outcome.verdicts();
+        let rejected = verdicts
+            .iter()
+            .find(|v| v.index == 4)
+            .expect("target 4 is rejected");
+        let Some(TargetReject::Residual { deg, limit }) = rejected.reason else {
+            panic!("expected a Residual reason, got {:?}", rejected.reason);
+        };
+        assert_eq!(deg, rejected.residual_deg);
+
+        let mut spread: Vec<f64> = verdicts
+            .iter()
+            .filter(|v| !matches!(v.reason, Some(TargetReject::TooFewSamples { .. })))
+            .map(|v| v.residual_deg)
+            .collect();
+        spread.sort_by(f64::total_cmp);
+        let median_rho = median(&mut spread);
+        assert_abs_diff_eq!(
+            limit,
+            (cfg.target_outlier_factor * median_rho).max(3.0),
+            epsilon = 1e-9
+        );
+    }
+
+    #[test]
+    fn test_verdicts_merge_takes_reason_from_rejecting_eye_not_accepting_eye() {
+        let right_cfg = SessionConfig {
+            side: Some(Side::Right),
+            bias: UNBIASED,
+            seed: 11,
+            ..SessionConfig::default()
+        };
+        let right_samples = generate_session(&right_cfg);
+
+        let left_cfg = SessionConfig {
+            side: Some(Side::Left),
+            bias: UNBIASED,
+            base_xy: (125.0, 60.0),
+            seed: 23,
+            ..SessionConfig::default()
+        };
+        let per_target = left_cfg.samples_per_target;
+        let starved_target = 4u32;
+        let left_samples: Vec<FitSample> = generate_session(&left_cfg)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                let target = i / per_target;
+                target != starved_target as usize || i % per_target < 2
+            })
+            .map(|(_, s)| s)
+            .collect();
+
+        let mut samples = right_samples;
+        samples.extend(left_samples);
+
+        let outcome = DotSessionFit::fit_with(
+            &samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap();
+
+        let right_report = outcome
+            .reports
+            .iter()
+            .find(|r| r.key == EyeKey::Right)
+            .unwrap();
+        let left_report = outcome
+            .reports
+            .iter()
+            .find(|r| r.key == EyeKey::Left)
+            .unwrap();
+        assert!(
+            right_report.targets_used.contains(&starved_target),
+            "setup: the right eye should accept target {starved_target}: {:?}",
+            right_report.targets_used
+        );
+        assert!(
+            left_report.targets_rejected.contains(&starved_target),
+            "setup: the left eye should reject target {starved_target}: {:?}",
+            left_report.targets_rejected
+        );
+
+        let merged = outcome.verdicts();
+        let v = merged
+            .iter()
+            .find(|v| v.index == starved_target)
+            .expect("a verdict exists for the starved target");
+        assert!(v.rejected, "{v:?}");
+        assert!(
+            matches!(v.reason, Some(TargetReject::TooFewSamples { .. })),
+            "a merged rejected verdict must carry a rejecting eye's reason: {v:?}"
+        );
+    }
+
+    #[test]
+    fn test_sample_rejection_reports_too_few_samples_not_jitter() {
+        let samples = generate_session(&SessionConfig::default());
+        let per_target = SessionConfig::default().samples_per_target;
+        let kept_for_target4 = 2;
+        let samples: Vec<FitSample> = samples
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                let target = i / per_target;
+                target != 4 || i % per_target < kept_for_target4
+            })
+            .map(|(_, s)| s)
+            .collect();
+        let outcome = DotSessionFit::fit_with(
+            &samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap();
+        let verdicts = outcome.verdicts();
+        let v = verdicts.iter().find(|v| v.index == 4).unwrap();
+        assert!(v.rejected);
+        assert!(
+            matches!(v.reason, Some(TargetReject::TooFewSamples { have, .. }) if have == kept_for_target4),
+            "{:?}",
+            v.reason
+        );
     }
 
     #[test]

@@ -18,6 +18,30 @@ pub fn position_key(window: &FixationWindow) -> (u64, u64) {
     (window.target_mm.x.to_bits(), window.target_mm.y.to_bits())
 }
 
+/// A `fit_samples` include predicate for a recording that may carry online retries: a live
+/// retry is appended after the base protocol's full sequence, so its window's `index` is
+/// `>= base_len`. For a position with such a window, only the LATEST one (replacing the
+/// rejected presentation and any earlier retries) is kept; a position never retried (including
+/// one legitimately repeated within the base protocol, where every window's `index < base_len`)
+/// keeps all of its windows, unchanged.
+pub fn latest_presentation(
+    windows: &[FixationWindow],
+    base_len: u32,
+) -> impl Fn(&FixationWindow) -> bool + '_ {
+    move |w| {
+        let key = position_key(w);
+        let latest_retry = windows
+            .iter()
+            .filter(|o| o.index >= base_len && position_key(o) == key)
+            .map(|o| o.index)
+            .max();
+        match latest_retry {
+            Some(latest) => w.index == latest,
+            None => true,
+        }
+    }
+}
+
 /// Every uncorrected ray of every batch whose timestamp lies in a window selected by `include`,
 /// with that window's `target_mm`.
 pub fn fit_samples<'a>(
