@@ -117,6 +117,9 @@ pub struct FusedEstimator {
     ir: IrChain,
     /// Latest ir-pupil-pair observation from earlier calls (the previous bracket).
     prev_ir: Option<Observations>,
+    /// Most recent landmark head pose and its frame time, lent to IR-only batches within
+    /// `max_bracket_ms`.
+    last_viewer: Option<(Timestamp, UnitQuaternion<f64>)>,
 }
 
 impl FusedEstimator {
@@ -136,6 +139,7 @@ impl FusedEstimator {
             params: EyeParams::default(),
             ir,
             prev_ir: None,
+            last_viewer: None,
             options,
         }
     }
@@ -177,12 +181,40 @@ impl FusedEstimator {
         obs: &[Observations],
         rig: &Rig,
     ) -> Result<Vec<(Side, FusedSource, GazeRay)>, EstimateError> {
-        Ok(self
-            .ir
-            .estimate(obs, rig)?
-            .into_iter()
-            .filter_map(|r| r.side.map(|side| (side, FusedSource::IrOnly, r)))
-            .collect())
+        let rays = self.ir.estimate(obs, rig)?;
+        let mut logged = false;
+        let mut out = Vec::new();
+        for ray in rays {
+            let Some(side) = ray.side else { continue };
+            let lend = self
+                .last_viewer
+                .filter(|(t, _)| {
+                    ray.timestamp.nanos_since(*t).unsigned_abs() as f64 / 1e6
+                        <= self.options.max_bracket_ms
+                })
+                .map(|(_, v)| v);
+            if let (Some((t, _)), Some(_)) = (self.last_viewer, lend)
+                && !logged
+            {
+                logged = true;
+                let age_ms = ray.timestamp.nanos_since(t) as f64 / 1e6;
+                tracing::debug!(
+                    { field::REASON } = "pose_lent",
+                    age_ms,
+                    "ir-only candidate stamped"
+                );
+            }
+            let head_rotation = ray.head_rotation.or(lend);
+            out.push((
+                side,
+                FusedSource::IrOnly,
+                GazeRay {
+                    head_rotation,
+                    ..ray
+                },
+            ));
+        }
+        Ok(out)
     }
 
     fn dual_or_rgb_candidates(
@@ -197,14 +229,27 @@ impl FusedEstimator {
             None => self.ir.estimate(ir_pairs, rig)?,
         };
 
+        let frame = self.landmark.estimate_frame(rgb, rig)?;
+        let lent = frame.as_ref().map(|f| f.viewer);
+        if let Some(f) = &frame {
+            self.last_viewer = Some((f.timestamp, f.viewer));
+        }
+
         let mut out = Vec::new();
         for ray in &i_rays {
             if let Some(side) = ray.side {
-                out.push((side, FusedSource::IrOnly, ray.clone()));
+                out.push((
+                    side,
+                    FusedSource::IrOnly,
+                    GazeRay {
+                        head_rotation: ray.head_rotation.or(lent),
+                        ..ray.clone()
+                    },
+                ));
             }
         }
 
-        if let Some(frame) = self.landmark.estimate_frame(rgb, rig)? {
+        if let Some(frame) = &frame {
             for eye in &frame.eyes {
                 let side = eye.side;
                 out.push((side, FusedSource::RgbOnly, eye.ray.clone()));
@@ -216,7 +261,7 @@ impl FusedEstimator {
                     continue;
                 };
 
-                if let Some((x_ray, source)) = self.cross_chain(eye, &frame, aligned_obs, rig)? {
+                if let Some((x_ray, source)) = self.cross_chain(eye, frame, aligned_obs, rig)? {
                     trace_ray(source.as_str(), &x_ray);
                     out.push((side, source, x_ray));
                 }
@@ -1134,16 +1179,133 @@ mod tests {
 
         for (_, source, ray) in &candidates2 {
             match source {
-                FusedSource::Stereo | FusedSource::InverseCovariance | FusedSource::RgbOnly => {
+                FusedSource::Stereo
+                | FusedSource::InverseCovariance
+                | FusedSource::RgbOnly
+                | FusedSource::IrOnly => {
                     assert_eq!(ray.timestamp, Timestamp::from_nanos(68_000_000));
                     assert!(ray.head_rotation.is_some());
                 }
-                FusedSource::IrOnly => {
-                    assert_eq!(ray.timestamp, Timestamp::from_nanos(68_000_000));
-                    assert_eq!(ray.head_rotation, None);
-                }
                 FusedSource::IrOnRgbEyeball => {}
             }
+        }
+    }
+
+    #[test]
+    fn test_ir_only_candidates_borrow_rgb_head_pose_in_dual_mode() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+
+        let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 1.0, 3);
+        let mut ir = synthetic_ir_observation_at(&rig, centres, target, 0.2, 3);
+        ir.timestamp = rgb.timestamp;
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        let candidates = estimator
+            .candidates(&[rgb.clone(), ir], &rig)
+            .expect("estimate succeeds");
+
+        let mut reference = LandmarkEstimator::new(LandmarkOptions {
+            apply_kappa: false,
+            ..Default::default()
+        });
+        let frame = reference
+            .estimate_frame(&rgb, &rig)
+            .expect("estimate succeeds")
+            .expect("frame recovered");
+
+        let ir_only: Vec<_> = candidates
+            .iter()
+            .filter(|(_, source, _)| *source == FusedSource::IrOnly)
+            .collect();
+        assert!(!ir_only.is_empty(), "expected IrOnly candidates");
+        for (side, _, ray) in ir_only {
+            assert_eq!(
+                ray.head_rotation,
+                Some(frame.viewer),
+                "side {side:?} missing lent head pose"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ir_only_mode_lends_last_rgb_pose_within_bracket() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+
+        let mut ir0 = synthetic_ir_observation_at(&rig, centres, target, 0.0, 1);
+        ir0.timestamp = Timestamp::from_nanos(0);
+        let mut rgb0 = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.0, 1);
+        rgb0.timestamp = Timestamp::from_nanos(0);
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        estimator
+            .candidates(&[rgb0.clone(), ir0], &rig)
+            .expect("call 1 succeeds");
+
+        let mut ir100 = synthetic_ir_observation_at(&rig, centres, target, 0.0, 2);
+        ir100.timestamp = Timestamp::from_nanos(100_000_000);
+        let candidates2 = estimator
+            .candidates(&[ir100], &rig)
+            .expect("call 2 succeeds");
+
+        let mut reference = LandmarkEstimator::new(LandmarkOptions {
+            apply_kappa: false,
+            ..Default::default()
+        });
+        let frame = reference
+            .estimate_frame(&rgb0, &rig)
+            .expect("estimate succeeds")
+            .expect("frame recovered");
+
+        assert!(!candidates2.is_empty(), "expected IrOnly candidates");
+        for (side, source, ray) in &candidates2 {
+            assert_eq!(*source, FusedSource::IrOnly);
+            assert_eq!(
+                ray.head_rotation,
+                Some(frame.viewer),
+                "side {side:?} missing lent head pose"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ir_only_mode_has_no_pose_beyond_bracket() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+
+        let mut ir0 = synthetic_ir_observation_at(&rig, centres, target, 0.0, 1);
+        ir0.timestamp = Timestamp::from_nanos(0);
+        let mut rgb0 = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.0, 1);
+        rgb0.timestamp = Timestamp::from_nanos(0);
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        estimator
+            .candidates(&[rgb0, ir0], &rig)
+            .expect("call 1 succeeds");
+
+        let mut ir400 = synthetic_ir_observation_at(&rig, centres, target, 0.0, 2);
+        ir400.timestamp = Timestamp::from_nanos(400_000_000);
+        let candidates2 = estimator
+            .candidates(&[ir400], &rig)
+            .expect("call 2 succeeds");
+
+        assert!(!candidates2.is_empty(), "expected IrOnly candidates");
+        for (side, source, ray) in &candidates2 {
+            assert_eq!(*source, FusedSource::IrOnly);
+            assert_eq!(
+                ray.head_rotation, None,
+                "side {side:?} unexpected lent pose"
+            );
         }
     }
 
