@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use eye_core::Frame;
+use eye_core::{Frame, log::field};
 
 use super::{
     FRAMES_DIR, INDEX_FILE, IndexRecord, RecordedCamera, RecordedFormat, SESSION_FILE, SessionMeta,
@@ -20,6 +20,8 @@ pub struct SessionWriter {
     cameras: HashMap<String, RecordedCamera>,
     index: BufWriter<File>,
     targets: BufWriter<File>,
+    frame_count: u64,
+    target_count: u64,
 }
 
 fn io_err(path: &Path) -> impl Fn(io::Error) -> CaptureError + '_ {
@@ -86,11 +88,20 @@ impl SessionWriter {
             .map(|c| (c.id.clone(), c.clone()))
             .collect();
 
+        tracing::info!(
+            { field::SESSION_ID } = meta.session_id.as_str(),
+            dir = %dir.display(),
+            cameras = meta.cameras.len(),
+            "session created"
+        );
+
         Ok(Self {
             dir,
             cameras,
             index,
             targets,
+            frame_count: 0,
+            target_count: 0,
         })
     }
 
@@ -150,14 +161,25 @@ impl SessionWriter {
         serde_json::to_writer(&mut self.index, &record).map_err(|e| self.bad(e.to_string()))?;
         self.index
             .write_all(b"\n")
-            .map_err(io_err(&self.dir.join(INDEX_FILE)))
+            .map_err(io_err(&self.dir.join(INDEX_FILE)))?;
+        self.frame_count += 1;
+        tracing::debug!(
+            { field::CAMERA } = cam.id.as_str(),
+            { field::SEQ } = h.seq,
+            bytes = bytes.len(),
+            "frame written"
+        );
+        Ok(())
     }
 
     pub fn write_target(&mut self, target: &TargetRecord) -> Result<(), CaptureError> {
         serde_json::to_writer(&mut self.targets, target).map_err(|e| self.bad(e.to_string()))?;
         self.targets
             .write_all(b"\n")
-            .map_err(io_err(&self.dir.join(TARGETS_FILE)))
+            .map_err(io_err(&self.dir.join(TARGETS_FILE)))?;
+        self.target_count += 1;
+        tracing::debug!({ field::SEQ } = target.seq, "target written");
+        Ok(())
     }
 
     pub fn finish(mut self) -> Result<PathBuf, CaptureError> {
@@ -175,6 +197,12 @@ impl SessionWriter {
             .get_ref()
             .sync_all()
             .map_err(io_err(&self.dir.join(TARGETS_FILE)))?;
+        tracing::info!(
+            dir = %self.dir.display(),
+            frames = self.frame_count,
+            targets = self.target_count,
+            "session written"
+        );
         Ok(self.dir)
     }
 }
@@ -434,5 +462,60 @@ mod tests {
         let _writer = SessionWriter::create(root.path(), &meta()).unwrap();
         let err = SessionWriter::create(root.path(), &meta()).unwrap_err();
         assert!(matches!(err, CaptureError::RecordingIo { .. }));
+    }
+
+    #[test]
+    fn test_logs_session_created_and_written_at_info() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut writer = SessionWriter::create(root.path(), &meta()).unwrap();
+            writer
+                .write_frame(&gray_frame("ir", 7, 1_000, 640, 360, 45))
+                .unwrap();
+            writer
+                .write_frame(&mjpeg_frame("rgb", 3, 2_000, b"\xff\xd8abc\xff\xd9"))
+                .unwrap();
+            writer
+                .write_target(&target(
+                    0,
+                    1_000_000_000,
+                    Some(3_000_000_000),
+                    TargetClock::Presentation,
+                    [960.0, 540.0],
+                    [155.0, 85.0],
+                ))
+                .unwrap();
+            writer.finish().unwrap();
+        });
+
+        let created: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "session created")
+            .collect();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].level, eye_log::Level::Info);
+        assert_eq!(created[0].fields["cameras"], eye_log::Value::U64(2));
+        assert_eq!(
+            created[0].fields[field::SESSION_ID],
+            eye_log::Value::Str("20261007T221500Z".to_string())
+        );
+
+        let written: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "session written")
+            .collect();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].level, eye_log::Level::Info);
+        assert_eq!(written[0].fields["frames"], eye_log::Value::U64(2));
+        assert_eq!(written[0].fields["targets"], eye_log::Value::U64(1));
+
+        let frame_written: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "frame written")
+            .collect();
+        assert_eq!(frame_written.len(), 2);
+        for rec in &frame_written {
+            assert!(matches!(rec.fields["bytes"], eye_log::Value::U64(_)));
+        }
     }
 }

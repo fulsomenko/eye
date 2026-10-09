@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use eye_core::{CameraId, Frame, FrameHeader, Timestamp};
+use eye_core::{CameraId, Frame, FrameHeader, Timestamp, log::field};
 
 use super::{
     FORMAT_VERSION, INDEX_FILE, IndexRecord, RecordedCamera, RecordedFormat, SESSION_FILE,
@@ -150,12 +150,22 @@ impl Recording {
         let targets: Vec<TargetRecord> =
             parse_jsonl(&targets_path, &read_to_string(&targets_path)?)?;
 
-        Ok(Self {
+        let out = Self {
             dir,
             meta,
             index,
             targets,
-        })
+        };
+        tracing::info!(
+            { field::SESSION_ID } = out.meta.session_id.as_str(),
+            dir = %out.dir.display(),
+            cameras = out.meta.cameras.len(),
+            frames = out.index.len(),
+            targets = out.targets.len(),
+            duration_ms = out.duration().map(|d| d.as_millis() as u64).unwrap_or(0),
+            "recording opened"
+        );
+        Ok(out)
     }
 
     pub fn dir(&self) -> &Path {
@@ -649,6 +659,30 @@ mod tests {
         assert_eq!(found_pairs, expected_pairs);
         assert_eq!(ir_alone, 16);
         assert_eq!(rgb_alone, 0);
+    }
+
+    #[test]
+    fn test_logs_recording_opened_at_info() {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, _) = write_session(root.path(), 3);
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            Recording::open(&dir).unwrap()
+        });
+        let opened: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "recording opened")
+            .collect();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].level, eye_log::Level::Info);
+        assert_eq!(
+            opened[0].fields[field::SESSION_ID],
+            eye_log::Value::Str("20261007T221500Z".to_string())
+        );
+        assert!(matches!(opened[0].fields["frames"], eye_log::Value::U64(_)));
+        assert!(matches!(
+            opened[0].fields["duration_ms"],
+            eye_log::Value::U64(_)
+        ));
     }
 
     #[test]

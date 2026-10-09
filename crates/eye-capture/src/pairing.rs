@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use eye_core::{CameraId, CameraInfo, Frame, FrameSet, Illumination, PixelFormat, Timestamp};
+use eye_core::{
+    CameraId, CameraInfo, Frame, FrameSet, Illumination, PixelFormat, Timestamp, log::field,
+};
 
 use crate::CaptureError;
 
@@ -83,21 +85,34 @@ impl Pairer {
             .iter()
             .position(|id| *id == frame.header().camera)
         else {
-            tracing::warn!(camera = %frame.header().camera, "frame from a camera the pairer does not know");
+            tracing::warn!(
+                { field::CAMERA } = frame.header().camera.as_str(),
+                { field::SEQ } = frame.header().seq,
+                "frame from a camera the pairer does not know"
+            );
             return vec![FrameSet::single(frame)];
         };
         let Some(cfg) = self.cfg else {
+            log_alone(&frame, "single_camera");
             return vec![FrameSet::single(frame)];
         };
         let mut out = Vec::new();
         if side == 1 {
             if let Some(old) = self.held.take() {
+                log_alone(&old, "superseded");
                 out.push(FrameSet::single(old));
             }
             let t = shifted(&frame, cfg.offset_secondary_ns);
             if self.last_lit.is_some_and(|lit| lit.as_nanos() as i128 > t) {
+                log_alone(&frame, "lit_primary_passed");
                 out.push(FrameSet::single(frame));
             } else {
+                let h = frame.header();
+                tracing::debug!(
+                    { field::CAMERA } = h.camera.as_str(),
+                    { field::SEQ } = h.seq,
+                    "frame held"
+                );
                 self.held = Some(frame);
             }
             return out;
@@ -108,12 +123,21 @@ impl Pairer {
             let d = t.as_nanos() as i128 - shifted(&held, cfg.offset_secondary_ns);
             if lit && d > 0 && d <= cfg.bracket_window.as_nanos() as i128 {
                 self.last_lit = Some(self.last_lit.map_or(t, |l| l.max(t)));
+                tracing::debug!(
+                    { field::CAMERA } = frame.header().camera.as_str(),
+                    { field::SEQ } = frame.header().seq,
+                    secondary_camera = held.header().camera.as_str(),
+                    secondary_seq = held.header().seq,
+                    delta_ns = d as i64,
+                    "frames paired"
+                );
                 out.push(
                     FrameSet::new(vec![frame, held]).expect("a pair holds two distinct cameras"),
                 );
                 return out;
             }
             if d > cfg.bracket_window.as_nanos() as i128 {
+                log_alone(&held, "bracket_window_expired");
                 out.push(FrameSet::single(held));
             } else {
                 self.held = Some(held);
@@ -122,14 +146,28 @@ impl Pairer {
         if lit {
             self.last_lit = Some(self.last_lit.map_or(t, |l| l.max(t)));
         }
+        log_alone(&frame, "unpaired_primary");
         out.push(FrameSet::single(frame));
         out
     }
 
     /// Emits the held secondary frame alone (end of stream, or the caller decided a camera stalled).
     pub fn flush(&mut self) -> Option<FrameSet> {
-        self.held.take().map(FrameSet::single)
+        self.held.take().map(|frame| {
+            log_alone(&frame, "flush");
+            FrameSet::single(frame)
+        })
     }
+}
+
+fn log_alone(frame: &Frame, reason: &'static str) {
+    let h = frame.header();
+    tracing::debug!(
+        { field::CAMERA } = h.camera.as_str(),
+        { field::SEQ } = h.seq,
+        { field::REASON } = reason,
+        "frame emitted alone"
+    );
 }
 
 fn shifted(frame: &Frame, offset_ns: i64) -> i128 {
@@ -331,6 +369,130 @@ mod tests {
         let out = pairer.push(ir(4, 4 * T, Illumination::IrLit));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].frames().len(), 2);
+    }
+
+    #[test]
+    fn test_logs_unknown_camera_at_warn_with_seq() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut pairer = Pairer::new(&infos()).unwrap();
+            pairer.push(rgb(0, 3 * T - 3_000_000));
+            let mut depth_frame = gray_frame("depth", 0, 3 * T, 4, 2, 0);
+            depth_frame.set_illumination(Illumination::Unknown);
+            pairer.push(depth_frame);
+        });
+        let warn: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "frame from a camera the pairer does not know")
+            .collect();
+        assert_eq!(warn.len(), 1);
+        assert_eq!(warn[0].level, eye_log::Level::Warn);
+        assert_eq!(warn[0].fields[field::SEQ], eye_log::Value::U64(0));
+    }
+
+    #[test]
+    fn test_logs_frames_paired_at_debug() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            drive(Pairer::new(&infos()).unwrap(), r30(9))
+        });
+        let paired: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "frames paired")
+            .collect();
+        assert_eq!(paired.len(), 3);
+        for rec in &paired {
+            assert_eq!(rec.level, eye_log::Level::Debug);
+            assert_eq!(
+                rec.fields["secondary_camera"],
+                eye_log::Value::Str("rgb".to_string())
+            );
+            match rec.fields["delta_ns"] {
+                eye_log::Value::I64(d) => assert!(d > 0),
+                ref other => panic!("expected I64, got {other:?}"),
+            }
+        }
+        let held_indices: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.message == "frame held")
+            .map(|(i, _)| i)
+            .collect();
+        let paired_indices: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.message == "frames paired")
+            .map(|(i, _)| i)
+            .collect();
+        assert!(held_indices.len() >= paired_indices.len());
+        let mut remaining_held = held_indices.clone();
+        for &paired_idx in &paired_indices {
+            let pos = remaining_held
+                .iter()
+                .position(|&h| h < paired_idx)
+                .expect("a `frame held` record precedes each `frames paired`");
+            remaining_held.remove(pos);
+        }
+    }
+
+    #[test]
+    fn test_logs_frame_emitted_alone_at_debug_with_reason() {
+        let frames = vec![
+            ir(1, T, Illumination::Ambient),
+            rgb(0, T - 3_000_000),
+            ir(2, 2 * T, Illumination::Ambient),
+            ir(3, 3 * T, Illumination::Ambient),
+        ];
+        let (flushed, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut pairer = Pairer::new(&infos()).unwrap();
+            for frame in frames {
+                pairer.push(frame);
+            }
+            pairer.flush()
+        });
+        assert!(flushed.is_none());
+        let alone: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "frame emitted alone")
+            .collect();
+        for rec in &alone {
+            assert_eq!(rec.level, eye_log::Level::Debug);
+        }
+        let reasons: Vec<eye_log::Value> = alone
+            .iter()
+            .map(|r| r.fields[field::REASON].clone())
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                eye_log::Value::Str("unpaired_primary".to_string()),
+                eye_log::Value::Str("unpaired_primary".to_string()),
+                eye_log::Value::Str("bracket_window_expired".to_string()),
+                eye_log::Value::Str("unpaired_primary".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_logs_flush_emits_held_secondary_alone_at_debug() {
+        let (flushed, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut pairer = Pairer::new(&infos()).unwrap();
+            pairer.push(rgb(0, 3 * T - 3_000_000));
+            pairer.flush()
+        });
+        assert!(flushed.is_some());
+        let alone: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "frame emitted alone")
+            .collect();
+        assert_eq!(alone.len(), 1);
+        assert_eq!(alone[0].level, eye_log::Level::Debug);
+        assert_eq!(
+            alone[0].fields[field::REASON],
+            eye_log::Value::Str("flush".to_string())
+        );
+        assert_eq!(
+            alone[0].fields[field::CAMERA],
+            eye_log::Value::Str("rgb".to_string())
+        );
     }
 
     proptest! {

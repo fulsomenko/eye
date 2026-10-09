@@ -21,6 +21,7 @@ v4l.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
+eye-log.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 

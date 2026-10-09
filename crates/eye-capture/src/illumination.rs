@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use eye_core::{CameraInfo, Frame, Illumination, PixelFormat, Timestamp};
+use eye_core::{CameraInfo, Frame, Illumination, PixelFormat, Timestamp, log::field};
 
 use crate::{
     CaptureError,
@@ -125,7 +125,20 @@ impl IlluminationTagger {
             Evidence::Vote(_) => self.flat_run = 0,
             Evidence::None => {}
         }
+        let old_state = self.state;
         self.state = self.next_state(evidence);
+        if state_label(old_state) != state_label(self.state)
+            || lit_parity_of(old_state) != lit_parity_of(self.state)
+        {
+            tracing::debug!(
+                { field::SEQ } = seq,
+                from = state_label(old_state),
+                to = state_label(self.state),
+                lit_parity = lit_parity_of(self.state),
+                flat_run = self.flat_run,
+                "tagger state changed"
+            );
+        }
         match self.state {
             TaggerState::Locked { lit_parity, .. } if (seq % 2) as u8 == lit_parity => {
                 Illumination::IrLit
@@ -142,6 +155,13 @@ impl IlluminationTagger {
         let lit_parity = if lit { parity } else { 1 - parity };
         self.prev = Some((seq, mean));
         self.flat_run = 0;
+        if !matches!(self.state, TaggerState::Locked { .. }) {
+            tracing::debug!(
+                { field::SEQ } = seq,
+                lit_parity,
+                "tagger locked by metadata"
+            );
+        }
         self.state = TaggerState::Locked {
             lit_parity,
             contradictions: 0,
@@ -222,6 +242,21 @@ impl IlluminationTagger {
     }
 }
 
+fn state_label(state: TaggerState) -> &'static str {
+    match state {
+        TaggerState::Searching { .. } => "searching",
+        TaggerState::Locked { .. } => "locked",
+        TaggerState::NotAlternating => "not_alternating",
+    }
+}
+
+fn lit_parity_of(state: TaggerState) -> i64 {
+    match state {
+        TaggerState::Locked { lit_parity, .. } => i64::from(lit_parity),
+        _ => -1,
+    }
+}
+
 pub fn mean_brightness(data: &[u8], width: u32, height: u32, step: usize) -> f64 {
     let (mut sum, mut n) = (0u64, 0u64);
     for row in data
@@ -257,6 +292,7 @@ impl MetaMatcher {
             };
             let d = record.timestamp.nanos_since(t);
             if d < -tol {
+                tracing::trace!(delta_ns = d, "stale metadata record skipped");
                 continue;
             }
             if d > tol {
@@ -322,9 +358,14 @@ impl<S: FrameSource> TaggedSource<S> {
             }
             Ok(None) => {
                 m.misses += 1;
+                tracing::debug!(
+                    { field::CAMERA } = self.inner.camera().id.as_str(),
+                    misses = m.misses,
+                    "no metadata for frame"
+                );
                 if m.misses >= self.tagger.cfg.meta_max_misses {
                     tracing::warn!(
-                        camera = %self.inner.camera().id,
+                        { field::CAMERA } = self.inner.camera().id.as_str(),
                         misses = m.misses,
                         "no FrameIllumination metadata; tagging by brightness"
                     );
@@ -334,8 +375,8 @@ impl<S: FrameSource> TaggedSource<S> {
             }
             Err(err) => {
                 tracing::warn!(
-                    camera = %self.inner.camera().id,
-                    %err,
+                    { field::CAMERA } = self.inner.camera().id.as_str(),
+                    error = %err,
                     "metadata stream failed; tagging by brightness"
                 );
                 self.meta = None;
@@ -356,12 +397,27 @@ impl<S: FrameSource> FrameSource for TaggedSource<S> {
         if h.format != PixelFormat::Gray8 {
             return Ok(frame);
         }
+        let _frame_span = eye_core::log::frame_span(
+            h.camera.as_str(),
+            h.seq,
+            h.timestamp.as_nanos(),
+            h.illumination.as_str(),
+            1,
+        )
+        .entered();
         let (seq, t) = (h.seq, h.timestamp);
         let mean = mean_brightness(frame.data(), h.width, h.height, self.tagger.cfg.sample_step);
-        let tag = match self.meta_flag(t) {
-            Some(lit) => self.tagger.observe(seq, mean, lit),
-            None => self.tagger.tag(seq, mean),
+        let (tag, source) = match self.meta_flag(t) {
+            Some(lit) => (self.tagger.observe(seq, mean, lit), "meta"),
+            None => (self.tagger.tag(seq, mean), "brightness"),
         };
+        tracing::trace!(
+            mean,
+            { field::ILLUMINATION } = tag.as_str(),
+            source,
+            state = state_label(self.tagger.state()),
+            "frame tagged"
+        );
         frame.set_illumination(tag);
         Ok(frame)
     }
@@ -905,6 +961,142 @@ mod tests {
                 Illumination::IrDark,
             ]
         );
+    }
+
+    // --- logging ---
+
+    #[test]
+    fn test_logs_frame_tagged_at_trace_with_mean_and_source() {
+        let info = camera_info("ir", PixelFormat::Gray8, 64, 36);
+        let frames = ir_frames(&[0, 49, 0, 48]);
+        let src = VecSource::new(info, frames);
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut tagged = TaggedSource::new(src, TaggerConfig::default()).unwrap();
+            for _ in 0..4 {
+                tagged.next_frame().unwrap();
+            }
+        });
+        let tagged_records: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "frame tagged")
+            .collect();
+        assert_eq!(tagged_records.len(), 4);
+        for rec in &tagged_records {
+            assert_eq!(rec.level, eye_log::Level::Trace);
+        }
+        assert_eq!(tagged_records[1].fields["mean"], eye_log::Value::F64(49.0));
+        assert_eq!(
+            tagged_records[1].fields["source"],
+            eye_log::Value::Str("brightness".to_string())
+        );
+        assert!(matches!(
+            tagged_records[1].fields[field::ILLUMINATION],
+            eye_log::Value::Str(_)
+        ));
+        assert!(matches!(
+            tagged_records[1].context[field::CAMERA],
+            eye_log::Value::Str(_)
+        ));
+        assert!(matches!(
+            tagged_records[1].context[field::SEQ],
+            eye_log::Value::U64(_)
+        ));
+    }
+
+    #[test]
+    fn test_logs_tagger_state_changed_at_debug_on_lock() {
+        let means = [0.0, 49.0, 0.0, 48.0, 0.0, 48.0, 0.0, 47.0, 0.0, 47.0];
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut tagger = IlluminationTagger::new(TaggerConfig::default());
+            run(&mut tagger, 100, &means)
+        });
+        let changed: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "tagger state changed")
+            .collect();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].level, eye_log::Level::Debug);
+        assert_eq!(
+            changed[0].fields["from"],
+            eye_log::Value::Str("searching".to_string())
+        );
+        assert_eq!(
+            changed[0].fields["to"],
+            eye_log::Value::Str("locked".to_string())
+        );
+        assert!(matches!(
+            changed[0].fields["lit_parity"],
+            eye_log::Value::I64(_)
+        ));
+    }
+
+    #[test]
+    fn test_logs_tagger_locked_by_metadata_at_debug_once() {
+        let means: [u8; 8] = [40; 8];
+        let frames = ir_frames(&means);
+        let meta_records: VecDeque<Option<MetaRecord>> =
+            (1..=8).map(|k| rec(k, Some(true))).collect();
+        let src = VecSource::new(camera_info("ir", PixelFormat::Gray8, 64, 36), frames);
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut tagged = TaggedSource::with_metadata(
+                src,
+                Box::new(VecMeta(meta_records)),
+                TaggerConfig::default(),
+            )
+            .unwrap();
+            for _ in 0..8 {
+                tagged.next_frame().unwrap();
+            }
+        });
+        let locked: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "tagger locked by metadata")
+            .collect();
+        assert_eq!(locked.len(), 1);
+        assert_eq!(locked[0].level, eye_log::Level::Debug);
+    }
+
+    #[test]
+    fn test_logs_no_metadata_at_debug_then_fallback_at_warn() {
+        let means: Vec<u8> = (0..8).map(|i| if i % 2 == 0 { 0 } else { 46 }).collect();
+        let frames = ir_frames(&means);
+        let meta_records: VecDeque<Option<MetaRecord>> = (1..=8).map(|k| rec(k, None)).collect();
+        let src = VecSource::new(camera_info("ir", PixelFormat::Gray8, 64, 36), frames);
+        let (active, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut tagged = TaggedSource::with_metadata(
+                src,
+                Box::new(VecMeta(meta_records)),
+                TaggerConfig::default(),
+            )
+            .unwrap();
+            for _ in 0..8 {
+                tagged.next_frame().unwrap();
+            }
+            tagged.metadata_active()
+        });
+        let misses: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "no metadata for frame")
+            .collect();
+        assert_eq!(misses.len(), 8);
+        for rec in &misses {
+            assert_eq!(rec.level, eye_log::Level::Debug);
+        }
+        let miss_values: Vec<u64> = misses
+            .iter()
+            .map(|r| match r.fields["misses"] {
+                eye_log::Value::U64(v) => v,
+                ref other => panic!("expected U64, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(miss_values, (1..=8).collect::<Vec<u64>>());
+        let fallback: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "no FrameIllumination metadata; tagging by brightness")
+            .collect();
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].level, eye_log::Level::Warn);
+        assert!(!active);
     }
 
     // --- hardware (needs the IR camera, emitter on) ---

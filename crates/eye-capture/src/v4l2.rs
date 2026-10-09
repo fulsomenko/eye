@@ -1,6 +1,8 @@
 use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
-use eye_core::{CameraId, CameraInfo, Frame, FrameHeader, Illumination, PixelFormat, Timestamp};
+use eye_core::{
+    CameraId, CameraInfo, Frame, FrameHeader, Illumination, PixelFormat, Timestamp, log::field,
+};
 use v4l::{
     Device, Format, FourCC,
     buffer::Flags,
@@ -156,6 +158,19 @@ impl V4l2Source {
             actual.stride
         };
 
+        tracing::info!(
+            { field::CAMERA } = id.as_str(),
+            device = %device.display(),
+            width,
+            height,
+            format = ?format,
+            fps,
+            frame_interval_us = frame_interval.as_micros() as u64,
+            buffers,
+            stride,
+            "camera opened"
+        );
+
         Ok(Self {
             info: CameraInfo {
                 id,
@@ -244,13 +259,13 @@ impl FrameSource for V4l2Source {
                 match CaptureStream::dequeue(&mut self.stream) {
                     Ok(_) => {
                         self.timeout_state.on_dequeued();
-                        tracing::debug!(%camera, "recovered pending dequeue after timeout, dropping frame");
+                        tracing::debug!(
+                            { field::CAMERA } = camera.as_str(),
+                            "recovered pending dequeue after timeout, dropping frame"
+                        );
                     }
                     Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                        return Err(CaptureError::Timeout {
-                            camera,
-                            timeout: self.timeout,
-                        });
+                        return Err(timeout_error(camera, self.timeout));
                     }
                     Err(e) if e.raw_os_error() == Some(ENODEV) => {
                         return Err(CaptureError::Disconnected { camera });
@@ -268,10 +283,7 @@ impl FrameSource for V4l2Source {
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => {
                     self.started = true;
                     self.timeout_state.on_timeout(self.started);
-                    return Err(CaptureError::Timeout {
-                        camera,
-                        timeout: self.timeout,
-                    });
+                    return Err(timeout_error(camera, self.timeout));
                 }
                 Err(e) if e.raw_os_error() == Some(ENODEV) => {
                     return Err(CaptureError::Disconnected { camera });
@@ -283,7 +295,11 @@ impl FrameSource for V4l2Source {
                 flags,
             })?;
             if meta.flags.contains(Flags::ERROR) {
-                tracing::warn!(%camera, sequence = meta.sequence, "driver flagged a corrupt buffer");
+                tracing::warn!(
+                    { field::CAMERA } = camera.as_str(),
+                    { field::SEQ } = meta.sequence,
+                    "driver flagged a corrupt buffer"
+                );
                 continue;
             }
             let used = (meta.bytesused as usize).min(buf.len());
@@ -292,7 +308,12 @@ impl FrameSource for V4l2Source {
                 _ => gray_payload(buf, used, self.info.width, self.info.height, self.stride),
             };
             let Some(data) = payload else {
-                tracing::warn!(%camera, sequence = meta.sequence, used, "dropping short or invalid frame");
+                tracing::warn!(
+                    { field::CAMERA } = camera.as_str(),
+                    { field::SEQ } = meta.sequence,
+                    used,
+                    "dropping short or invalid frame"
+                );
                 continue;
             };
             let header = FrameHeader {
@@ -307,9 +328,27 @@ impl FrameSource for V4l2Source {
                     _ => Illumination::Unknown,
                 },
             };
+            let _frame_span = eye_core::log::frame_span(
+                header.camera.as_str(),
+                header.seq,
+                header.timestamp.as_nanos(),
+                header.illumination.as_str(),
+                1,
+            )
+            .entered();
+            tracing::trace!(bytes = data.len(), source = "v4l2", "frame produced");
             return Ok(Frame::new(header, data)?);
         }
     }
+}
+
+fn timeout_error(camera: String, timeout: Duration) -> CaptureError {
+    tracing::warn!(
+        { field::CAMERA } = camera.as_str(),
+        timeout_ms = timeout.as_millis() as u64,
+        "no frame within timeout"
+    );
+    CaptureError::Timeout { camera, timeout }
 }
 
 pub(crate) fn fourcc_for(format: PixelFormat) -> Option<FourCC> {
@@ -626,17 +665,46 @@ mod tests {
             640,
             360,
         );
-        let mut source = V4l2Source::open(config).unwrap();
-        let mut timestamps = Vec::new();
-        for _ in 0..30 {
-            let frame = source.next_frame().unwrap();
-            assert_eq!(frame.data().len(), 230_400);
-            assert_eq!(frame.header().format, PixelFormat::Gray8);
-            assert_eq!(frame.header().illumination, Illumination::Unknown);
-            timestamps.push(frame.header().timestamp);
-        }
-        let interval = source.camera().frame_interval;
+        let (interval, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut source = V4l2Source::open(config).unwrap();
+            let mut timestamps = Vec::new();
+            for _ in 0..30 {
+                let frame = source.next_frame().unwrap();
+                assert_eq!(frame.data().len(), 230_400);
+                assert_eq!(frame.header().format, PixelFormat::Gray8);
+                assert_eq!(frame.header().illumination, Illumination::Unknown);
+                timestamps.push(frame.header().timestamp);
+            }
+            source.camera().frame_interval
+        });
         assert!((interval.as_secs_f64() - 0.033_333).abs() < 0.001);
+
+        let opened: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "camera opened")
+            .collect();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].level, eye_log::Level::Info);
+
+        let produced: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "frame produced")
+            .collect();
+        assert_eq!(produced.len(), 30);
+        for rec in &produced {
+            assert_eq!(rec.level, eye_log::Level::Trace);
+            let keys: Vec<&str> = rec.context.keys().map(|k| k.as_str()).collect();
+            assert_eq!(
+                keys,
+                vec![
+                    field::CAMERA,
+                    field::ILLUMINATION,
+                    field::SEQ,
+                    field::SET_CAMERAS,
+                    field::TS_NS,
+                ]
+            );
+        }
     }
 
     #[test]

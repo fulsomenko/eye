@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use eye_core::Timestamp;
+use eye_core::{Timestamp, log::field};
 use v4l::{Device, buffer::Type, io::traits::CaptureStream};
 
 use crate::CaptureError;
@@ -72,6 +72,11 @@ impl UvcMetaStream {
         let mut stream =
             v4l::io::mmap::Stream::with_buffers(&dev, Type::MetaCapture, 4).map_err(open_err)?;
         stream.set_timeout(timeout);
+        tracing::info!(
+            path = %path.display(),
+            timeout_ms = timeout.as_millis() as u64,
+            "metadata stream opened"
+        );
         Ok(Self {
             path: path.to_owned(),
             timeout,
@@ -86,6 +91,11 @@ impl IlluminationMeta for UvcMetaStream {
         let (buf, meta) = match CaptureStream::next(&mut self.stream) {
             Ok(next) => next,
             Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                tracing::warn!(
+                    path = camera.as_str(),
+                    timeout_ms = self.timeout.as_millis() as u64,
+                    "no metadata buffer within timeout"
+                );
                 return Err(CaptureError::Timeout {
                     camera,
                     timeout: self.timeout,
@@ -94,10 +104,15 @@ impl IlluminationMeta for UvcMetaStream {
             Err(source) => return Err(CaptureError::Io { camera, source }),
         };
         let used = (meta.bytesused as usize).min(buf.len());
-        Ok(MetaRecord {
-            timestamp: Timestamp(Duration::from(meta.timestamp)),
-            lit: frame_illumination(&buf[..used]),
-        })
+        let timestamp = Timestamp(Duration::from(meta.timestamp));
+        let lit = frame_illumination(&buf[..used]);
+        tracing::trace!(
+            { field::TS_NS } = timestamp.as_nanos(),
+            flagged = lit.is_some(),
+            lit = lit == Some(true),
+            "metadata record"
+        );
+        Ok(MetaRecord { timestamp, lit })
     }
 }
 
@@ -167,5 +182,33 @@ mod tests {
     fn test_meta_stream_is_send() {
         fn f<T: Send>() {}
         f::<UvcMetaStream>();
+    }
+
+    // --- hardware (needs the IR camera's metadata node) ---
+
+    #[test]
+    #[ignore = "needs hardware"]
+    fn test_logs_metadata_record_at_trace() {
+        let mut meta =
+            UvcMetaStream::open(&PathBuf::from("/dev/video3"), Duration::from_millis(500))
+                .expect("open /dev/video3");
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            meta.next_record().expect("read a metadata record")
+        });
+        let metadata: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "metadata record")
+            .collect();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].level, eye_log::Level::Trace);
+        assert!(matches!(
+            metadata[0].fields[field::TS_NS],
+            eye_log::Value::U64(_)
+        ));
+        assert!(matches!(
+            metadata[0].fields["flagged"],
+            eye_log::Value::Bool(_)
+        ));
+        assert!(matches!(metadata[0].fields["lit"], eye_log::Value::Bool(_)));
     }
 }
