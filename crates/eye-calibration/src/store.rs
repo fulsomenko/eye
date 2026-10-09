@@ -45,6 +45,11 @@ impl ProfileStore {
     pub fn load_rig(&self, output: &OutputId) -> Result<Option<Rig>, CalibrationError> {
         let path = self.rig_path(output)?;
         let Some(table) = read_table(&path)? else {
+            tracing::debug!(
+                output = output.as_str(),
+                path = %path.display(),
+                "rig not found"
+            );
             return Ok(None);
         };
         Ok(Some(rig_from_table_at(&table, &path)?))
@@ -165,15 +170,28 @@ fn rig_from_table_at(table: &toml::Table, path: &Path) -> Result<Rig, Calibratio
         size_px: (file.screen.size_px[0], file.screen.size_px[1]),
         scale: file.screen.scale,
     };
-    Ok(Rig::new(
-        file.camera.into_iter().map(CameraModel::from).collect(),
-        screen,
-    )?)
+    let output = screen.output.as_str().to_owned();
+    let cameras: Vec<CameraModel> = file.camera.into_iter().map(CameraModel::from).collect();
+    let camera_count = cameras.len() as u64;
+    let rig = Rig::new(cameras, screen)?;
+    tracing::info!(
+        path = %path.display(),
+        output,
+        cameras = camera_count,
+        "rig loaded"
+    );
+    Ok(rig)
 }
 
 pub fn write_rig(path: &Path, rig: &Rig) -> Result<(), CalibrationError> {
     let contents = toml::to_string_pretty(&RigFile::from(rig)).map_err(StoreError::from)?;
     write_atomic(path, &contents)?;
+    tracing::info!(
+        path = %path.display(),
+        output = rig.screen().output.as_str(),
+        cameras = rig.cameras().len() as u64,
+        "rig written"
+    );
     Ok(())
 }
 
@@ -356,6 +374,68 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = ProfileStore::at(&dir);
         assert_eq!(store.load_rig(&OutputId::from("eDP-1")).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_logs_rig_loaded_at_info() {
+        let dir = test_dir("logs-loaded");
+        let store = ProfileStore::at(&dir);
+        let rig = fixture_rig();
+
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::INFO, || {
+            store.save_rig(&rig).unwrap();
+            store.load_rig(&OutputId::from("eDP-1")).unwrap();
+        });
+
+        let written = records
+            .iter()
+            .find(|r| r.message == "rig written")
+            .expect("no 'rig written' record");
+        assert_eq!(written.level, eye_log::Level::Info);
+        assert_eq!(
+            written.fields.get("cameras"),
+            Some(&eye_log::Value::U64(rig.cameras().len() as u64))
+        );
+        match written.fields.get("path") {
+            Some(eye_log::Value::Str(p)) => assert!(p.ends_with("rigs/eDP-1.toml"), "{p}"),
+            other => panic!("expected path Str, got {other:?}"),
+        }
+
+        let loaded = records
+            .iter()
+            .find(|r| r.message == "rig loaded")
+            .expect("no 'rig loaded' record");
+        assert_eq!(loaded.level, eye_log::Level::Info);
+        assert_eq!(
+            loaded.fields.get("cameras"),
+            Some(&eye_log::Value::U64(rig.cameras().len() as u64))
+        );
+        match loaded.fields.get("path") {
+            Some(eye_log::Value::Str(p)) => assert!(p.ends_with("rigs/eDP-1.toml"), "{p}"),
+            other => panic!("expected path Str, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_logs_rig_not_found_at_debug() {
+        let dir = test_dir("logs-not-found");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = ProfileStore::at(&dir);
+
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            store.load_rig(&OutputId::from("eDP-1")).unwrap();
+        });
+
+        assert!(!records.iter().any(|r| r.message == "rig loaded"));
+        let rec = records
+            .iter()
+            .find(|r| r.message == "rig not found")
+            .expect("no 'rig not found' record");
+        assert_eq!(rec.level, eye_log::Level::Debug);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

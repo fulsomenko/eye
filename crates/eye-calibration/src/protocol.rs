@@ -129,7 +129,7 @@ impl TargetProtocol {
             let j = (splitmix64(&mut s) % (i as u64 + 1)) as usize;
             cells.swap(i, j);
         }
-        cells
+        let targets: Vec<Target> = cells
             .into_iter()
             .enumerate()
             .map(|(k, (c, r))| Target {
@@ -140,7 +140,15 @@ impl TargetProtocol {
                     (f64::from(r) + 0.5) / f64::from(rows),
                 ),
             })
-            .collect()
+            .collect();
+        tracing::debug!(
+            seed,
+            cols = u64::from(cols),
+            rows = u64::from(rows),
+            targets = targets.len() as u64,
+            "target sequence generated"
+        );
+        targets
     }
 
     pub fn schedule(&self, seed: u64) -> Vec<ScheduledTarget> {
@@ -227,16 +235,34 @@ impl TargetProtocol {
                 .ok_or_else(|| targets_err(format!("record {} lies outside the screen", r.seq)))?;
             let onset = Timestamp::from_nanos(r.shown_ns);
             let start = Timestamp(onset.0 + settle);
+            let end = Timestamp(start.0 + window);
+            tracing::trace!(
+                index = k as u64,
+                cell_col = u64::from(cell.0),
+                cell_row = u64::from(cell.1),
+                onset_ns = onset.as_nanos(),
+                start_ns = start.as_nanos(),
+                end_ns = end.as_nanos(),
+                target_x_mm = mm.x,
+                target_y_mm = mm.y,
+                "fixation window"
+            );
             out.push(FixationWindow {
                 index: k as u32,
                 cell,
                 onset,
                 start,
-                end: Timestamp(start.0 + window),
+                end,
                 target_mm: mm,
                 target_px_logical: Point2::from(r.px_logical),
             });
         }
+        tracing::info!(
+            windows = out.len() as u64,
+            settle_ms = self.cfg.settle_ms,
+            window_ms = self.cfg.window_ms,
+            "fixation windows built"
+        );
         Ok(out)
     }
 }
@@ -351,6 +377,22 @@ mod tests {
     }
 
     #[test]
+    fn test_logs_target_sequence_at_debug() {
+        let proto = TargetProtocol::new(ProtocolConfig::default()).unwrap();
+        let (_, records) =
+            eye_log::testing::capture_logs(tracing::Level::DEBUG, || proto.sequence(7));
+        let rec = records
+            .iter()
+            .find(|r| r.message == "target sequence generated")
+            .expect("no 'target sequence generated' record");
+        assert_eq!(rec.level, eye_log::Level::Debug);
+        assert_eq!(rec.fields.get("seed"), Some(&eye_log::Value::U64(7)));
+        assert_eq!(rec.fields.get("cols"), Some(&eye_log::Value::U64(3)));
+        assert_eq!(rec.fields.get("rows"), Some(&eye_log::Value::U64(3)));
+        assert_eq!(rec.fields.get("targets"), Some(&eye_log::Value::U64(9)));
+    }
+
+    #[test]
     fn test_display_sequence_matches_sequence() {
         let proto = TargetProtocol::new(ProtocolConfig::default()).unwrap();
         let screen = screen();
@@ -443,6 +485,65 @@ mod tests {
         assert_eq!(windows[1].end, Timestamp::from_nanos(12_900_000_000));
         assert_eq!(windows[1].cell, (0, 0));
         assert_eq!(windows[1].target_mm, Point2::new(51.0, 29.0));
+    }
+
+    #[test]
+    fn test_logs_fixation_windows_at_info() {
+        let proto = TargetProtocol::new(ProtocolConfig::default()).unwrap();
+        let screen = screen();
+        let records = vec![rec(0, 10.0, [155.0, 87.1875]), rec(1, 11.5, [51.0, 29.0])];
+
+        let (_, logs) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            proto.fixation_windows(&records, &screen).unwrap()
+        });
+
+        let summary = logs
+            .iter()
+            .find(|r| r.message == "fixation windows built")
+            .expect("no 'fixation windows built' record");
+        assert_eq!(summary.level, eye_log::Level::Info);
+        assert_eq!(summary.fields.get("windows"), Some(&eye_log::Value::U64(2)));
+        assert_eq!(
+            summary.fields.get("settle_ms"),
+            Some(&eye_log::Value::U64(600))
+        );
+        assert_eq!(
+            summary.fields.get("window_ms"),
+            Some(&eye_log::Value::U64(800))
+        );
+
+        let windows: Vec<_> = logs
+            .iter()
+            .filter(|r| r.message == "fixation window")
+            .collect();
+        assert_eq!(windows.len(), 2);
+        for w in &windows {
+            assert_eq!(w.level, eye_log::Level::Trace);
+        }
+        assert_eq!(
+            windows[0].fields.get("start_ns"),
+            Some(&eye_log::Value::U64(10_600_000_000))
+        );
+        assert_eq!(
+            windows[0].fields.get("cell_col"),
+            Some(&eye_log::Value::U64(1))
+        );
+        assert_eq!(
+            windows[0].fields.get("cell_row"),
+            Some(&eye_log::Value::U64(1))
+        );
+        assert_eq!(
+            windows[1].fields.get("start_ns"),
+            Some(&eye_log::Value::U64(12_100_000_000))
+        );
+        assert_eq!(
+            windows[1].fields.get("cell_col"),
+            Some(&eye_log::Value::U64(0))
+        );
+        assert_eq!(
+            windows[1].fields.get("cell_row"),
+            Some(&eye_log::Value::U64(0))
+        );
     }
 
     #[test]

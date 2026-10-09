@@ -1,3 +1,4 @@
+use eye_core::log::field;
 use eye_core::{CameraId, CameraModel, Rig, ScreenModel};
 use eye_geometry::camera::Intrinsics;
 use nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion, Vector2, Vector3};
@@ -116,7 +117,22 @@ pub fn nominal_rig(
             reason: format!("must be positive and finite, got [{w}, {h}]"),
         });
     }
+    let edid_size_mm = screen.size_mm;
     screen.size_mm = corrected_screen_size_mm(&screen, cfg.screen_size_mm);
+    if screen.size_mm != edid_size_mm {
+        tracing::debug!(
+            { field::REASON } = if cfg.screen_size_mm.is_some() {
+                "config_override"
+            } else {
+                "aspect_mismatch"
+            },
+            edid_w_mm = edid_size_mm.x,
+            edid_h_mm = edid_size_mm.y,
+            w_mm = screen.size_mm.x,
+            h_mm = screen.size_mm.y,
+            "screen size corrected"
+        );
+    }
 
     for config_camera in &cfg.cameras {
         if !streams.iter().any(|s| s.id.as_str() == config_camera.id) {
@@ -138,7 +154,8 @@ pub fn nominal_rig(
             .iter()
             .find(|c| c.id.as_str() == stream.id.as_str());
 
-        let f = match config_camera.and_then(|c| c.focal_px) {
+        let mut fov_bounds: Option<(f64, f64)> = None;
+        let (f, focal_source) = match config_camera.and_then(|c| c.focal_px) {
             Some(f) => {
                 if !(f.is_finite() && f > 0.0) {
                     return Err(CalibrationError::Param {
@@ -146,17 +163,31 @@ pub fn nominal_rig(
                         reason: format!("must be positive and finite, got {f}"),
                     });
                 }
-                f
+                (f, "config.focal_px")
             }
             None => {
-                let diag_fov_deg = config_camera
-                    .and_then(|c| c.diag_fov_deg.as_deref())
-                    .unwrap_or(&cfg.default_diag_fov_deg);
-                focal_prior(stream.width, stream.height, diag_fov_deg)?.f_px
+                let camera_fov = config_camera.and_then(|c| c.diag_fov_deg.as_deref());
+                let diag_fov_deg = camera_fov.unwrap_or(&cfg.default_diag_fov_deg);
+                fov_bounds = Some((
+                    diag_fov_deg.iter().copied().fold(f64::INFINITY, f64::min),
+                    diag_fov_deg
+                        .iter()
+                        .copied()
+                        .fold(f64::NEG_INFINITY, f64::max),
+                ));
+                let source = if camera_fov.is_some() {
+                    "camera.diag_fov_deg"
+                } else {
+                    "default_diag_fov_deg"
+                };
+                (
+                    focal_prior(stream.width, stream.height, diag_fov_deg)?.f_px,
+                    source,
+                )
             }
         };
 
-        let position = match config_camera.and_then(|c| c.position_mm) {
+        let (position, position_source) = match config_camera.and_then(|c| c.position_mm) {
             Some([x, y, z]) => {
                 if !(x.is_finite() && y.is_finite() && z.is_finite()) {
                     return Err(CalibrationError::Param {
@@ -164,12 +195,25 @@ pub fn nominal_rig(
                         reason: format!("must be finite, got [{x}, {y}, {z}]"),
                     });
                 }
-                Point3::new(x, y, z)
+                (Point3::new(x, y, z), "config")
             }
-            None => default_position,
+            None => (default_position, "default"),
         };
 
         positions.push((stream.id.clone(), position));
+
+        tracing::info!(
+            { field::CAMERA } = stream.id.as_str(),
+            focal_source,
+            f_px = f,
+            fov_min_deg = fov_bounds.map(|(lo, _)| lo),
+            fov_max_deg = fov_bounds.map(|(_, hi)| hi),
+            position_source,
+            x_mm = position.x,
+            y_mm = position.y,
+            z_mm = position.z,
+            "nominal camera"
+        );
 
         cameras.push(CameraModel {
             id: stream.id.clone(),
@@ -190,11 +234,21 @@ pub fn nominal_rig(
             let (b, pb) = &positions[j];
             if pa == pb {
                 tracing::info!(
-                    "cameras {a} and {b} share a nominal position; stereo depth is unavailable until calibration-stereo runs"
+                    camera_a = a.as_str(),
+                    camera_b = b.as_str(),
+                    "cameras share a nominal position; stereo depth is unavailable until calibration-stereo runs"
                 );
             }
         }
     }
+
+    tracing::info!(
+        output = screen.output.as_str(),
+        cameras = cameras.len() as u64,
+        screen_w_mm = screen.size_mm.x,
+        screen_h_mm = screen.size_mm.y,
+        "nominal rig built"
+    );
 
     Ok(Rig::new(cameras, screen)?)
 }
@@ -228,7 +282,7 @@ pub fn nominal_screen_from_camera(position_mm: &Point3<f64>) -> Isometry3<f64> {
 
 #[cfg(test)]
 mod tests {
-    use approx::assert_relative_eq;
+    use approx::{assert_abs_diff_eq, assert_relative_eq};
     use eye_core::OutputId;
 
     use super::*;
@@ -414,6 +468,77 @@ mod tests {
     }
 
     #[test]
+    fn test_logs_screen_size_corrected_at_debug() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::DEBUG, || {
+            nominal_rig(edp1(), &streams(), &NominalRigConfig::default()).unwrap();
+        });
+        let rec = records
+            .iter()
+            .find(|r| r.message == "screen size corrected")
+            .expect("no 'screen size corrected' record");
+        assert_eq!(rec.level, eye_log::Level::Debug);
+        assert_eq!(
+            rec.fields.get("reason"),
+            Some(&eye_log::Value::Str("aspect_mismatch".to_string()))
+        );
+        assert_eq!(
+            rec.fields.get("edid_h_mm"),
+            Some(&eye_log::Value::F64(170.0))
+        );
+        match rec.fields.get("h_mm") {
+            Some(eye_log::Value::F64(v)) => {
+                assert_abs_diff_eq!(*v, 310.0 * 2160.0 / 3840.0, epsilon = 1e-9)
+            }
+            other => panic!("expected h_mm F64, got {other:?}"),
+        }
+
+        let mut screen = edp1();
+        screen.size_mm = Vector2::new(310.0, 200.0);
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::DEBUG, || {
+            nominal_rig(screen, &streams(), &NominalRigConfig::default()).unwrap();
+        });
+        let rec = records
+            .iter()
+            .find(|r| r.message == "screen size corrected")
+            .expect("no 'screen size corrected' record");
+        assert_eq!(
+            rec.fields.get("reason"),
+            Some(&eye_log::Value::Str("aspect_mismatch".to_string()))
+        );
+        assert_eq!(
+            rec.fields.get("edid_h_mm"),
+            Some(&eye_log::Value::F64(200.0))
+        );
+
+        let cfg = NominalRigConfig {
+            screen_size_mm: Some([300.0, 170.0]),
+            ..NominalRigConfig::default()
+        };
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::DEBUG, || {
+            nominal_rig(edp1(), &streams(), &cfg).unwrap();
+        });
+        let rec = records
+            .iter()
+            .find(|r| r.message == "screen size corrected")
+            .expect("no 'screen size corrected' record");
+        assert_eq!(
+            rec.fields.get("reason"),
+            Some(&eye_log::Value::Str("config_override".to_string()))
+        );
+        assert_eq!(rec.fields.get("w_mm"), Some(&eye_log::Value::F64(300.0)));
+
+        let mut consistent = edp1();
+        consistent.size_mm = Vector2::new(309.9, 174.3);
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::DEBUG, || {
+            nominal_rig(consistent, &streams(), &NominalRigConfig::default()).unwrap();
+        });
+        assert!(
+            !records.iter().any(|r| r.message == "screen size corrected"),
+            "{records:?}"
+        );
+    }
+
+    #[test]
     fn test_config_override_wins() {
         let size = corrected_screen_size_mm(&edp1(), Some([300.0, 170.0]));
         assert_relative_eq!(size.x, 300.0, epsilon = 1e-9);
@@ -528,6 +653,66 @@ mod tests {
         assert!(px.y >= 0.0 && px.y <= 360.0);
         assert_relative_eq!(px.x, 320.0, epsilon = 1.0);
         assert_relative_eq!(px.y, 259.0, epsilon = 1.0);
+    }
+
+    #[test]
+    fn test_logs_nominal_camera_at_info() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::INFO, || {
+            nominal_rig(edp1(), &streams(), &dell_cfg()).unwrap();
+        });
+
+        let camera_recs: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "nominal camera")
+            .collect();
+        assert_eq!(camera_recs.len(), 2);
+        for rec in &camera_recs {
+            assert_eq!(rec.level, eye_log::Level::Info);
+            match rec.fields.get(field::CAMERA) {
+                Some(eye_log::Value::Str(s)) => assert!(s == "rgb" || s == "ir", "{s}"),
+                other => panic!("expected camera str, got {other:?}"),
+            }
+            assert_eq!(
+                rec.fields.get("focal_source"),
+                Some(&eye_log::Value::Str("default_diag_fov_deg".to_string()))
+            );
+            assert_eq!(
+                rec.fields.get("fov_min_deg"),
+                Some(&eye_log::Value::F64(75.8))
+            );
+            assert_eq!(
+                rec.fields.get("fov_max_deg"),
+                Some(&eye_log::Value::F64(87.0))
+            );
+            assert_eq!(
+                rec.fields.get("position_source"),
+                Some(&eye_log::Value::Str("default".to_string()))
+            );
+            assert_eq!(rec.fields.get("y_mm"), Some(&eye_log::Value::F64(-7.0)));
+        }
+
+        let rig_built = records
+            .iter()
+            .find(|r| r.message == "nominal rig built")
+            .expect("no 'nominal rig built' record");
+        assert_eq!(
+            rig_built.fields.get("cameras"),
+            Some(&eye_log::Value::U64(2))
+        );
+
+        let shared = records
+            .iter()
+            .find(|r| r.message.contains("share a nominal position"))
+            .expect("no shared-position record");
+        assert!(!shared.message.contains("rgb") && !shared.message.contains("ir"));
+        assert_eq!(
+            shared.fields.get("camera_a"),
+            Some(&eye_log::Value::Str("rgb".to_string()))
+        );
+        assert_eq!(
+            shared.fields.get("camera_b"),
+            Some(&eye_log::Value::Str("ir".to_string()))
+        );
     }
 
     #[test]

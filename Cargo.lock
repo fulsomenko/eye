@@ -577,6 +577,7 @@ dependencies = [
  "etcetera",
  "eye-core",
  "eye-geometry",
+ "eye-log",
  "nalgebra",
  "serde",
  "tempfile",

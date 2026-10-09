@@ -15,9 +15,11 @@ impl ProfileStore {
 
     pub fn load_profile(&self, name: &str) -> Result<Option<UserProfile>, CalibrationError> {
         let path = self.profile_path(name)?;
-        read_table(&path)?
-            .map(|table| profile_from_table(table, &path))
-            .transpose()
+        let Some(table) = read_table(&path)? else {
+            tracing::debug!(name, path = %path.display(), "profile not found");
+            return Ok(None);
+        };
+        Ok(Some(profile_from_table(table, &path)?))
     }
 
     pub fn save_profile(
@@ -55,21 +57,37 @@ impl ProfileStore {
             }
         }
         names.sort();
+        tracing::debug!(dir = %dir.display(), count = names.len() as u64, "profiles listed");
         Ok(names)
     }
 }
 
 fn profile_from_table(table: toml::Table, path: &Path) -> Result<UserProfile, CalibrationError> {
     check_version(&table, "profile")?;
-    Ok(table.try_into().map_err(|source| StoreError::Parse {
+    let profile: UserProfile = table.try_into().map_err(|source| StoreError::Parse {
         path: path.to_owned(),
         source,
-    })?)
+    })?;
+    tracing::info!(
+        path = %path.display(),
+        name = %profile.name,
+        estimator = %profile.estimator,
+        rig_fingerprint = %profile.rig_fingerprint,
+        eyes = profile.eyes.len() as u64,
+        "profile loaded"
+    );
+    Ok(profile)
 }
 
 pub fn write_profile(path: &Path, profile: &UserProfile) -> Result<(), CalibrationError> {
     let contents = toml::to_string_pretty(profile).map_err(StoreError::from)?;
     write_atomic(path, &contents)?;
+    tracing::info!(
+        path = %path.display(),
+        name = %profile.name,
+        eyes = profile.eyes.len() as u64,
+        "profile written"
+    );
     Ok(())
 }
 
@@ -200,6 +218,100 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = ProfileStore::at(&dir);
         assert_eq!(store.load_profile("default").unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_logs_profile_loaded_at_info() {
+        let dir = test_dir("logs-loaded");
+        let store = ProfileStore::at(&dir);
+        let profile = fixture_profile();
+
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::INFO, || {
+            store.save_profile("p", &profile).unwrap();
+            store.load_profile("p").unwrap();
+        });
+
+        let written = records
+            .iter()
+            .find(|r| r.message == "profile written")
+            .expect("no 'profile written' record");
+        assert_eq!(written.level, eye_log::Level::Info);
+        assert_eq!(
+            written.fields.get("name"),
+            Some(&eye_log::Value::Str(profile.name.clone()))
+        );
+        assert_eq!(
+            written.fields.get("eyes"),
+            Some(&eye_log::Value::U64(profile.eyes.len() as u64))
+        );
+
+        let loaded = records
+            .iter()
+            .find(|r| r.message == "profile loaded")
+            .expect("no 'profile loaded' record");
+        assert_eq!(loaded.level, eye_log::Level::Info);
+        assert_eq!(
+            loaded.fields.get("name"),
+            Some(&eye_log::Value::Str(profile.name.clone()))
+        );
+        assert_eq!(
+            loaded.fields.get("eyes"),
+            Some(&eye_log::Value::U64(profile.eyes.len() as u64))
+        );
+        assert!(matches!(
+            loaded.fields.get("estimator"),
+            Some(eye_log::Value::Str(_))
+        ));
+        assert!(matches!(
+            loaded.fields.get("rig_fingerprint"),
+            Some(eye_log::Value::Str(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_logs_profile_not_found_at_debug() {
+        let dir = test_dir("logs-not-found");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = ProfileStore::at(&dir);
+
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            store.load_profile("missing-name").unwrap()
+        });
+
+        assert!(!records.iter().any(|r| r.message == "profile loaded"));
+        let rec = records
+            .iter()
+            .find(|r| r.message == "profile not found")
+            .expect("no 'profile not found' record");
+        assert_eq!(rec.level, eye_log::Level::Debug);
+        assert_eq!(
+            rec.fields.get("name"),
+            Some(&eye_log::Value::Str("missing-name".to_string()))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_logs_profiles_listed_at_debug() {
+        let dir = test_dir("logs-listed");
+        let store = ProfileStore::at(&dir);
+        store.save_profile("p", &fixture_profile()).unwrap();
+
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::DEBUG, || {
+            store.list_profiles().unwrap()
+        });
+
+        let rec = records
+            .iter()
+            .find(|r| r.message == "profiles listed")
+            .expect("no 'profiles listed' record");
+        assert_eq!(rec.level, eye_log::Level::Debug);
+        assert_eq!(rec.fields.get("count"), Some(&eye_log::Value::U64(1)));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

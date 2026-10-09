@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, HashMap};
 
+use eye_core::log::field;
 use eye_core::{GazeRay, Rig};
 use eye_geometry::angles::yaw_pitch_from_direction;
 use nalgebra::{Cholesky, Matrix2, Point2, Point3, SMatrix, SVector, Unit, Vector2};
 
 use crate::correction::{
     AngularCorrection, CorrectionModel, EyeKey, UserProfile, design, design_quad, design12,
+    eye_label,
 };
 use crate::error::CalibrationError;
 
@@ -254,6 +256,15 @@ impl DotSessionFit {
                 let keep = reject_sample_outliers(&es, cfg);
                 let n_keep = keep.iter().filter(|&&k| k).count();
                 if n_keep < cfg.min_samples_per_target {
+                    tracing::debug!(
+                        eye = eye_label(eye),
+                        target = idx as u64,
+                        { field::REASON } = "too_few_samples",
+                        samples = group.len() as u64,
+                        kept = n_keep as u64,
+                        min_samples_per_target = cfg.min_samples_per_target as u64,
+                        "target rejected"
+                    );
                     sample_rejected.push(idx);
                     let spread_deg = sample_spread_deg(&es);
                     diagnostics.push(TargetVerdict {
@@ -305,6 +316,15 @@ impl DotSessionFit {
                     .try_inverse()
                     .unwrap_or_else(|| Matrix2::identity() / (jitter_rad * jitter_rad));
 
+                tracing::trace!(
+                    eye = eye_label(eye),
+                    target = idx as u64,
+                    samples = kept_o.len() as u64,
+                    err_yaw_deg = mean_e.x.to_degrees(),
+                    err_pitch_deg = mean_e.y.to_degrees(),
+                    "target aggregated"
+                );
+
                 usable.push(TargetAgg {
                     index: idx,
                     samples: n_keep,
@@ -317,6 +337,13 @@ impl DotSessionFit {
             max_usable = max_usable.max(usable.len());
 
             if usable.len() < cfg.min_targets_offset {
+                tracing::debug!(
+                    eye = eye_label(eye),
+                    { field::REASON } = "too_few_targets",
+                    usable = usable.len() as u64,
+                    min_targets_offset = cfg.min_targets_offset as u64,
+                    "eye omitted"
+                );
                 reports.push(EyeFitReport {
                     key: eye,
                     model: None,
@@ -333,7 +360,7 @@ impl DotSessionFit {
             let mut weights = vec![1.0; usable.len()];
             let mut theta_prev: Option<SVector<f64, 6>> = None;
             let mut rho = vec![0.0; usable.len()];
-            for _ in 0..10 {
+            for iteration in 0..10u32 {
                 let (theta, _cov, _chi2) = solve_weighted(&usable, &weights, &prior6)
                     .expect("ridge prior keeps the normal matrix positive definite");
                 rho = usable
@@ -343,9 +370,15 @@ impl DotSessionFit {
                         (r.dot(&(t.cov_inv * r))).sqrt()
                     })
                     .collect();
-                let converged = theta_prev
-                    .map(|p| (theta - p).norm() < 1e-9)
-                    .unwrap_or(false);
+                let step = theta_prev.map(|p| (theta - p).norm());
+                let converged = step.map(|s| s < 1e-9).unwrap_or(false);
+                tracing::trace!(
+                    eye = eye_label(eye),
+                    iteration = u64::from(iteration),
+                    step = step.unwrap_or(0.0),
+                    converged,
+                    "irls iteration"
+                );
                 theta_prev = Some(theta);
                 if converged {
                     break;
@@ -370,8 +403,24 @@ impl DotSessionFit {
             for (t, &r) in usable.iter().zip(&rho) {
                 let rejected = r > residual_limit;
                 if rejected {
+                    tracing::debug!(
+                        eye = eye_label(eye),
+                        target = t.index as u64,
+                        { field::REASON } = "huber_outlier",
+                        rho = r,
+                        median_rho,
+                        target_outlier_factor = cfg.target_outlier_factor,
+                        "target rejected"
+                    );
                     huber_rejected.push(t.index);
                 } else {
+                    tracing::debug!(
+                        eye = eye_label(eye),
+                        target = t.index as u64,
+                        rho = r,
+                        median_rho,
+                        "target residual"
+                    );
                     remaining.push(t.clone());
                 }
                 diagnostics.push(TargetVerdict {
@@ -391,6 +440,13 @@ impl DotSessionFit {
             targets_rejected.sort_unstable();
 
             if remaining.len() < cfg.min_targets_offset {
+                tracing::debug!(
+                    eye = eye_label(eye),
+                    { field::REASON } = "too_few_targets_after_rejection",
+                    remaining = remaining.len() as u64,
+                    min_targets_offset = cfg.min_targets_offset as u64,
+                    "eye omitted"
+                );
                 reports.push(EyeFitReport {
                     key: eye,
                     model: None,
@@ -493,7 +549,7 @@ impl DotSessionFit {
                 )
             }));
 
-            let loo_rms = loo_rms_deg(&remaining, model, s_off, &prior6, &prior12);
+            let loo_rms = loo_rms_deg(eye, &remaining, model, s_off, &prior6, &prior12);
 
             eyes.insert(
                 eye,
@@ -507,6 +563,19 @@ impl DotSessionFit {
                     targets_used: targets_used.len() as u32,
                     rms_after_rad: rms_after.to_radians(),
                 },
+            );
+
+            let chi2_reduced = if dof > 0.0 { chi2_final / dof } else { 0.0 };
+            tracing::info!(
+                eye = eye_label(eye),
+                model = ?model,
+                targets_used = targets_used.len() as u64,
+                targets_rejected = targets_rejected.len() as u64,
+                rms_before_deg = rms_before,
+                rms_after_deg = rms_after,
+                loo_rms_deg = loo_rms,
+                chi2_reduced,
+                "eye fitted"
             );
 
             reports.push(EyeFitReport {
@@ -529,12 +598,22 @@ impl DotSessionFit {
             });
         }
 
+        let rig_fingerprint = crate::correction::rig_fingerprint(rig);
+        tracing::info!(
+            eyes = eyes.len() as u64,
+            targets = target_mm_of.len() as u64,
+            samples = samples.len() as u64,
+            rig_fingerprint = %rig_fingerprint,
+            name = %meta.name,
+            "profile fitted"
+        );
+
         Ok(FitOutcome {
             profile: UserProfile {
                 version: 1,
                 name: meta.name,
                 created_unix_s: meta.created_unix_s,
-                rig_fingerprint: crate::correction::rig_fingerprint(rig),
+                rig_fingerprint,
                 estimator: meta.estimator,
                 eyes,
             },
@@ -661,6 +740,7 @@ fn rms_deg(pairs: impl Iterator<Item = (Vector2<f64>, Vector2<f64>)>) -> f64 {
 }
 
 fn loo_rms_deg(
+    eye: EyeKey,
     targets: &[TargetAgg],
     model: CorrectionModel,
     s_off: f64,
@@ -693,6 +773,14 @@ fn loo_rms_deg(
                 held_out.observed + design12(&held_out.observed) * theta12
             }
         };
+        let residual_deg = (held_out.desired - predicted).norm().to_degrees();
+        tracing::debug!(
+            eye = eye_label(eye),
+            held_out = held_out.index as u64,
+            residual_deg,
+            model = ?model,
+            "loo fold"
+        );
         sum += (held_out.desired - predicted).norm_squared();
     }
     (sum / targets.len() as f64).sqrt().to_degrees()
@@ -1513,5 +1601,265 @@ mod tests {
         let desired_angles = yaw_pitch_from_direction(&true_dir);
         let err_deg = (corrected_angles - desired_angles).norm().to_degrees();
         assert!(err_deg < 0.15, "{err_deg}");
+    }
+
+    #[test]
+    fn test_logs_eye_fitted_at_info() {
+        let samples = generate_session(&SessionConfig::default());
+        let (outcome, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            DotSessionFit::fit_with(
+                &samples,
+                &fixture_rig(),
+                &FitConfig::default(),
+                ProfileMeta::default(),
+            )
+            .unwrap()
+        });
+
+        let eye_fitted: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "eye fitted")
+            .collect();
+        assert_eq!(eye_fitted.len(), 1);
+        let rec = eye_fitted[0];
+        assert_eq!(rec.level, eye_log::Level::Info);
+        assert_eq!(
+            rec.fields.get("eye"),
+            Some(&eye_log::Value::Str("right".to_string()))
+        );
+        assert_eq!(
+            rec.fields.get("model"),
+            Some(&eye_log::Value::Str("Affine".to_string()))
+        );
+        let targets_used = match rec.fields.get("targets_used") {
+            Some(eye_log::Value::U64(v)) => *v,
+            other => panic!("expected targets_used U64, got {other:?}"),
+        };
+        let targets_rejected = match rec.fields.get("targets_rejected") {
+            Some(eye_log::Value::U64(v)) => *v,
+            other => panic!("expected targets_rejected U64, got {other:?}"),
+        };
+        assert!(targets_used >= 6, "{targets_used}");
+        assert_eq!(targets_used + targets_rejected, 9);
+        let rms_before = match rec.fields.get("rms_before_deg") {
+            Some(eye_log::Value::F64(v)) => *v,
+            other => panic!("expected rms_before_deg F64, got {other:?}"),
+        };
+        let rms_after = match rec.fields.get("rms_after_deg") {
+            Some(eye_log::Value::F64(v)) => *v,
+            other => panic!("expected rms_after_deg F64, got {other:?}"),
+        };
+        assert!(rms_after < rms_before, "{rms_after} vs {rms_before}");
+
+        let profile_fitted: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "profile fitted")
+            .collect();
+        assert_eq!(profile_fitted.len(), 1);
+        let prec = profile_fitted[0];
+        assert_eq!(prec.level, eye_log::Level::Info);
+        assert_eq!(prec.fields.get("eyes"), Some(&eye_log::Value::U64(1)));
+        assert_eq!(prec.fields.get("targets"), Some(&eye_log::Value::U64(9)));
+        assert_eq!(prec.fields.get("samples"), Some(&eye_log::Value::U64(216)));
+        assert!(matches!(
+            prec.fields.get("name"),
+            Some(eye_log::Value::Str(_))
+        ));
+
+        let loo_folds: Vec<_> = records.iter().filter(|r| r.message == "loo fold").collect();
+        assert_eq!(loo_folds.len() as u64, targets_used);
+        for fold in &loo_folds {
+            assert_eq!(fold.level, eye_log::Level::Debug);
+            let held_out = match fold.fields.get("held_out") {
+                Some(eye_log::Value::U64(v)) => *v,
+                other => panic!("expected held_out U64, got {other:?}"),
+            };
+            assert!(held_out <= 8, "{held_out}");
+            match fold.fields.get("residual_deg") {
+                Some(eye_log::Value::F64(v)) => assert!(v.is_finite(), "{v}"),
+                other => panic!("expected residual_deg F64, got {other:?}"),
+            }
+        }
+
+        let residual_and_rejected = records
+            .iter()
+            .filter(|r| r.message == "target residual" || r.message == "target rejected")
+            .count();
+        assert_eq!(residual_and_rejected, 9);
+
+        let _ = outcome;
+    }
+
+    #[test]
+    fn test_logs_target_rejected_at_debug() {
+        let mut samples = generate_session(&SessionConfig::default());
+        let per_target = SessionConfig::default().samples_per_target;
+        for i in 0..per_target {
+            let idx = 4 * per_target + i;
+            add_yaw_bias_deg(&mut samples[idx], 8.0);
+        }
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            DotSessionFit::fit_with(
+                &samples,
+                &fixture_rig(),
+                &FitConfig::default(),
+                ProfileMeta::default(),
+            )
+            .unwrap()
+        });
+        let rejected: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "target rejected")
+            .collect();
+        assert!(!rejected.is_empty());
+        for r in &rejected {
+            assert_eq!(r.level, eye_log::Level::Debug);
+        }
+        let huber = rejected
+            .iter()
+            .find(|r| {
+                r.fields.get(field::REASON)
+                    == Some(&eye_log::Value::Str("huber_outlier".to_string()))
+            })
+            .expect("no huber_outlier 'target rejected' record");
+        assert_eq!(huber.level, eye_log::Level::Debug);
+        let rho = match huber.fields.get("rho") {
+            Some(eye_log::Value::F64(v)) => *v,
+            other => panic!("expected rho F64, got {other:?}"),
+        };
+        let median_rho = match huber.fields.get("median_rho") {
+            Some(eye_log::Value::F64(v)) => *v,
+            other => panic!("expected median_rho F64, got {other:?}"),
+        };
+        assert!(rho > median_rho * 3.0, "{rho} vs {median_rho}");
+
+        let mut samples = generate_session(&SessionConfig::default());
+        for target in 0..9 {
+            for i in 0..3 {
+                let idx = target * per_target + i;
+                add_yaw_bias_deg(&mut samples[idx], 15.0);
+            }
+        }
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            DotSessionFit::fit_with(
+                &samples,
+                &fixture_rig(),
+                &FitConfig::default(),
+                ProfileMeta::default(),
+            )
+            .unwrap()
+        });
+        let rejected = records
+            .iter()
+            .filter(|r| r.message == "target rejected")
+            .count();
+        let residual = records
+            .iter()
+            .filter(|r| r.message == "target residual")
+            .count();
+        assert_eq!(rejected, 0);
+        assert_eq!(residual, 9);
+    }
+
+    #[test]
+    fn test_logs_eye_omitted_at_debug() {
+        let mut samples = generate_session(&SessionConfig::default());
+        let left_cfg = SessionConfig {
+            grid: [3, 3],
+            samples_per_target: 24,
+            side: Some(Side::Left),
+            base_xy: (125.0, 60.0),
+            sway_mm: 0.0,
+            bias: UNBIASED,
+            seed: 97,
+        };
+        let per_target = left_cfg.samples_per_target;
+        let left_samples: Vec<FitSample> = generate_session(&left_cfg)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| i / per_target < 2)
+            .map(|(_, s)| s)
+            .collect();
+        samples.extend(left_samples);
+
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            DotSessionFit::fit_with(
+                &samples,
+                &fixture_rig(),
+                &FitConfig::default(),
+                ProfileMeta::default(),
+            )
+            .unwrap()
+        });
+
+        let rec = records
+            .iter()
+            .find(|r| r.message == "eye omitted")
+            .expect("no 'eye omitted' record");
+        assert_eq!(rec.level, eye_log::Level::Debug);
+        assert_eq!(
+            rec.fields.get("eye"),
+            Some(&eye_log::Value::Str("left".to_string()))
+        );
+        assert_eq!(
+            rec.fields.get(field::REASON),
+            Some(&eye_log::Value::Str("too_few_targets".to_string()))
+        );
+        assert_eq!(rec.fields.get("usable"), Some(&eye_log::Value::U64(2)));
+        assert_eq!(
+            rec.fields.get("min_targets_offset"),
+            Some(&eye_log::Value::U64(3))
+        );
+    }
+
+    #[test]
+    fn test_logs_irls_iteration_at_trace() {
+        let samples = generate_session(&SessionConfig::default());
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            DotSessionFit::fit_with(
+                &samples,
+                &fixture_rig(),
+                &FitConfig::default(),
+                ProfileMeta::default(),
+            )
+            .unwrap()
+        });
+
+        let iterations: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "irls iteration")
+            .collect();
+        assert!(
+            !iterations.is_empty() && iterations.len() <= 10,
+            "{}",
+            iterations.len()
+        );
+
+        let mut prev_iter: Option<u64> = None;
+        for (k, rec) in iterations.iter().enumerate() {
+            assert_eq!(rec.level, eye_log::Level::Trace);
+            assert_eq!(
+                rec.fields.get("eye"),
+                Some(&eye_log::Value::Str("right".to_string()))
+            );
+            let iteration = match rec.fields.get("iteration") {
+                Some(eye_log::Value::U64(v)) => *v,
+                other => panic!("expected iteration U64, got {other:?}"),
+            };
+            if let Some(prev) = prev_iter {
+                assert!(iteration > prev, "{iteration} should exceed {prev}");
+            } else {
+                assert_eq!(iteration, 0);
+                assert_eq!(rec.fields.get("step"), Some(&eye_log::Value::F64(0.0)));
+            }
+            prev_iter = Some(iteration);
+            let converged = match rec.fields.get("converged") {
+                Some(eye_log::Value::Bool(v)) => *v,
+                other => panic!("expected converged Bool, got {other:?}"),
+            };
+            if converged {
+                assert_eq!(k, iterations.len() - 1, "converged before the last record");
+            }
+        }
     }
 }

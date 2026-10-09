@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use eye_core::log::field;
 use eye_core::stage::GazeCorrection;
 use eye_core::{GazeRay, Rig, Side};
 use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
@@ -14,6 +15,14 @@ pub enum EyeKey {
     Left,
     Right,
     Cyclopean,
+}
+
+pub(crate) fn eye_label(k: EyeKey) -> &'static str {
+    match k {
+        EyeKey::Left => "left",
+        EyeKey::Right => "right",
+        EyeKey::Cyclopean => "cyclopean",
+    }
 }
 
 impl From<Option<Side>> for EyeKey {
@@ -100,7 +109,13 @@ fn head_frame_correct(
 
 impl GazeCorrection for UserProfile {
     fn correct(&self, ray: &GazeRay) -> GazeRay {
-        let Some(c) = self.eyes.get(&EyeKey::from(ray.side)) else {
+        let eye = EyeKey::from(ray.side);
+        let Some(c) = self.eyes.get(&eye) else {
+            tracing::trace!(
+                eye = eye_label(eye),
+                { field::REASON } = "no_profile_entry",
+                "ray uncorrected"
+            );
             return ray.clone();
         };
         let a = yaw_pitch_from_direction(&ray.direction);
@@ -157,6 +172,15 @@ impl GazeCorrection for UserProfile {
                 (head_frame_correct(&rot, &a, &th), propagate(&j, &cov8))
             }
         };
+        tracing::trace!(
+            eye = eye_label(eye),
+            model = ?c.model,
+            yaw_in_deg = a.x.to_degrees(),
+            pitch_in_deg = a.y.to_degrees(),
+            yaw_out_deg = corrected.x.to_degrees(),
+            pitch_out_deg = corrected.y.to_degrees(),
+            "ray corrected"
+        );
         GazeRay {
             direction: direction_from_yaw_pitch(&corrected),
             angular_cov,
@@ -307,6 +331,68 @@ mod tests {
         let ray = straight_ray(Some(eye_core::Side::Left));
         let corrected = profile.correct(&ray);
         assert_eq!(corrected, ray);
+    }
+
+    #[test]
+    fn test_logs_ray_corrected_at_trace() {
+        let profile = fixture_profile();
+        let ray = straight_ray(Some(eye_core::Side::Right));
+        let expected_yaw_in = yaw_pitch_from_direction(&ray.direction).x.to_degrees();
+
+        let (corrected, records) =
+            eye_log::testing::capture_logs(tracing::Level::TRACE, || profile.correct(&ray));
+
+        let expected_yaw_out = yaw_pitch_from_direction(&corrected.direction)
+            .x
+            .to_degrees();
+        let rec = records
+            .iter()
+            .find(|r| r.message == "ray corrected")
+            .expect("no 'ray corrected' record");
+        assert_eq!(rec.level, eye_log::Level::Trace);
+        assert_eq!(
+            rec.fields.get("eye"),
+            Some(&eye_log::Value::Str("right".to_string()))
+        );
+        assert_eq!(
+            rec.fields.get("model"),
+            Some(&eye_log::Value::Str("Affine".to_string()))
+        );
+        match rec.fields.get("yaw_in_deg") {
+            Some(eye_log::Value::F64(v)) => {
+                assert_abs_diff_eq!(*v, expected_yaw_in, epsilon = 1e-9)
+            }
+            other => panic!("expected yaw_in_deg F64, got {other:?}"),
+        }
+        match rec.fields.get("yaw_out_deg") {
+            Some(eye_log::Value::F64(v)) => {
+                assert_abs_diff_eq!(*v, expected_yaw_out, epsilon = 1e-9)
+            }
+            other => panic!("expected yaw_out_deg F64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_logs_ray_uncorrected_at_trace() {
+        let profile = fixture_profile();
+        let ray = straight_ray(Some(eye_core::Side::Left));
+
+        let (_, records) =
+            eye_log::testing::capture_logs(tracing::Level::TRACE, || profile.correct(&ray));
+
+        let rec = records
+            .iter()
+            .find(|r| r.message == "ray uncorrected")
+            .expect("no 'ray uncorrected' record");
+        assert_eq!(rec.level, eye_log::Level::Trace);
+        assert_eq!(
+            rec.fields.get("eye"),
+            Some(&eye_log::Value::Str("left".to_string()))
+        );
+        assert_eq!(
+            rec.fields.get(field::REASON),
+            Some(&eye_log::Value::Str("no_profile_entry".to_string()))
+        );
     }
 
     #[test]
