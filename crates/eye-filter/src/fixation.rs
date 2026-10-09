@@ -29,6 +29,9 @@ pub enum EyeMovement {
 #[serde(default, deny_unknown_fields)]
 pub struct IvtConfig {
     pub velocity_threshold_deg_s: f64,
+    /// Samples older than this are dropped from the velocity window, except
+    /// the most recent predecessor, so a stream slower than the window still
+    /// classifies.
     pub window_ms: f64,
     pub viewing_distance_mm: f64,
     pub min_fixation_ms: f64,
@@ -107,7 +110,9 @@ impl IvtClassifier {
             return EyeMovement::Unknown;
         }
         let window = self.cfg.window_ms / 1000.0;
-        while let Some(&(t0, _)) = self.history.front() {
+        while self.history.len() > 1
+            && let Some(&(t0, _)) = self.history.front()
+        {
             match dt_seconds(t0, t) {
                 Some(dt) if dt > window => {
                     self.history.pop_front();
@@ -348,6 +353,17 @@ mod tests {
             EyeMovement::Unknown,
             "k=2, 66.7 ms of history is >= window/2 = 50 ms"
         );
+    }
+
+    #[test]
+    fn test_ivt_labels_fixation_at_7_5_hz() {
+        const P7_5: u64 = 133_333_333;
+        let mut c = classifier(IvtConfig::default());
+        assert_eq!(c.classify(&pt(0, 100.0, 100.0)), EyeMovement::Unknown);
+        for k in 1..5u64 {
+            let label = c.classify(&pt(k * P7_5, 100.0, 100.0));
+            assert_eq!(label, EyeMovement::Fixation, "k={k}");
+        }
     }
 
     #[test]
