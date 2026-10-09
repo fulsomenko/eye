@@ -87,7 +87,8 @@ pub fn px_logical_to_mm(screen: &ScreenModel, px: &Point2<f64>) -> Point2<f64> {
 
 /// Monotone display/gating hint in (0, 1], not a probability: `exp(-sigma_major / CONFIDENCE_SCALE_MM)`.
 pub fn confidence_from_cov(cov_mm: &Cov2) -> f64 {
-    let lambda_max = cov_mm.symmetric_eigen().eigenvalues.max().max(0.0);
+    let (a, b, d) = (cov_mm[(0, 0)], cov_mm[(0, 1)], cov_mm[(1, 1)]);
+    let lambda_max = ((a + d) / 2.0 + ((a - d) / 2.0).hypot(b)).max(0.0);
     (-lambda_max.sqrt() / CONFIDENCE_SCALE_MM).exp()
 }
 
@@ -290,6 +291,23 @@ mod tests {
         let screen = edp1();
         let px = mm_to_px_physical(&screen, &Point2::new(-20.0, 85.0));
         assert_abs_diff_eq!(px.x, -20.0 * 3840.0 / 310.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_confidence_closed_form_matches_eigen() {
+        let mut rng = SplitMix64::new(11);
+        for _ in 0..1000 {
+            let m = Matrix2::new(
+                rng.gaussian(),
+                rng.gaussian(),
+                rng.gaussian(),
+                rng.gaussian(),
+            );
+            let cov = m * m.transpose();
+            let eigen_max = cov.symmetric_eigen().eigenvalues.max().max(0.0);
+            let expected = (-eigen_max.sqrt() / CONFIDENCE_SCALE_MM).exp();
+            assert_relative_eq!(confidence_from_cov(&cov), expected, max_relative = 1e-12);
+        }
     }
 
     #[test]

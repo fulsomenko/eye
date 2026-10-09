@@ -28,6 +28,10 @@ pub struct Triangulated {
     pub parallax_rad: f64,
 }
 
+fn parallax_rad(d1: &Vector3<f64>, d2: &Vector3<f64>) -> f64 {
+    d1.cross(d2).norm().atan2(d1.dot(d2))
+}
+
 /// Midpoint of the common perpendicular of two rays; `None` when (near) parallel.
 pub fn midpoint(
     o1: &Point3<f64>,
@@ -80,7 +84,7 @@ pub fn triangulate(a: &View<'_>, b: &View<'_>) -> Result<Triangulated, GeometryE
     let (o1, d1) = crate::camera::pixel_ray(a.camera, a.pixel.value())?;
     let (o2, d2) = crate::camera::pixel_ray(b.camera, b.pixel.value())?;
 
-    let parallax_rad = d1.dot(&d2).clamp(-1.0, 1.0).acos();
+    let parallax_rad = parallax_rad(&d1, &d2);
     if parallax_rad < MIN_PARALLAX_RAD {
         return Err(GeometryError::Degenerate("parallax"));
     }
@@ -134,6 +138,15 @@ mod tests {
 
     use super::*;
     use crate::synth::SplitMix64;
+
+    #[test]
+    fn test_parallax_atan2_is_exact_at_1e_8_rad() {
+        let theta = 1e-8_f64;
+        let d1 = Vector3::new(0.0, 0.0, 1.0);
+        let d2 = Vector3::new(theta.sin(), 0.0, theta.cos());
+        let p = parallax_rad(&d1, &d2);
+        assert_abs_diff_eq!(p, theta, epsilon = 1e-12);
+    }
 
     #[test]
     fn test_midpoint_intersecting_rays_returns_intersection() {

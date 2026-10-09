@@ -9,6 +9,9 @@ use crate::GeometryError;
 use crate::camera::Intrinsics;
 use crate::lsq::{self, ResidualModel, SolveOptions};
 
+#[cfg(test)]
+static SOLVE_FROM_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pose {
     pub camera_from_object: Isometry3<f64>,
@@ -60,6 +63,8 @@ fn solve_from(
     image: &[Measured<Point2<f64>>],
     start: &Isometry3<f64>,
 ) -> Result<(Pose, f64), GeometryError> {
+    #[cfg(test)]
+    SOLVE_FROM_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let problem = PnpProblem {
         intr,
         object,
@@ -175,6 +180,7 @@ pub fn solve_pnp(
 
     let t0 = frontal_init(intr, object, image)?;
     let frontal_result = solve_from(intr, object, image, &t0);
+    let frontal_err = frontal_result.as_ref().err().cloned();
 
     let mut median_sigma_sorted: Vec<f64> = image.iter().map(|m| m.sigma()).collect();
     median_sigma_sorted.sort_by(|a, b| a.total_cmp(b));
@@ -202,7 +208,7 @@ pub fn solve_pnp(
 
     match best {
         Some((pose, _)) => Ok(pose),
-        None => solve_from(intr, object, image, &t0).map(|(pose, _)| pose),
+        None => Err(frontal_err.unwrap_or(GeometryError::NotConverged("restarts".into()))),
     }
 }
 
@@ -413,6 +419,33 @@ mod tests {
             &without_init.camera_from_object,
         );
         assert!(err.norm() < 1e-9, "err norm = {}", err.norm());
+    }
+
+    #[test]
+    fn test_pnp_all_starts_failing_returns_frontal_error_without_fourth_solve() {
+        let intr = intr();
+        let object = vec![Point3::new(0.0, 0.0, 0.0); 4];
+        let image = vec![
+            Measured::new(Point2::new(100.0, 100.0), 1.0).unwrap(),
+            Measured::new(Point2::new(200.0, 100.0), 1.0).unwrap(),
+            Measured::new(Point2::new(100.0, 200.0), 1.0).unwrap(),
+            Measured::new(Point2::new(200.0, 200.0), 1.0).unwrap(),
+        ];
+
+        let before = SOLVE_FROM_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let err = solve_pnp(&intr, &object, &image, None).unwrap_err();
+        let after = SOLVE_FROM_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+
+        let t0 = frontal_init(&intr, &object, &image).unwrap();
+        let frontal_err = solve_from(&intr, &object, &image, &t0).unwrap_err();
+
+        assert_eq!(err, frontal_err);
+        assert_eq!(
+            after - before,
+            3,
+            "expected exactly 3 solve_from calls, counted {}",
+            after - before
+        );
     }
 
     #[test]

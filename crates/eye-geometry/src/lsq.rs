@@ -1,5 +1,5 @@
 use levenberg_marquardt::{LeastSquaresProblem, LevenbergMarquardt};
-use nalgebra::{Cholesky, DMatrix, DVector, Dyn, U1, VecStorage};
+use nalgebra::{DMatrix, DVector, Dyn, U1, VecStorage};
 
 use crate::GeometryError;
 
@@ -24,7 +24,7 @@ pub struct SolveOptions {
 impl Default for SolveOptions {
     fn default() -> Self {
         Self {
-            tol: 1e-10,
+            tol: 1e-8,
             patience: 100,
             inflate_by_chi2: true,
         }
@@ -147,14 +147,20 @@ pub fn covariance_from_jacobian(
     chi2: f64,
     dof: usize,
 ) -> Result<DMatrix<f64>, GeometryError> {
-    let jtj = j.transpose() * j;
     let scale = if dof == 0 {
         1.0
     } else {
         (chi2 / dof as f64).max(1.0)
     };
-    let chol = Cholesky::new(jtj).ok_or(GeometryError::Unobservable)?;
-    Ok(chol.inverse() * scale)
+    let qr = j.clone().qr();
+    let r = qr.r();
+    let max = r.diagonal().amax();
+    if r.diagonal().iter().any(|d| d.abs() < 1e-12 * max) {
+        return Err(GeometryError::Unobservable);
+    }
+    let r_inv = r.try_inverse().ok_or(GeometryError::Unobservable)?;
+    // (J^T J)^-1 = R^-1 R^-T, R is the n x n upper triangular factor of J's QR.
+    Ok(r_inv.clone() * r_inv.transpose() * scale)
 }
 
 #[cfg(test)]
@@ -162,7 +168,7 @@ mod tests {
     use approx::assert_relative_eq;
     use nalgebra::{DMatrix, DVector};
 
-    use super::{ResidualModel, SolveOptions, solve};
+    use super::{ResidualModel, SolveOptions, covariance_from_jacobian, jacobian, solve};
     use crate::GeometryError;
     use crate::synth::SplitMix64;
 
@@ -270,6 +276,32 @@ mod tests {
 
         let expected_cov = closed_form(&x, 0.1);
         assert_relative_eq!(fit.cov, expected_cov, max_relative = 1e-6);
+    }
+
+    #[test]
+    fn test_covariance_from_qr_matches_cholesky() {
+        let (x, y) = line_data(1, 0.1);
+        let model = Line {
+            x: x.clone(),
+            y,
+            s: 0.1,
+        };
+        let fit = solve(
+            &model,
+            DVector::from_vec(vec![0.0, 0.0]),
+            &SolveOptions::default(),
+        )
+        .expect("should converge");
+        let j = jacobian(&model, &fit.x).expect("jacobian at optimum");
+
+        let qr_cov = covariance_from_jacobian(&j, fit.chi2, fit.dof).expect("observable");
+
+        let scale = (fit.chi2 / fit.dof as f64).max(1.0);
+        let jtj = j.transpose() * &j;
+        let chol = nalgebra::Cholesky::new(jtj).expect("positive definite");
+        let cholesky_cov = chol.inverse() * scale;
+
+        assert_relative_eq!(qr_cov, cholesky_cov, max_relative = 1e-12);
     }
 
     #[test]
