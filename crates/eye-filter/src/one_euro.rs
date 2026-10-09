@@ -18,8 +18,8 @@ pub struct OneEuroConfig {
 impl Default for OneEuroConfig {
     fn default() -> Self {
         Self {
-            min_cutoff: 1.0,
-            beta: 0.007,
+            min_cutoff: 0.3,
+            beta: 0.002,
             d_cutoff: 1.0,
             reset_after_s: 0.5,
         }
@@ -215,8 +215,8 @@ mod tests {
         }
     }
 
-    fn alpha30() -> f64 {
-        1.0 / (1.0 + (1.0 / TAU) / (P30 as f64 * 1e-9))
+    fn alpha03() -> f64 {
+        1.0 / (1.0 + (1.0 / (TAU * 0.3)) / (P30 as f64 * 1e-9))
     }
 
     fn pt_cov(t_ns: u64, x_mm: f64, y_mm: f64, cov_val: f64) -> GazePoint {
@@ -237,6 +237,14 @@ mod tests {
 
     fn filter(cfg: OneEuroConfig) -> OneEuroFilter {
         OneEuroFilter::new(cfg, edp1()).unwrap()
+    }
+
+    #[test]
+    fn test_one_euro_default_is_heavy() {
+        let cfg = OneEuroConfig::default();
+        approx::assert_abs_diff_eq!(cfg.min_cutoff, 0.3, epsilon = 1e-12);
+        approx::assert_abs_diff_eq!(cfg.beta, 0.002, epsilon = 1e-12);
+        approx::assert_abs_diff_eq!(cfg.d_cutoff, 1.0, epsilon = 1e-12);
     }
 
     #[test]
@@ -311,12 +319,12 @@ mod tests {
         let mean = tail.iter().sum::<f64>() / tail.len() as f64;
         let var = tail.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / tail.len() as f64;
         let std = var.sqrt();
-        let expected_std = 10.0 * (alpha30() / (2.0 - alpha30())).sqrt();
+        let expected_std = 10.0 * (alpha03() / (2.0 - alpha03())).sqrt();
         assert!(
             (std - expected_std).abs() < 0.1 * expected_std,
             "std = {std}, expected ~{expected_std}"
         );
-        let expected_cov = 100.0 * alpha30() / (2.0 - alpha30());
+        let expected_cov = 100.0 * alpha03() / (2.0 - alpha03());
         approx::assert_abs_diff_eq!(last_cov, expected_cov, epsilon = 1e-9);
     }
 
@@ -450,7 +458,7 @@ mod tests {
         let mut f = filter(cfg);
         f.apply(pt_cov(0, 0.0, 0.0, 100.0));
         let out = f.apply(pt_cov(P30, 0.0, 0.0, 10000.0));
-        let a = alpha30();
+        let a = alpha03();
         let cov_lp = 100.0 + (10000.0 - 100.0) * a;
         let expected = cov_lp * (a / (2.0 - a));
         let naive = 10000.0 * (a / (2.0 - a));
@@ -470,7 +478,7 @@ mod tests {
         let mut f = filter(cfg);
         f.apply(pt_cov(0, 0.0, 0.0, 100.0));
         let out = f.apply(pt_cov(P30, 0.0, 0.0, 100.0));
-        let a = alpha30();
+        let a = alpha03();
         let expected = 100.0 * (a / (2.0 - a));
         approx::assert_abs_diff_eq!(out.cov_mm[(0, 0)], expected, epsilon = 1e-9);
     }
@@ -515,7 +523,7 @@ mod tests {
         let recs = find(&records, "filter step");
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].level, eye_log::Level::Trace);
-        approx::assert_abs_diff_eq!(f64_field(recs[0], "cutoff_hz"), 1.0, epsilon = 1e-9);
+        approx::assert_abs_diff_eq!(f64_field(recs[0], "cutoff_hz"), 0.3, epsilon = 1e-9);
         approx::assert_abs_diff_eq!(f64_field(recs[0], "in_x_mm"), 100.0, epsilon = 1e-9);
         approx::assert_abs_diff_eq!(f64_field(recs[0], "out_x_mm"), 100.0, epsilon = 1e-9);
         approx::assert_abs_diff_eq!(f64_field(recs[0], "in_cov_xx"), 100.0, epsilon = 1e-9);
@@ -636,7 +644,7 @@ mod tests {
         f.reset();
         f.apply(pt_cov(2 * P30, 0.0, 0.0, 500.0));
         let out = f.apply(pt_cov(3 * P30, 0.0, 0.0, 500.0));
-        let a = alpha30();
+        let a = alpha03();
         let expected = 500.0 * (a / (2.0 - a));
         approx::assert_abs_diff_eq!(out.cov_mm[(0, 0)], expected, epsilon = 1e-9);
     }

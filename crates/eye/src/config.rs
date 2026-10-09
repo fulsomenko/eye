@@ -429,10 +429,7 @@ mod tests {
         assert_eq!(config.estimate.kind, "fused");
 
         assert_eq!(config.filter.kind, "one-euro");
-        let mut expected_filter_options = toml::Table::new();
-        expected_filter_options.insert("min_cutoff".into(), toml::Value::Float(1.0));
-        expected_filter_options.insert("beta".into(), toml::Value::Float(0.007));
-        assert_eq!(config.filter.options, expected_filter_options);
+        assert!(config.filter.options.is_empty());
 
         assert_eq!(
             config.output,

@@ -23,8 +23,6 @@ kind = "fused"
 
 [filter]
 kind = "one-euro"
-min_cutoff = 1.0
-beta = 0.007
 
 [output]
 kind = "layer-shell"
