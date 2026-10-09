@@ -641,6 +641,7 @@ dependencies = [
  "approx",
  "eye-core",
  "eye-geometry",
+ "eye-log",
  "nalgebra",
  "proptest",
  "serde",

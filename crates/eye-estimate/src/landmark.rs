@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use eye_core::log::field;
 use eye_core::observation::SCHEME_MEDIAPIPE_478;
 use eye_core::stage::{GazeEstimator, StageError};
 use eye_core::{
@@ -19,6 +20,7 @@ use nalgebra::{Isometry3, Point2, Point3, Translation3, UnitQuaternion, Vector3,
 use serde::Deserialize;
 
 use crate::EstimateError;
+use crate::log::{side_str, trace_ray};
 use crate::options::parse_options;
 
 pub const MEDIAPIPE_LANDMARKS: usize = 478;
@@ -108,16 +110,29 @@ impl LandmarkEstimator {
             self.last_pose.remove(&obs.camera);
             return Ok(None);
         };
+        let warm_start = self.last_pose.contains_key(&obs.camera);
+        tracing::trace!(
+            rms_px = pose.rms_px,
+            tx_mm = pose.camera_from_object.translation.vector.x,
+            ty_mm = pose.camera_from_object.translation.vector.y,
+            tz_mm = pose.camera_from_object.translation.vector.z,
+            rotation_rad = pose.camera_from_object.rotation.angle(),
+            warm_start,
+            "head pose"
+        );
         self.last_pose
             .insert(obs.camera.clone(), pose.camera_from_object);
         let viewer = screen_from_viewer(
             &cam.screen_from_camera.rotation,
             &pose.camera_from_object.rotation,
         );
-        let eyes = [Side::Right, Side::Left]
+        let eyes: Vec<LandmarkEye> = [Side::Right, Side::Left]
             .into_iter()
             .filter_map(|side| self.eye(side, face, &pose, cam, &viewer))
             .collect();
+        for eye in &eyes {
+            trace_ray(Self::NAME, &eye.ray);
+        }
         Ok(Some(LandmarkFrame {
             camera: obs.camera.clone(),
             timestamp: obs.timestamp,
@@ -129,10 +144,22 @@ impl LandmarkEstimator {
 
     fn head_pose(&self, id: &CameraId, cam: &CameraModel, face: &FaceObservation) -> Option<Pose> {
         if face.landmarks.len() != MEDIAPIPE_LANDMARKS {
+            tracing::debug!(
+                { field::REASON } = "landmark_count",
+                landmarks = face.landmarks.len() as u64,
+                "head pose rejected"
+            );
             return None;
         }
         let (object, image) = MEDIAPIPE_RIGID
             .correspondences(&face.landmarks, self.options.landmark_sigma_px)
+            .inspect_err(|e| {
+                tracing::debug!(
+                    { field::REASON } = "correspondences_failed",
+                    error = %e,
+                    "head pose rejected"
+                );
+            })
             .ok()?;
         let pose = solve_pnp(
             &Intrinsics::from_camera_model(cam),
@@ -140,8 +167,24 @@ impl LandmarkEstimator {
             &image,
             self.last_pose.get(id),
         )
+        .inspect_err(|e| {
+            tracing::debug!(
+                { field::REASON } = "pnp_failed",
+                error = %e,
+                "head pose rejected"
+            );
+        })
         .ok()?;
-        (pose.rms_px <= self.options.max_reprojection_px).then_some(pose)
+        if pose.rms_px > self.options.max_reprojection_px {
+            tracing::debug!(
+                { field::REASON } = "rms_too_high",
+                rms_px = pose.rms_px,
+                max_reprojection_px = self.options.max_reprojection_px,
+                "head pose rejected"
+            );
+            return None;
+        }
+        Some(pose)
     }
 
     fn eye(
@@ -175,21 +218,56 @@ impl LandmarkEstimator {
             );
             Some((screen_from_camera * camera_from_head * e_head).coords)
         };
-        let (e, cov) = propagate_fn::<3, 6>(e_of, &Vector6::zeros(), &pose.cov)?;
+        let Some((e, cov)) = propagate_fn::<3, 6>(e_of, &Vector6::zeros(), &pose.cov) else {
+            tracing::debug!(
+                { field::REASON } = "propagate_failed",
+                side = side_str(side),
+                "eye dropped"
+            );
+            return None;
+        };
         let centre = EyeCentre {
             position: Point3::from(e),
             cov,
         };
 
-        let iris_px = face
-            .eye(side)?
-            .iris
-            .map(|m| m.map(|ellipse| ellipse.center()))?;
+        let Some(eye) = face.eye(side) else {
+            tracing::debug!(
+                { field::REASON } = "eye_missing",
+                side = side_str(side),
+                "eye dropped"
+            );
+            return None;
+        };
+        let Some(iris_px) = eye.iris.map(|m| m.map(|ellipse| ellipse.center())) else {
+            tracing::debug!(
+                { field::REASON } = "no_iris",
+                side = side_str(side),
+                "eye dropped"
+            );
+            return None;
+        };
 
-        let (o, u) = pixel_ray(cam, iris_px.value()).ok()?;
+        let (o, u) = pixel_ray(cam, iris_px.value())
+            .inspect_err(|err| {
+                tracing::debug!(
+                    { field::REASON } = "pixel_ray_failed",
+                    side = side_str(side),
+                    error = %err,
+                    "eye dropped"
+                );
+            })
+            .ok()?;
         let miss =
             (centre.position - o).cross(&u.into_inner()).norm() - self.params.rotation_to_pupil_mm;
         if miss > self.options.max_iris_miss_mm {
+            tracing::debug!(
+                { field::REASON } = "iris_miss",
+                side = side_str(side),
+                miss_mm = miss,
+                max_iris_miss_mm = self.options.max_iris_miss_mm,
+                "eye dropped"
+            );
             return None;
         }
 
@@ -204,7 +282,16 @@ impl LandmarkEstimator {
                 ..self.params
             }
         };
-        let ray = gaze_ray(side, &centre, cam, &iris_px, &params, viewer).ok()?;
+        let ray = gaze_ray(side, &centre, cam, &iris_px, &params, viewer)
+            .inspect_err(|e| {
+                tracing::debug!(
+                    { field::REASON } = "gaze_ray_failed",
+                    side = side_str(side),
+                    error = %e,
+                    "eye dropped"
+                );
+            })
+            .ok()?;
 
         Some(LandmarkEye {
             side,
@@ -238,6 +325,8 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use eye_geometry::angles::yaw_pitch_from_direction;
     use eye_geometry::eyeball::visual_axis;
+    use eye_log::testing::capture_logs;
+    use eye_log::{Level, Value};
     use nalgebra::{Matrix2, Translation3, Unit, Vector2};
 
     use super::*;
@@ -721,5 +810,217 @@ mod tests {
 
         let err = LandmarkEstimator::from_config(&table, &rig).expect_err("unknown option errors");
         assert!(matches!(err, StageError::Config(_)));
+    }
+
+    #[test]
+    fn test_logs_head_pose_at_trace() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let obs = synthetic_rgb_observation(
+            &rig,
+            &screen_from_head,
+            1.0,
+            Point2::new(155.0, 85.0),
+            0.0,
+            0.0,
+            1,
+        );
+        let mut estimator = LandmarkEstimator::new(LandmarkOptions::default());
+
+        let (_, logs1) = capture_logs(tracing::Level::TRACE, || {
+            estimator
+                .estimate_frame(&obs, &rig)
+                .expect("estimate succeeds")
+                .expect("frame is recovered")
+        });
+        let rec1 = logs1
+            .iter()
+            .find(|r| r.message == "head pose")
+            .expect("head pose logged");
+        assert_eq!(rec1.level, Level::Trace);
+        assert_eq!(rec1.target, "eye_estimate::landmark");
+        assert!(matches!(rec1.fields["rms_px"], Value::F64(v) if v < 1.0));
+        assert!(matches!(
+            rec1.fields["tz_mm"],
+            Value::F64(v) if (v - 500.0).abs() < 10.0
+        ));
+        assert_eq!(rec1.fields["warm_start"], Value::Bool(false));
+
+        let (_, logs2) = capture_logs(tracing::Level::TRACE, || {
+            estimator
+                .estimate_frame(&obs, &rig)
+                .expect("estimate succeeds")
+                .expect("frame is recovered")
+        });
+        let rec2 = logs2
+            .iter()
+            .find(|r| r.message == "head pose")
+            .expect("head pose logged");
+        assert_eq!(rec2.fields["warm_start"], Value::Bool(true));
+    }
+
+    #[test]
+    fn test_logs_head_pose_rejected_at_debug() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let mut obs = synthetic_rgb_observation(
+            &rig,
+            &screen_from_head,
+            1.0,
+            Point2::new(155.0, 85.0),
+            0.0,
+            0.0,
+            1,
+        );
+        obs.face
+            .as_mut()
+            .expect("face is present")
+            .landmarks
+            .truncate(468);
+        let mut estimator = LandmarkEstimator::new(LandmarkOptions::default());
+
+        let (frame, logs) = capture_logs(tracing::Level::DEBUG, || {
+            estimator
+                .estimate_frame(&obs, &rig)
+                .expect("estimate succeeds")
+        });
+
+        assert!(frame.is_none());
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "head pose rejected")
+            .expect("landmark_count logged");
+        assert_eq!(
+            rec.fields[field::REASON],
+            Value::Str("landmark_count".into())
+        );
+        assert_eq!(rec.fields["landmarks"], Value::U64(468));
+    }
+
+    #[test]
+    fn test_logs_reversed_landmarks_rejected_at_debug() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let good = synthetic_rgb_observation(
+            &rig,
+            &screen_from_head,
+            1.0,
+            Point2::new(155.0, 85.0),
+            0.0,
+            0.0,
+            1,
+        );
+        let mut estimator = LandmarkEstimator::new(LandmarkOptions::default());
+        estimator
+            .estimate_frame(&good, &rig)
+            .expect("estimate succeeds")
+            .expect("frame is recovered");
+
+        let mut bad = good;
+        {
+            let face = bad.face.as_mut().expect("face is present");
+            let indices: Vec<usize> = MEDIAPIPE_RIGID.points.iter().map(|&(i, _)| i).collect();
+            let values: Vec<Point2<f64>> = indices.iter().map(|&i| face.landmarks[i]).collect();
+            for (i, v) in indices.iter().zip(values.iter().rev()) {
+                face.landmarks[*i] = *v;
+            }
+        }
+
+        let (frame, logs) = capture_logs(tracing::Level::DEBUG, || {
+            estimator
+                .estimate_frame(&bad, &rig)
+                .expect("estimate succeeds")
+        });
+
+        assert!(frame.is_none());
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "head pose rejected")
+            .expect("rms_too_high logged");
+        assert_eq!(rec.fields[field::REASON], Value::Str("rms_too_high".into()));
+        assert!(matches!(rec.fields["rms_px"], Value::F64(v) if v > 6.0));
+    }
+
+    #[test]
+    fn test_logs_eye_dropped_at_debug() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let mut obs = synthetic_rgb_observation(
+            &rig,
+            &screen_from_head,
+            1.0,
+            Point2::new(155.0, 85.0),
+            0.0,
+            0.0,
+            1,
+        );
+        {
+            let face = obs.face.as_mut().expect("face is present");
+            let right = face
+                .eyes
+                .iter_mut()
+                .find(|e| e.side == Side::Right)
+                .expect("right eye is present");
+            let iris = right.iris.as_mut().expect("right iris is present");
+            let ellipse = *iris.value();
+            let shifted = eye_core::Ellipse2::circle(
+                Point2::new(ellipse.center().x - 100.0, ellipse.center().y),
+                ellipse.semi_major(),
+            )
+            .expect("shifted ellipse is valid");
+            *iris = Measured::new(shifted, iris.sigma()).expect("sigma is valid");
+        }
+        let mut estimator = LandmarkEstimator::new(LandmarkOptions::default());
+
+        let (frame, logs) = capture_logs(tracing::Level::DEBUG, || {
+            estimator
+                .estimate_frame(&obs, &rig)
+                .expect("estimate succeeds")
+                .expect("frame is recovered")
+        });
+
+        assert!(frame.eyes.iter().all(|e| e.side != Side::Right));
+        let rec = logs
+            .iter()
+            .find(|r| {
+                r.message == "eye dropped"
+                    && r.fields[field::REASON] == Value::Str("iris_miss".into())
+            })
+            .expect("iris_miss logged");
+        assert_eq!(rec.fields["side"], Value::Str("right".into()));
+        assert!(matches!(rec.fields["miss_mm"], Value::F64(v) if v > 2.0));
+
+        let mut obs2 = synthetic_rgb_observation(
+            &rig,
+            &screen_from_head,
+            1.0,
+            Point2::new(155.0, 85.0),
+            0.0,
+            0.0,
+            1,
+        );
+        {
+            let face = obs2.face.as_mut().expect("face is present");
+            let right = face
+                .eyes
+                .iter_mut()
+                .find(|e| e.side == Side::Right)
+                .expect("right eye is present");
+            right.iris = None;
+        }
+        let mut estimator2 = LandmarkEstimator::new(LandmarkOptions::default());
+        let (_, logs2) = capture_logs(tracing::Level::DEBUG, || {
+            estimator2
+                .estimate_frame(&obs2, &rig)
+                .expect("estimate succeeds")
+        });
+        let rec2 = logs2
+            .iter()
+            .find(|r| {
+                r.message == "eye dropped"
+                    && r.fields[field::REASON] == Value::Str("no_iris".into())
+            })
+            .expect("no_iris logged");
+        assert_eq!(rec2.fields["side"], Value::Str("right".into()));
     }
 }

@@ -1,5 +1,6 @@
+use eye_core::log::field;
 use eye_core::stage::{GazeEstimator, StageError};
-use eye_core::{CameraModel, GazeRay, Observations, Rig, ScreenModel, Side};
+use eye_core::{CameraModel, GazeRay, Measured, Observations, Rig, ScreenModel, Side};
 use eye_geometry::camera::pixel_ray;
 use eye_geometry::eyeball::{EyeCentre, EyeParams, Kappa, gaze_ray, optical_axis, ray_sphere_near};
 use eye_geometry::screen::intersect_plane;
@@ -8,6 +9,7 @@ use serde::Deserialize;
 
 use crate::EstimateError;
 use crate::ir::{PupilPair, binocular_pupils};
+use crate::log::{side_str, trace_ray};
 use crate::options::parse_options;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,6 +77,11 @@ impl IrPupilEstimator {
     ) -> Result<Vec<GazeRay>, EstimateError> {
         self.last_reanchor = None;
         let Some(pair) = PupilPair::from_observations(obs) else {
+            tracing::debug!(
+                { field::REASON } = "no_pupil_pair",
+                observations = obs.len() as u64,
+                "no pupil pair"
+            );
             return Ok(vec![]);
         };
         let cam = rig
@@ -86,24 +93,42 @@ impl IrPupilEstimator {
         let r = self.params.rotation_to_pupil_mm;
         let mut anchor = match self.anchor {
             None => {
+                tracing::debug!({ field::REASON } = "initial", "re-anchor");
                 self.last_reanchor = Some(Trigger::Initial);
                 self.anchor_from(&x, rig.screen())
             }
-            Some(c)
-                if ((x[0] - c[0]).norm() - r).abs() + ((x[1] - c[1]).norm() - r).abs()
-                    > 2.0 * self.options.reanchor_distance_mm =>
-            {
-                self.last_reanchor = Some(Trigger::Distance);
-                self.anchor_from(&x, rig.screen())
+            Some(c) => {
+                let drift = ((x[0] - c[0]).norm() - r).abs() + ((x[1] - c[1]).norm() - r).abs();
+                let max_drift = 2.0 * self.options.reanchor_distance_mm;
+                if drift > max_drift {
+                    tracing::debug!(
+                        { field::REASON } = "distance",
+                        drift_mm = drift,
+                        max_drift_mm = max_drift,
+                        "re-anchor"
+                    );
+                    self.last_reanchor = Some(Trigger::Distance);
+                    self.anchor_from(&x, rig.screen())
+                } else {
+                    c
+                }
             }
-            Some(c) => c,
         };
 
-        if let Some(g) = self.optical_pair(cam, &pair, &anchor)
-            && !self.on_grown_screen(&anchor, &g, rig.screen())
-        {
-            self.last_reanchor = Some(Trigger::OffScreen);
-            anchor = self.anchor_from(&x, rig.screen());
+        if let Some(g) = self.optical_pair(cam, &pair, &anchor) {
+            let hit = screen_hit(&anchor, &g);
+            let margin = self.options.reanchor_margin;
+            if !hit.is_some_and(|h| within_grown_screen(&h, margin, rig.screen())) {
+                tracing::debug!(
+                    { field::REASON } = "off_screen",
+                    hit_x_mm = hit.map(|h| h.x),
+                    hit_y_mm = hit.map(|h| h.y),
+                    margin,
+                    "re-anchor"
+                );
+                self.last_reanchor = Some(Trigger::OffScreen);
+                anchor = self.anchor_from(&x, rig.screen());
+            }
         }
 
         self.anchor = Some(anchor);
@@ -111,11 +136,15 @@ impl IrPupilEstimator {
             self.last_optical = Some(g);
         }
 
-        Ok(self
+        let rays: Vec<GazeRay> = self
             .rays(&pair, cam, &anchor)
             .into_iter()
             .flatten()
-            .collect())
+            .collect();
+        for ray in &rays {
+            trace_ray(Self::NAME, ray);
+        }
+        Ok(rays)
     }
 
     fn anchor_from(&self, x: &[Point3<f64>; 2], screen: &ScreenModel) -> [Point3<f64>; 2] {
@@ -153,24 +182,6 @@ impl IrPupilEstimator {
         ])
     }
 
-    fn on_grown_screen(
-        &self,
-        anchor: &[Point3<f64>; 2],
-        g: &[Unit<Vector3<f64>>; 2],
-        screen: &ScreenModel,
-    ) -> bool {
-        let origin = Point3::from((anchor[0].coords + anchor[1].coords) / 2.0);
-        let Some(direction) = Unit::try_new(g[0].into_inner() + g[1].into_inner(), 1e-12) else {
-            return false;
-        };
-        let Some(hit) = intersect_plane(&origin, &direction) else {
-            return false;
-        };
-        let m = self.options.reanchor_margin;
-        let (w, h) = (screen.size_mm.x, screen.size_mm.y);
-        (-m * w..=(1.0 + m) * w).contains(&hit.x) && (-m * h..=(1.0 + m) * h).contains(&hit.y)
-    }
-
     fn rays(
         &self,
         pair: &PupilPair,
@@ -191,33 +202,42 @@ impl IrPupilEstimator {
         let a = self.options.anchor_sigma_mm;
         let cov = Matrix3::from_diagonal(&Vector3::new(a * a, a * a, 9.0 * a * a));
         let viewer = UnitQuaternion::identity();
+        let ray_for = |side: Side, position: Point3<f64>, px: &Measured<Point2<f64>>| {
+            gaze_ray(
+                side,
+                &EyeCentre { position, cov },
+                cam,
+                px,
+                &params,
+                &viewer,
+            )
+            .inspect_err(|e| {
+                tracing::debug!(
+                    { field::REASON } = "gaze_ray_failed",
+                    side = side_str(side),
+                    error = %e,
+                    "gaze ray failed"
+                );
+            })
+            .ok()
+        };
         [
-            gaze_ray(
-                Side::Right,
-                &EyeCentre {
-                    position: anchor[0],
-                    cov,
-                },
-                cam,
-                &pair.right,
-                &params,
-                &viewer,
-            )
-            .ok(),
-            gaze_ray(
-                Side::Left,
-                &EyeCentre {
-                    position: anchor[1],
-                    cov,
-                },
-                cam,
-                &pair.left,
-                &params,
-                &viewer,
-            )
-            .ok(),
+            ray_for(Side::Right, anchor[0], &pair.right),
+            ray_for(Side::Left, anchor[1], &pair.left),
         ]
     }
+}
+
+fn screen_hit(anchor: &[Point3<f64>; 2], g: &[Unit<Vector3<f64>>; 2]) -> Option<Point2<f64>> {
+    let origin = Point3::from((anchor[0].coords + anchor[1].coords) / 2.0);
+    let direction = Unit::try_new(g[0].into_inner() + g[1].into_inner(), 1e-12)?;
+    intersect_plane(&origin, &direction)
+}
+
+fn within_grown_screen(hit: &Point2<f64>, margin: f64, screen: &ScreenModel) -> bool {
+    let (w, h) = (screen.size_mm.x, screen.size_mm.y);
+    (-margin * w..=(1.0 + margin) * w).contains(&hit.x)
+        && (-margin * h..=(1.0 + margin) * h).contains(&hit.y)
 }
 
 impl GazeEstimator for IrPupilEstimator {
@@ -238,6 +258,8 @@ mod tests {
     use eye_geometry::angles::yaw_pitch_from_direction;
     use eye_geometry::camera::Intrinsics;
     use eye_geometry::synth::SplitMix64;
+    use eye_log::testing::capture_logs;
+    use eye_log::{Level, Value};
     use nalgebra::Vector2;
 
     use super::*;
@@ -687,5 +709,153 @@ mod tests {
         for ray in &rays {
             ray.validate().expect("ray is valid");
         }
+    }
+
+    #[test]
+    fn test_logs_gaze_ray_at_trace() {
+        let rig = test_rig();
+        let mut estimator = IrPupilEstimator::new(IrPupilOptions {
+            apply_kappa: false,
+            ..Default::default()
+        });
+        let obs =
+            synthetic_ir_observation(&rig, Point2::new(155.0, 85.0), Vector3::zeros(), 0.0, 1);
+
+        let (rays, logs) = capture_logs(tracing::Level::TRACE, || {
+            estimator
+                .estimate_rays(&[obs], &rig)
+                .expect("estimate succeeds")
+        });
+
+        assert_eq!(rays.len(), 2);
+        let recs: Vec<_> = logs.iter().filter(|r| r.message == "gaze ray").collect();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].level, Level::Trace);
+        assert_eq!(recs[0].target, "eye_estimate::log");
+        assert_eq!(recs[0].fields["source"], Value::Str("ir-pupil".into()));
+        assert_eq!(recs[0].fields["side"], Value::Str("right".into()));
+        assert_eq!(recs[1].fields["side"], Value::Str("left".into()));
+        assert!(matches!(
+            recs[0].fields["origin_z_mm"],
+            Value::F64(z) if (z - (-500.0)).abs() < 20.0
+        ));
+        assert!(matches!(
+            recs[0].fields["yaw_sigma_rad"],
+            Value::F64(s) if s > 0.0
+        ));
+        assert!(matches!(
+            recs[0].fields["angular_cov_det"],
+            Value::F64(d) if d > 0.0
+        ));
+    }
+
+    #[test]
+    fn test_logs_no_pupil_pair_at_debug() {
+        let rig = test_rig();
+        let mut estimator = IrPupilEstimator::new(IrPupilOptions::default());
+
+        let (rays, logs) = capture_logs(tracing::Level::DEBUG, || {
+            estimator
+                .estimate_rays(&[], &rig)
+                .expect("estimate succeeds")
+        });
+
+        assert!(rays.is_empty());
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "no pupil pair")
+            .expect("no_pupil_pair logged");
+        assert_eq!(rec.target, "eye_estimate::ir_pupil");
+        assert_eq!(rec.fields["observations"], Value::U64(0));
+        assert_eq!(
+            rec.fields[field::REASON],
+            Value::Str("no_pupil_pair".into())
+        );
+        let keys: Vec<&str> = rec.fields.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["observations", field::REASON]);
+    }
+
+    #[test]
+    fn test_logs_reanchor_at_debug() {
+        let rig = test_rig();
+        let mut estimator = IrPupilEstimator::new(IrPupilOptions {
+            apply_kappa: false,
+            ..Default::default()
+        });
+        let centre_obs =
+            synthetic_ir_observation(&rig, Point2::new(155.0, 85.0), Vector3::zeros(), 0.0, 1);
+
+        let (_, logs_initial) = capture_logs(tracing::Level::DEBUG, || {
+            estimator
+                .estimate_rays(std::slice::from_ref(&centre_obs), &rig)
+                .expect("estimate succeeds")
+        });
+        let rec_initial = logs_initial
+            .iter()
+            .find(|r| r.message == "re-anchor")
+            .expect("initial re-anchor logged");
+        assert_eq!(
+            rec_initial.fields[field::REASON],
+            Value::Str("initial".into())
+        );
+
+        let mut logs_distance = Vec::new();
+        for k in 1_u64..=3 {
+            let offset = Vector3::new(0.0, 0.0, 2.0 * k as f64);
+            let obs = synthetic_ir_observation(&rig, Point2::new(155.0, 85.0), offset, 0.0, 10 + k);
+            let (_, logs) = capture_logs(tracing::Level::DEBUG, || {
+                estimator
+                    .estimate_rays(&[obs], &rig)
+                    .expect("estimate succeeds")
+            });
+            logs_distance = logs;
+        }
+        let rec_distance = logs_distance
+            .iter()
+            .find(|r| r.message == "re-anchor")
+            .expect("distance re-anchor logged");
+        assert_eq!(
+            rec_distance.fields[field::REASON],
+            Value::Str("distance".into())
+        );
+        let drift = match rec_distance.fields["drift_mm"] {
+            Value::F64(v) => v,
+            ref other => panic!("expected F64 drift_mm, got {other:?}"),
+        };
+        let max_drift = match rec_distance.fields["max_drift_mm"] {
+            Value::F64(v) => v,
+            ref other => panic!("expected F64 max_drift_mm, got {other:?}"),
+        };
+        assert_abs_diff_eq!(max_drift, 10.0, epsilon = 1e-12);
+        assert!(drift > max_drift);
+
+        let mut estimator2 = IrPupilEstimator::new(IrPupilOptions {
+            apply_kappa: false,
+            ..Default::default()
+        });
+        estimator2
+            .estimate_rays(&[centre_obs], &rig)
+            .expect("anchoring frame succeeds");
+        let moved = synthetic_ir_observation(
+            &rig,
+            Point2::new(155.0, 85.0),
+            Vector3::new(5.0, 0.0, 0.0),
+            0.0,
+            2,
+        );
+        let (_, logs_offscreen) = capture_logs(tracing::Level::DEBUG, || {
+            estimator2
+                .estimate_rays(&[moved], &rig)
+                .expect("estimate succeeds")
+        });
+        let rec_offscreen = logs_offscreen
+            .iter()
+            .find(|r| r.message == "re-anchor")
+            .expect("off_screen re-anchor logged");
+        assert_eq!(
+            rec_offscreen.fields[field::REASON],
+            Value::Str("off_screen".into())
+        );
+        assert!(matches!(rec_offscreen.fields["hit_x_mm"], Value::F64(_)));
     }
 }

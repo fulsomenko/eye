@@ -1,3 +1,4 @@
+use eye_core::log::field;
 use eye_core::observation::SCHEME_IR_PUPIL_PAIR;
 use eye_core::{CameraId, CameraModel, FaceObservation, Measured, Observations, Side, Timestamp};
 use eye_geometry::camera::pixel_ray;
@@ -22,11 +23,24 @@ impl PupilPair {
                 if face.scheme != SCHEME_IR_PUPIL_PAIR {
                     return None;
                 }
+                let (Some(right), Some(left)) = (
+                    pupil_centre(face, Side::Right),
+                    pupil_centre(face, Side::Left),
+                ) else {
+                    tracing::debug!(
+                        { field::REASON } = "missing_pupil",
+                        { field::CAMERA } = %o.camera,
+                        obs_ts_ns = o.timestamp.as_nanos(),
+                        eyes = face.eyes.len() as u64,
+                        "ir observation without both pupils"
+                    );
+                    return None;
+                };
                 Some(PupilPair {
                     camera: o.camera.clone(),
                     timestamp: o.timestamp,
-                    right: pupil_centre(face, Side::Right)?,
-                    left: pupil_centre(face, Side::Left)?,
+                    right,
+                    left,
                 })
             })
             .collect();
@@ -51,10 +65,26 @@ pub fn binocular_pupils(
     pair: &PupilPair,
     ipd_mm: f64,
 ) -> Option<[Point3<f64>; 2]> {
-    let (origin, u_right) = pixel_ray(cam, pair.right.value()).ok()?;
-    let (_, u_left) = pixel_ray(cam, pair.left.value()).ok()?;
+    let log_pixel_ray_failed = |e: &eye_geometry::GeometryError| {
+        tracing::debug!(
+            { field::REASON } = "pixel_ray_failed",
+            error = %e,
+            "binocular pupils failed"
+        );
+    };
+    let (origin, u_right) = pixel_ray(cam, pair.right.value())
+        .inspect_err(log_pixel_ray_failed)
+        .ok()?;
+    let (_, u_left) = pixel_ray(cam, pair.left.value())
+        .inspect_err(log_pixel_ray_failed)
+        .ok()?;
     let separation = (u_right.into_inner() - u_left.into_inner()).norm();
     if separation <= f64::EPSILON {
+        tracing::debug!(
+            { field::REASON } = "zero_separation",
+            separation,
+            "binocular pupils failed"
+        );
         return None;
     }
     let range = ipd_mm / separation;
@@ -67,7 +97,10 @@ pub fn binocular_pupils(
 #[cfg(test)]
 mod tests {
     use eye_core::observation::SCHEME_MEDIAPIPE_478;
+    use eye_core::{Ellipse2, EyeObservation};
     use eye_geometry::eyeball::EyeParams;
+    use eye_log::testing::capture_logs;
+    use eye_log::{Level, Value};
     use nalgebra::Vector3;
 
     use super::*;
@@ -109,6 +142,73 @@ mod tests {
             left: pixel,
         };
         assert!(binocular_pupils(cam, &pair, 63.0).is_none());
+    }
+
+    #[test]
+    fn test_logs_zero_separation_at_debug() {
+        let rig = test_rig();
+        let cam = rig.camera("ir").expect("rig has an ir camera");
+        let pixel = Measured::new(Point2::new(320.0, 180.0), 0.0).expect("valid sigma");
+        let pair = PupilPair {
+            camera: CameraId::new("ir"),
+            timestamp: Timestamp::from_nanos(0),
+            right: pixel,
+            left: pixel,
+        };
+
+        let (result, logs) =
+            capture_logs(tracing::Level::DEBUG, || binocular_pupils(cam, &pair, 63.0));
+
+        assert!(result.is_none());
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "binocular pupils failed")
+            .expect("zero_separation logged");
+        assert_eq!(rec.level, Level::Debug);
+        assert_eq!(
+            rec.fields[field::REASON],
+            Value::Str("zero_separation".into())
+        );
+        assert_eq!(rec.fields["separation"], Value::F64(0.0));
+    }
+
+    #[test]
+    fn test_logs_missing_pupil_at_debug() {
+        let mut right_eye = EyeObservation::new(Side::Right);
+        right_eye.pupil = Some(
+            Measured::new(
+                Ellipse2::circle(Point2::new(300.0, 180.0), 3.0).expect("valid ellipse"),
+                0.2,
+            )
+            .expect("valid sigma"),
+        );
+        let obs = Observations {
+            camera: CameraId::new("ir"),
+            timestamp: Timestamp::from_nanos(0),
+            face: Some(FaceObservation {
+                scheme: SCHEME_IR_PUPIL_PAIR,
+                landmarks: Vec::new(),
+                eyes: vec![right_eye],
+            }),
+        };
+
+        let (pairs, logs) = capture_logs(tracing::Level::DEBUG, || {
+            PupilPair::all_from_observations(&[obs])
+        });
+
+        assert!(pairs.is_empty());
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "ir observation without both pupils")
+            .expect("missing_pupil logged");
+        assert_eq!(rec.level, Level::Debug);
+        assert_eq!(
+            rec.fields[field::REASON],
+            Value::Str("missing_pupil".into())
+        );
+        assert_eq!(rec.fields[field::CAMERA], Value::Str("ir".into()));
+        assert_eq!(rec.fields["obs_ts_ns"], Value::U64(0));
+        assert_eq!(rec.fields["eyes"], Value::U64(1));
     }
 
     #[test]

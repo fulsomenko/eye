@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod log;
 
 pub mod fused;
 pub mod ir;

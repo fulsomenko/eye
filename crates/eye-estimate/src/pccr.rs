@@ -1,3 +1,4 @@
+use eye_core::log::field;
 use eye_core::stage::{GazeEstimator, StageError};
 use eye_core::{GazeRay, Measured, Observations, Rig, Side};
 use eye_geometry::camera::pixel_ray;
@@ -8,6 +9,7 @@ use serde::Deserialize;
 
 use crate::EstimateError;
 use crate::ir::PupilPair;
+use crate::log::{side_str, trace_ray};
 use crate::options::parse_options;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -55,6 +57,11 @@ impl PccrEstimator {
         rig: &Rig,
     ) -> Result<Vec<GazeRay>, EstimateError> {
         let Some(pair) = PupilPair::from_observations(obs) else {
+            tracing::debug!(
+                { field::REASON } = "no_pupil_pair",
+                observations = obs.len() as u64,
+                "no pupil pair"
+            );
             return Ok(vec![]);
         };
         let cam = rig
@@ -95,8 +102,18 @@ impl PccrEstimator {
             ];
             let cov =
                 Matrix6::from_diagonal(&Vector6::from_iterator(sigmas.into_iter().map(|s| s * s)));
-            if let Some(ray) = self.ray(side, cam, &z, &cov) {
-                rays.push(ray);
+            match self.ray(side, cam, &z, &cov) {
+                Some(ray) => {
+                    trace_ray(Self::NAME, &ray);
+                    rays.push(ray);
+                }
+                None => {
+                    tracing::debug!(
+                        { field::REASON } = "no_solution",
+                        side = side_str(side),
+                        "pccr ray failed"
+                    );
+                }
             }
         }
         Ok(rays)
@@ -109,11 +126,36 @@ impl PccrEstimator {
         side: Side,
         pupil: &Measured<Point2<f64>>,
     ) -> Option<Measured<Point2<f64>>> {
-        let eye = face.eye(side)?;
-        eye.glints
+        let Some(eye) = face.eye(side) else {
+            tracing::debug!(
+                { field::REASON } = "eye_missing",
+                side = side_str(side),
+                "glint rejected"
+            );
+            return None;
+        };
+        let max = self.options.max_glint_offset_px;
+        let found = eye
+            .glints
             .iter()
-            .find(|g| (*g.value() - pupil.value()).norm() <= self.options.max_glint_offset_px)
-            .copied()
+            .find(|g| (*g.value() - pupil.value()).norm() <= max)
+            .copied();
+        if found.is_none() {
+            let nearest_px = eye
+                .glints
+                .iter()
+                .map(|g| (*g.value() - pupil.value()).norm())
+                .min_by(f64::total_cmp);
+            tracing::debug!(
+                { field::REASON } = "no_glint",
+                side = side_str(side),
+                glints = eye.glints.len() as u64,
+                nearest_px,
+                max_glint_offset_px = max,
+                "glint rejected"
+            );
+        }
+        found
     }
 
     fn solve(
@@ -199,6 +241,8 @@ pub fn pccr_axis(
 mod tests {
     use approx::assert_abs_diff_eq;
     use eye_geometry::synth::SplitMix64;
+    use eye_log::Value;
+    use eye_log::testing::capture_logs;
     use nalgebra::{Matrix2, Vector2};
 
     use super::*;
@@ -591,5 +635,106 @@ mod tests {
 
         let err = PccrEstimator::from_config(&table, &rig).expect_err("unknown option errors");
         assert!(matches!(err, StageError::Config(_)));
+    }
+
+    #[test]
+    fn test_logs_no_pupil_pair_at_debug() {
+        let rig = test_rig();
+        let mut estimator = PccrEstimator::new(PccrOptions::default());
+
+        let (rays, logs) = capture_logs(tracing::Level::DEBUG, || {
+            estimator
+                .estimate_rays(&[], &rig)
+                .expect("estimate succeeds")
+        });
+
+        assert!(rays.is_empty());
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "no pupil pair")
+            .expect("no_pupil_pair logged");
+        assert_eq!(rec.target, "eye_estimate::pccr");
+        assert_eq!(rec.fields["observations"], Value::U64(0));
+        assert_eq!(
+            rec.fields[field::REASON],
+            Value::Str("no_pupil_pair".into())
+        );
+    }
+
+    #[test]
+    fn test_logs_no_glint_at_debug() {
+        let rig = test_rig();
+        let mut estimator = PccrEstimator::new(PccrOptions::default());
+        let mut obs = synthetic_pccr_observation(
+            &rig,
+            Point2::new(155.0, 85.0),
+            Vector3::zeros(),
+            0.0,
+            0.0,
+            1,
+        );
+        for eye in obs.face.as_mut().expect("face present").eyes.iter_mut() {
+            eye.glints.clear();
+        }
+
+        let (rays, logs) = capture_logs(tracing::Level::DEBUG, || {
+            estimator
+                .estimate_rays(&[obs], &rig)
+                .expect("estimate succeeds")
+        });
+
+        assert!(rays.is_empty());
+        let rec = logs
+            .iter()
+            .find(|r| {
+                r.message == "glint rejected"
+                    && r.fields[field::REASON] == Value::Str("no_glint".into())
+            })
+            .expect("no_glint logged");
+        assert_eq!(rec.fields["glints"], Value::U64(0));
+        assert!(!rec.fields.contains_key("nearest_px"));
+        assert_eq!(rec.fields["max_glint_offset_px"], Value::F64(3.0));
+
+        let mut estimator2 = PccrEstimator::new(PccrOptions::default());
+        let base_obs = synthetic_pccr_observation(
+            &rig,
+            Point2::new(155.0, 85.0),
+            Vector3::zeros(),
+            0.0,
+            0.0,
+            1,
+        );
+        let base_face = base_obs.face.as_ref().expect("face present");
+        let right_glint = *base_face
+            .eye(Side::Right)
+            .expect("right eye present")
+            .glints[0]
+            .value();
+        let shifted = right_glint + Vector2::new(3.5, 0.0);
+        let mut obs2 = base_obs;
+        {
+            let face = obs2.face.as_mut().expect("face present");
+            let right = face
+                .eyes
+                .iter_mut()
+                .find(|e| e.side == Side::Right)
+                .expect("right eye present");
+            right.glints = vec![Measured::new(shifted, 0.0).expect("valid sigma")];
+        }
+        let (_, logs2) = capture_logs(tracing::Level::DEBUG, || {
+            estimator2
+                .estimate_rays(&[obs2], &rig)
+                .expect("estimate succeeds")
+        });
+        let rec2 = logs2
+            .iter()
+            .find(|r| {
+                r.message == "glint rejected"
+                    && r.fields[field::REASON] == Value::Str("no_glint".into())
+                    && r.fields.get("side") == Some(&Value::Str("right".into()))
+            })
+            .expect("no_glint logged for right eye");
+        assert!(matches!(rec2.fields["nearest_px"], Value::F64(v) if v > 3.0));
+        assert_eq!(rec2.fields["max_glint_offset_px"], Value::F64(3.0));
     }
 }
