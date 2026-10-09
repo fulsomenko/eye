@@ -97,14 +97,20 @@ impl TractRuntime {
         let (landmarks, li, lout) = load_model(&landmarks_path, LANDMARK_INPUT)?;
         let detector_roles =
             resolve_detector_roles(&di, &dout).map_err(|reason| DetectError::Model {
-                path: detector_path,
+                path: detector_path.clone(),
                 reason,
             })?;
         let landmark_roles =
             resolve_landmark_roles(&li, &lout).map_err(|reason| DetectError::Model {
-                path: landmarks_path,
+                path: landmarks_path.clone(),
                 reason,
             })?;
+        tracing::info!(
+            runtime = "mediapipe-tract",
+            detector = %detector_path.display(),
+            landmarks = %landmarks_path.display(),
+            "mediapipe models loaded"
+        );
         Ok(Self {
             detector,
             landmarks,
@@ -211,6 +217,24 @@ mod tests {
     fn test_model_tract_loads_both_models() {
         let dir = ModelDir::resolve(None).unwrap();
         TractRuntime::load(&dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs EYE_MODEL_DIR"]
+    fn test_logs_models_loaded_at_info() {
+        use eye_log::testing::capture_logs;
+        use eye_log::{Level as LogLevel, Value};
+
+        let dir = ModelDir::resolve(None).unwrap();
+        let (_, logs) = capture_logs(tracing::Level::INFO, || TractRuntime::load(&dir).unwrap());
+
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "mediapipe models loaded")
+            .expect("event emitted");
+        assert_eq!(rec.level, LogLevel::Info);
+        assert_eq!(rec.fields["runtime"], Value::Str("mediapipe-tract".into()));
+        assert!(matches!(rec.fields["detector"], Value::Str(_)));
     }
 
     #[test]

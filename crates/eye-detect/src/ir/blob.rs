@@ -187,12 +187,17 @@ pub(crate) fn candidates(diff: GrayView<'_>, options: &IrClassicOptions) -> Vec<
         })
         .collect();
     components.sort_by_key(|c| std::cmp::Reverse(c.1));
+    let components_total = components.len() as u64;
+    let truncated = components.len() > options.max_candidates;
     components.truncate(options.max_candidates);
 
     let mut out = Vec::new();
+    let (mut rejected_area, mut rejected_aspect, mut rejected_contrast, mut rejected_iris_ratio) =
+        (0u64, 0u64, 0u64, 0u64);
     for (pixels, peak) in components {
         let area = pixels.len() as u32;
         if area < options.pupil_area_px[0] || area > options.pupil_area_px[1] {
+            rejected_area += 1;
             continue;
         }
 
@@ -231,6 +236,7 @@ pub(crate) fn candidates(diff: GrayView<'_>, options: &IrClassicOptions) -> Vec<
         }
         let aspect = covariance_aspect(sxx / n, syy / n, sxy / n);
         if aspect < options.min_aspect {
+            rejected_aspect += 1;
             continue;
         }
 
@@ -245,12 +251,25 @@ pub(crate) fn candidates(diff: GrayView<'_>, options: &IrClassicOptions) -> Vec<
             / n;
         let contrast = blob_mean / iris_mean;
         if contrast < options.min_pupil_contrast {
+            rejected_contrast += 1;
             continue;
         }
         let iris_ratio = iris_mean / outer_mean;
         if iris_ratio > options.max_iris_ratio {
+            rejected_iris_ratio += 1;
             continue;
         }
+
+        tracing::trace!(
+            area = u64::from(area),
+            x = centroid.x,
+            y = centroid.y,
+            peak = u64::from(peak),
+            contrast,
+            aspect,
+            iris_ratio,
+            "candidate"
+        );
 
         out.push(Candidate {
             area,
@@ -263,6 +282,18 @@ pub(crate) fn candidates(diff: GrayView<'_>, options: &IrClassicOptions) -> Vec<
             aspect,
         });
     }
+
+    tracing::debug!(
+        threshold = u64::from(t),
+        components = components_total,
+        truncated,
+        rejected_area,
+        rejected_aspect,
+        rejected_contrast,
+        rejected_iris_ratio,
+        accepted = out.len() as u64,
+        "blob candidates"
+    );
 
     out
 }
@@ -279,5 +310,58 @@ mod tests {
         let diff = crate::image::saturating_diff(lit.view(), dark.view()).unwrap();
         let cands = candidates(diff.view(), &IrClassicOptions::default());
         assert_eq!(cands.len(), 2);
+    }
+
+    #[test]
+    fn test_logs_blob_candidates_at_debug() {
+        use eye_log::testing::capture_logs;
+        use eye_log::{Level as LogLevel, Value};
+
+        let scene = SyntheticIr::default_scene();
+        let (lit, dark) = scene.render();
+        let diff = crate::image::saturating_diff(lit.view(), dark.view()).unwrap();
+        let (cands, logs) = capture_logs(tracing::Level::TRACE, || {
+            candidates(diff.view(), &IrClassicOptions::default())
+        });
+        assert_eq!(cands.len(), 2);
+
+        let summaries: Vec<_> = logs
+            .iter()
+            .filter(|r| r.message == "blob candidates")
+            .collect();
+        assert_eq!(summaries.len(), 1);
+        let rec = summaries[0];
+        assert_eq!(rec.level, LogLevel::Debug);
+        assert_eq!(rec.fields["accepted"], Value::U64(2));
+        assert_eq!(rec.fields["truncated"], Value::Bool(false));
+        match rec.fields["threshold"] {
+            Value::U64(t) => assert!(t >= 30, "threshold {t}"),
+            ref other => panic!("expected U64 threshold, got {other:?}"),
+        }
+        for key in [
+            "rejected_area",
+            "rejected_aspect",
+            "rejected_contrast",
+            "rejected_iris_ratio",
+        ] {
+            assert!(
+                matches!(rec.fields[key], Value::U64(_)),
+                "expected U64 {key}, got {:?}",
+                rec.fields[key]
+            );
+        }
+
+        let candidate_recs: Vec<_> = logs.iter().filter(|r| r.message == "candidate").collect();
+        assert_eq!(candidate_recs.len(), 2);
+        for rec in &candidate_recs {
+            assert_eq!(rec.level, LogLevel::Trace);
+            match (rec.fields["area"].clone(), rec.fields["contrast"].clone()) {
+                (Value::U64(area), Value::F64(contrast)) => {
+                    assert!((7..=120).contains(&area), "area {area} out of range");
+                    assert!(contrast > 1.3, "contrast {contrast} not > 1.3");
+                }
+                other => panic!("unexpected field types: {other:?}"),
+            }
+        }
     }
 }

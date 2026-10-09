@@ -96,17 +96,24 @@ impl OrtRuntime {
         let detector_roles =
             resolve_detector_roles(&io(detector.inputs()), &io(detector.outputs())).map_err(
                 |reason| DetectError::Model {
-                    path: detector_path,
+                    path: detector_path.clone(),
                     reason,
                 },
             )?;
         let landmark_roles =
             resolve_landmark_roles(&io(landmarks.inputs()), &io(landmarks.outputs())).map_err(
                 |reason| DetectError::Model {
-                    path: landmarks_path,
+                    path: landmarks_path.clone(),
                     reason,
                 },
             )?;
+        tracing::info!(
+            runtime = "mediapipe-ort",
+            detector = %detector_path.display(),
+            landmarks = %landmarks_path.display(),
+            threads = threads as u64,
+            "mediapipe models loaded"
+        );
         Ok(Self {
             detector,
             landmarks,
@@ -247,6 +254,24 @@ mod tests {
     fn test_model_load_resolves_roles() {
         let dir = ModelDir::resolve(None).unwrap();
         OrtRuntime::load(&dir, 2).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs EYE_MODEL_DIR"]
+    fn test_logs_models_loaded_at_info() {
+        use eye_log::testing::capture_logs;
+        use eye_log::{Level as LogLevel, Value};
+
+        let dir = ModelDir::resolve(None).unwrap();
+        let (_, logs) = capture_logs(tracing::Level::INFO, || OrtRuntime::load(&dir, 2).unwrap());
+
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "mediapipe models loaded")
+            .expect("event emitted");
+        assert_eq!(rec.level, LogLevel::Info);
+        assert_eq!(rec.fields["runtime"], Value::Str("mediapipe-ort".into()));
+        assert!(matches!(rec.fields["detector"], Value::Str(_)));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use eye_core::image::{GrayImage, GrayView};
+use eye_core::log::field;
 use eye_core::{Ellipse2, Measured};
 use nalgebra::Point2;
 
@@ -25,6 +26,13 @@ pub fn find_glint(search: &GlintSearch<'_>) -> Result<Option<Measured<Point2<f64
     let half = (options.glint_search_radius * r_pupil).ceil() as u32 + 1;
     let roi = Roi::around(&pupil.center(), half, lit.width(), lit.height());
     if roi.width == 0 || roi.height == 0 {
+        tracing::debug!(
+            { field::REASON } = "roi_empty",
+            x = pupil.center().x,
+            y = pupil.center().y,
+            half = u64::from(half),
+            "glint search skipped"
+        );
         return Ok(None);
     }
 
@@ -41,6 +49,13 @@ pub fn find_glint(search: &GlintSearch<'_>) -> Result<Option<Measured<Point2<f64
     }
     let (i, j, peak) = best;
     if f64::from(peak) < f64::from(plateau) + options.glint_min_excess {
+        tracing::debug!(
+            { field::REASON } = "glint_too_dim",
+            peak = u64::from(peak),
+            plateau = u64::from(plateau),
+            min_excess = options.glint_min_excess,
+            "glint rejected"
+        );
         return Ok(None);
     }
 
@@ -49,6 +64,16 @@ pub fn find_glint(search: &GlintSearch<'_>) -> Result<Option<Measured<Point2<f64
     } else {
         subpixel_peak(lit, i, j, plateau)
     };
+
+    tracing::trace!(
+        x = point.x,
+        y = point.y,
+        peak = u64::from(peak),
+        plateau = u64::from(plateau),
+        saturated = peak == 255,
+        sigma = options.glint_sigma_px,
+        "glint"
+    );
 
     Ok(Some(Measured::new(point, options.glint_sigma_px)?))
 }
@@ -298,6 +323,48 @@ mod tests {
         };
         let glint = find_glint(&search).unwrap().expect("glint found");
         assert_eq!(glint.sigma(), 0.7);
+    }
+
+    #[test]
+    fn test_logs_glint_too_dim_at_debug() {
+        use eye_log::testing::capture_logs;
+        use eye_log::{Level as LogLevel, Value};
+
+        let scene = SyntheticIr::default_scene();
+        let centers = [scene.eyes[0].pupil_center, scene.eyes[1].pupil_center];
+        let (lit, _dark) = scene.render();
+
+        let options = IrClassicOptions::default();
+        let (_, logs) = capture_logs(tracing::Level::TRACE, || {
+            for center in centers {
+                let pupil = pupil_ellipse(center, 3.0);
+                let search = GlintSearch {
+                    lit: lit.view(),
+                    pupil: &pupil,
+                    options: &options,
+                };
+                assert_eq!(find_glint(&search).unwrap(), None);
+            }
+        });
+
+        let rejected: Vec<_> = logs
+            .iter()
+            .filter(|r| r.message == "glint rejected")
+            .collect();
+        assert_eq!(rejected.len(), 2);
+        for rec in &rejected {
+            assert_eq!(rec.level, LogLevel::Debug);
+            assert_eq!(
+                rec.fields[field::REASON],
+                Value::Str("glint_too_dim".into())
+            );
+            match (rec.fields["peak"].clone(), rec.fields["plateau"].clone()) {
+                (Value::U64(peak), Value::U64(plateau)) => {
+                    assert!(peak < plateau + 15, "peak {peak} plateau {plateau}");
+                }
+                other => panic!("unexpected field types: {other:?}"),
+            }
+        }
     }
 
     proptest! {

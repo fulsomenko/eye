@@ -619,6 +619,7 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "eye-core",
+ "eye-log",
  "image",
  "nalgebra",
  "ort",

@@ -1,4 +1,5 @@
 use eye_core::image::GrayView;
+use eye_core::log::field;
 use eye_core::{Ellipse2, Measured};
 use nalgebra::Point2;
 
@@ -73,27 +74,50 @@ pub(crate) fn pupil_from_candidate(
         }
     }
 
-    let accepted_fit = (points.len() >= 6)
-        .then(|| fit_ellipse(&points))
-        .flatten()
-        .filter(|fit| {
-            let center_dist = (fit.ellipse.center() - centroid).norm();
-            center_dist <= 1.0
-                && fit.ellipse.semi_major() >= 0.5 * r
-                && fit.ellipse.semi_major() <= 2.0 * r
-                && fit.ellipse.semi_minor() >= 0.5 * r
-                && fit.ellipse.semi_minor() <= 2.0 * r
-        });
+    let fit = if points.len() < 6 {
+        Err("too_few_edges")
+    } else {
+        fit_ellipse(&points).ok_or("fit_failed")
+    };
 
-    let (ellipse, sigma) = match accepted_fit {
-        Some(fit) => {
+    let (ellipse, sigma) = match fit {
+        Ok(fit) if plausible(&fit.ellipse, centroid, r) => {
             let sigma = (fit.rms_residual * (2.0 / points.len() as f64).sqrt()).max(0.05);
             (fit.ellipse, sigma)
         }
-        None => (Ellipse2::circle(centroid, r)?, 0.5),
+        Ok(fit) => {
+            tracing::debug!(
+                { field::REASON } = "fit_implausible",
+                edge_points = points.len() as u64,
+                r,
+                center_dist = (fit.ellipse.center() - centroid).norm(),
+                semi_major = fit.ellipse.semi_major(),
+                semi_minor = fit.ellipse.semi_minor(),
+                "ellipse fit fell back to circle"
+            );
+            (Ellipse2::circle(centroid, r)?, 0.5)
+        }
+        Err(reason) => {
+            tracing::debug!(
+                { field::REASON } = reason,
+                edge_points = points.len() as u64,
+                r,
+                "ellipse fit fell back to circle"
+            );
+            (Ellipse2::circle(centroid, r)?, 0.5)
+        }
     };
 
     Ok(Measured::new(ellipse, sigma)?)
+}
+
+fn plausible(ellipse: &Ellipse2, centroid: Point2<f64>, r: f64) -> bool {
+    let center_dist = (ellipse.center() - centroid).norm();
+    center_dist <= 1.0
+        && ellipse.semi_major() >= 0.5 * r
+        && ellipse.semi_major() <= 2.0 * r
+        && ellipse.semi_minor() >= 0.5 * r
+        && ellipse.semi_minor() <= 2.0 * r
 }
 
 /// Picks the pair of candidates whose separation and tilt are plausible for the two eyes
@@ -102,7 +126,7 @@ pub(crate) fn select_pair(
     candidates: &[Candidate],
     options: &IrClassicOptions,
 ) -> Option<(usize, usize)> {
-    let mut best: Option<(usize, usize, f64)> = None;
+    let mut best: Option<(usize, usize, f64, f64, f64)> = None;
     for i in 0..candidates.len() {
         for j in (i + 1)..candidates.len() {
             let a = &candidates[i];
@@ -110,20 +134,33 @@ pub(crate) fn select_pair(
             let dx = b.centroid.x - a.centroid.x;
             let dy = b.centroid.y - a.centroid.y;
             let dist = (dx * dx + dy * dy).sqrt();
-            if dist < options.pair_separation_px[0] || dist > options.pair_separation_px[1] {
-                continue;
-            }
             let tilt = fold_to_right_angle(dy.atan2(dx).to_degrees());
-            if tilt > options.max_pair_tilt_deg {
+            let reject_reason =
+                if dist < options.pair_separation_px[0] || dist > options.pair_separation_px[1] {
+                    Some("separation")
+                } else if tilt > options.max_pair_tilt_deg {
+                    Some("tilt")
+                } else {
+                    None
+                };
+            if let Some(reason) = reject_reason {
+                tracing::trace!(
+                    { field::REASON } = reason,
+                    dist_px = dist,
+                    tilt_deg = tilt,
+                    "pair rejected"
+                );
                 continue;
             }
             let score = a.contrast + b.contrast;
-            if best.is_none_or(|(_, _, best_score)| score > best_score) {
-                best = Some((i, j, score));
+            if best.is_none_or(|(_, _, best_score, _, _)| score > best_score) {
+                best = Some((i, j, score, dist, tilt));
             }
         }
     }
-    best.map(|(i, j, _)| (i, j))
+    let (i, j, score, dist, tilt) = best?;
+    tracing::debug!(dist_px = dist, tilt_deg = tilt, score, "pair accepted");
+    Some((i, j))
 }
 
 fn fold_to_right_angle(deg: f64) -> f64 {

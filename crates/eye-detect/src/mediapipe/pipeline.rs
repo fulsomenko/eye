@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use eye_core::log::field;
 use eye_core::observation::SCHEME_MEDIAPIPE_478;
 use eye_core::stage::{Detector, StageError};
 use eye_core::{CameraId, FaceObservation, FrameSet, Illumination, Observations, PixelFormat};
@@ -78,7 +79,16 @@ impl<R: MediaPipeRuntime> MediaPipeDetector<R> {
 
         if presence < self.options.min_presence {
             self.tracked.remove(camera);
-            if from_track && allow_retry {
+            let retry = from_track && allow_retry;
+            tracing::debug!(
+                { field::REASON } = "low_presence",
+                presence = f64::from(presence),
+                min_presence = f64::from(self.options.min_presence),
+                from_track,
+                retry,
+                "face rejected"
+            );
+            if retry {
                 return self.detect_image_retrying(camera, image, false);
             }
             return Ok(None);
@@ -86,6 +96,14 @@ impl<R: MediaPipeRuntime> MediaPipeDetector<R> {
 
         let landmarks = unproject_landmarks(&output.landmarks, &roi, LANDMARK_INPUT)?;
         let eyes = eyes_from_landmarks(&landmarks, &roi, &self.options)?;
+
+        tracing::trace!(
+            presence = f64::from(presence),
+            landmarks = landmarks.len() as u64,
+            from_track,
+            roi_size = roi.size,
+            "landmarks"
+        );
 
         if self.options.track {
             self.tracked
@@ -104,11 +122,33 @@ impl<R: MediaPipeRuntime> MediaPipeDetector<R> {
             letterbox_to_tensor(image, DETECTOR_INPUT, (-1.0, 1.0), &mut self.detector_input);
         let raw = self.runtime.run_face_detector(&self.detector_input)?;
         let detections = decode(&raw, &self.anchors, self.options.min_detection_score)?;
+        let n_detections = detections.len() as u64;
         let merged = weighted_nms(detections, self.options.nms_iou);
-        Ok(merged
-            .into_iter()
-            .next()
-            .map(|det| roi_from_detection(&det, &letterbox, DETECTOR_INPUT)))
+        let n_merged = merged.len() as u64;
+        match merged.into_iter().next() {
+            Some(det) => {
+                let roi = roi_from_detection(&det, &letterbox, DETECTOR_INPUT);
+                tracing::trace!(
+                    score = f64::from(det.score),
+                    x = roi.center.x,
+                    y = roi.center.y,
+                    size = roi.size,
+                    rotation_rad = roi.rotation,
+                    merged = n_merged,
+                    "face roi"
+                );
+                Ok(Some(roi))
+            }
+            None => {
+                tracing::debug!(
+                    { field::REASON } = "no_face",
+                    detections = n_detections,
+                    min_detection_score = f64::from(self.options.min_detection_score),
+                    "no face"
+                );
+                Ok(None)
+            }
+        }
     }
 
     pub fn detect_frames(&mut self, frames: &FrameSet) -> Result<Vec<Observations>, DetectError> {
@@ -116,10 +156,22 @@ impl<R: MediaPipeRuntime> MediaPipeDetector<R> {
         for frame in frames.frames() {
             let header = frame.header();
             if !self.accepts(header.format, header.illumination) {
+                tracing::trace!(
+                    { field::REASON } = "not_accepted",
+                    format = ?header.format,
+                    { field::ILLUMINATION } = header.illumination.as_str(),
+                    "frame not accepted"
+                );
                 continue;
             }
             let image = RgbImage::from_frame(frame)?;
+            let start = std::time::Instant::now();
             let face = self.detect_image(&header.camera, &image)?;
+            tracing::trace!(
+                { field::ELAPSED_US } = start.elapsed().as_micros() as u64,
+                face = face.is_some(),
+                "mediapipe frame"
+            );
             out.push(Observations {
                 camera: header.camera.clone(),
                 timestamp: header.timestamp,
@@ -408,6 +460,162 @@ mod tests {
         assert_eq!(obs.len(), 1);
         assert_eq!(obs[0].camera, CameraId::from("rgb"));
         assert!(obs[0].face.is_some());
+    }
+
+    #[test]
+    fn test_logs_no_face_at_debug() {
+        use eye_log::testing::capture_logs;
+        use eye_log::{Level as LogLevel, Value};
+
+        let runtime = FakeRuntime {
+            detector: FaceDetectorOutput {
+                regressors: vec![0.0; NUM_ANCHORS * NUM_COORDS],
+                logits: vec![-10.0; NUM_ANCHORS],
+            },
+            landmarks: VecDeque::new(),
+            detector_calls: 0,
+        };
+        let mut pipeline =
+            MediaPipeDetector::new("mediapipe-fake", runtime, MediaPipeOptions::default());
+        let image = sample_image();
+        let camera = CameraId::from("rgb");
+
+        let (face, logs) = capture_logs(tracing::Level::TRACE, || {
+            pipeline.detect_image(&camera, &image)
+        });
+        assert!(face.unwrap().is_none());
+
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "no face")
+            .expect("event emitted");
+        assert_eq!(rec.level, LogLevel::Debug);
+        assert_eq!(rec.fields[field::REASON], Value::Str("no_face".into()));
+        assert_eq!(rec.fields["detections"], Value::U64(0));
+        assert_eq!(rec.fields["min_detection_score"], Value::F64(0.5));
+    }
+
+    #[test]
+    fn test_logs_low_presence_at_debug() {
+        use eye_log::testing::capture_logs;
+        use eye_log::{Level as LogLevel, Value};
+
+        let anchors = short_range_anchors();
+        let det = sample_detection();
+        let detector_output = encode_detection(&anchors, 400, &det);
+        let raw_landmarks = sample_raw_landmarks();
+        let runtime = FakeRuntime {
+            detector: detector_output,
+            landmarks: VecDeque::from(vec![
+                LandmarkOutput {
+                    landmarks: raw_landmarks.clone(),
+                    presence_logit: 5.0,
+                },
+                LandmarkOutput {
+                    landmarks: raw_landmarks.clone(),
+                    presence_logit: -5.0,
+                },
+                LandmarkOutput {
+                    landmarks: raw_landmarks,
+                    presence_logit: 5.0,
+                },
+            ]),
+            detector_calls: 0,
+        };
+        let mut pipeline =
+            MediaPipeDetector::new("mediapipe-fake", runtime, MediaPipeOptions::default());
+        let image = sample_image();
+        let camera = CameraId::from("rgb");
+
+        pipeline.detect_image(&camera, &image).unwrap();
+        let (second, logs) = capture_logs(tracing::Level::TRACE, || {
+            pipeline.detect_image(&camera, &image)
+        });
+        assert!(second.unwrap().is_some());
+
+        let rejected = logs
+            .iter()
+            .find(|r| r.message == "face rejected")
+            .expect("event emitted");
+        assert_eq!(rejected.level, LogLevel::Debug);
+        assert_eq!(
+            rejected.fields[field::REASON],
+            Value::Str("low_presence".into())
+        );
+        assert_eq!(rejected.fields["from_track"], Value::Bool(true));
+        assert_eq!(rejected.fields["retry"], Value::Bool(true));
+
+        let landmarks = logs
+            .iter()
+            .find(|r| r.message == "landmarks")
+            .expect("event emitted");
+        assert_eq!(landmarks.fields["from_track"], Value::Bool(false));
+    }
+
+    #[test]
+    fn test_logs_landmarks_at_trace() {
+        use eye_core::{Frame, FrameHeader, Timestamp};
+        use eye_log::Value;
+        use eye_log::testing::capture_logs;
+
+        let anchors = short_range_anchors();
+        let det = sample_detection();
+        let detector_output = encode_detection(&anchors, 400, &det);
+        let raw_landmarks = sample_raw_landmarks();
+        let runtime = FakeRuntime {
+            detector: detector_output,
+            landmarks: VecDeque::from(vec![LandmarkOutput {
+                landmarks: raw_landmarks,
+                presence_logit: 5.0,
+            }]),
+            detector_calls: 0,
+        };
+        let mut pipeline =
+            MediaPipeDetector::new("mediapipe-fake", runtime, MediaPipeOptions::default());
+        let image = sample_image();
+
+        let frame = Frame::new(
+            FrameHeader {
+                camera: CameraId::from("rgb"),
+                seq: 0,
+                timestamp: Timestamp::from_nanos(0),
+                width: image.width,
+                height: image.height,
+                format: PixelFormat::Rgb8,
+                illumination: Illumination::Ambient,
+            },
+            image.data.clone().into(),
+        )
+        .unwrap();
+        let frames = FrameSet::single(frame);
+
+        let (out, logs) = capture_logs(tracing::Level::TRACE, || {
+            pipeline.detect_frames(&frames).unwrap()
+        });
+        assert_eq!(out.len(), 1);
+        assert!(out[0].face.is_some());
+
+        let face_roi = logs
+            .iter()
+            .find(|r| r.message == "face roi")
+            .expect("event emitted");
+        assert_eq!(face_roi.fields["merged"], Value::U64(1));
+
+        let landmarks_rec = logs
+            .iter()
+            .find(|r| r.message == "landmarks")
+            .expect("event emitted");
+        assert_eq!(landmarks_rec.fields["landmarks"], Value::U64(478));
+        match landmarks_rec.fields["presence"] {
+            Value::F64(p) => assert!(p > 0.99, "presence {p}"),
+            ref other => panic!("expected F64 presence, got {other:?}"),
+        }
+
+        let frame_rec = logs
+            .iter()
+            .find(|r| r.message == "mediapipe frame")
+            .expect("event emitted");
+        assert_eq!(frame_rec.fields["face"], Value::Bool(true));
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod testutil;
 use std::collections::HashMap;
 
 use eye_core::image::GrayView;
+use eye_core::log::field;
 use eye_core::observation::SCHEME_IR_PUPIL_PAIR;
 use eye_core::stage::{Detector, StageError};
 use eye_core::{
@@ -103,6 +104,16 @@ impl IrClassicDetector {
         let diff = diff.view();
         let cands = blob::candidates(diff, &self.options);
         let Some((i, j)) = pupil::select_pair(&cands, &self.options) else {
+            let reason = match cands.len() {
+                0 => "no_candidates",
+                1 => "single_candidate",
+                _ => "no_pair",
+            };
+            tracing::debug!(
+                { field::REASON } = reason,
+                candidates = cands.len() as u64,
+                "pair rejected"
+            );
             return Ok(None);
         };
         let (pupil_i, glint_i) = self.pupil_and_glint(lit, diff, &cands[i])?;
@@ -120,6 +131,23 @@ impl IrClassicDetector {
         let mut left_eye = EyeObservation::new(Side::Left);
         left_eye.pupil = Some(left.0);
         left_eye.glints = left.1.into_iter().collect();
+
+        for eye in [&right_eye, &left_eye] {
+            let pupil = eye.pupil.expect("pupil set above");
+            let ellipse = pupil.value();
+            tracing::trace!(
+                side = side_str(eye.side),
+                x = ellipse.center().x,
+                y = ellipse.center().y,
+                semi_major = ellipse.semi_major(),
+                semi_minor = ellipse.semi_minor(),
+                angle_rad = ellipse.angle(),
+                sigma = pupil.sigma(),
+                glint = !eye.glints.is_empty(),
+                "pupil"
+            );
+        }
+
         Ok(Some([right_eye, left_eye]))
     }
 
@@ -151,9 +179,22 @@ impl IrClassicDetector {
 
     fn paired_dark(&self, lit: &Frame) -> Option<&Frame> {
         let h = lit.header();
-        let dark = self.last_dark.get(&h.camera)?;
+        let Some(dark) = self.last_dark.get(&h.camera) else {
+            tracing::debug!({ field::REASON } = "no_dark", "lit frame unpaired");
+            return None;
+        };
         let gap = h.timestamp.nanos_since(dark.header().timestamp);
-        (gap > 0 && gap as f64 <= self.options.max_pair_gap_ms * 1e6).then_some(dark)
+        if gap > 0 && gap as f64 <= self.options.max_pair_gap_ms * 1e6 {
+            Some(dark)
+        } else {
+            tracing::debug!(
+                { field::REASON } = "dark_gap",
+                gap_ns = gap,
+                max_pair_gap_ms = self.options.max_pair_gap_ms,
+                "lit frame unpaired"
+            );
+            None
+        }
     }
 
     fn detect_frames(&mut self, frames: &FrameSet) -> Result<Vec<Observations>, DetectError> {
@@ -161,16 +202,31 @@ impl IrClassicDetector {
         for frame in frames.frames() {
             let h = frame.header();
             if !Self::accepts_frame(h.format, h.illumination) {
+                tracing::trace!(
+                    { field::REASON } = "not_accepted",
+                    format = ?h.format,
+                    { field::ILLUMINATION } = h.illumination.as_str(),
+                    "frame not accepted"
+                );
                 continue;
             }
             if h.illumination == Illumination::IrDark {
                 self.last_dark.insert(h.camera.clone(), frame.clone());
+                tracing::debug!("dark frame stored");
                 continue;
             }
             let face = match self.paired_dark(frame) {
-                Some(dark) => self
-                    .detect_pair(GrayView::from_frame(frame)?, GrayView::from_frame(dark)?)?
-                    .map(face_from_pupils),
+                Some(dark) => {
+                    let start = std::time::Instant::now();
+                    let result = self
+                        .detect_pair(GrayView::from_frame(frame)?, GrayView::from_frame(dark)?)?;
+                    tracing::trace!(
+                        { field::ELAPSED_US } = start.elapsed().as_micros() as u64,
+                        face = result.is_some(),
+                        "ir-classic frame"
+                    );
+                    result.map(face_from_pupils)
+                }
                 None => None,
             };
             out.push(Observations {
@@ -180,6 +236,13 @@ impl IrClassicDetector {
             });
         }
         Ok(out)
+    }
+}
+
+fn side_str(side: Side) -> &'static str {
+    match side {
+        Side::Right => "right",
+        Side::Left => "left",
     }
 }
 
@@ -978,5 +1041,302 @@ mod tests {
         let height: u32 = fields[2].parse().unwrap();
         let data = bytes[pos..pos + (width * height) as usize].to_vec();
         eye_core::image::GrayImage::new(width, height, data).unwrap()
+    }
+
+    #[test]
+    fn test_logs_pair_rejected_at_debug() {
+        use eye_log::testing::capture_logs;
+        use eye_log::{Level as LogLevel, Value};
+
+        let detector = IrClassicDetector::new(IrClassicOptions::default());
+        let mut scene = SyntheticIr::default_scene();
+        scene.eyes.truncate(1);
+        let (lit, dark) = scene.render();
+        let (_, logs) = capture_logs(tracing::Level::TRACE, || {
+            detector.detect_pair(lit.view(), dark.view())
+        });
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "pair rejected" && r.target == "eye_detect::ir")
+            .expect("event emitted");
+        assert_eq!(rec.level, LogLevel::Debug);
+        assert_eq!(
+            rec.fields[field::REASON],
+            Value::Str("single_candidate".into())
+        );
+        assert_eq!(rec.fields["candidates"], Value::U64(1));
+        let mut keys: Vec<&str> = rec.fields.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut expected = vec![field::REASON, "candidates"];
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
+
+        let detector = IrClassicDetector::new(IrClassicOptions::default());
+        let mut scene = SyntheticIr::default_scene();
+        for eye in &mut scene.eyes {
+            eye.pupil_level = 55;
+        }
+        let (lit, dark) = scene.render();
+        let (_, logs) = capture_logs(tracing::Level::TRACE, || {
+            detector.detect_pair(lit.view(), dark.view())
+        });
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "pair rejected" && r.target == "eye_detect::ir")
+            .expect("event emitted");
+        assert_eq!(
+            rec.fields[field::REASON],
+            Value::Str("no_candidates".into())
+        );
+        assert_eq!(rec.fields["candidates"], Value::U64(0));
+
+        let detector = IrClassicDetector::new(IrClassicOptions::default());
+        let mut scene = SyntheticIr::default_scene();
+        scene.eyes = vec![
+            SyntheticEye::at(Point2::new(260.3, 180.7)),
+            SyntheticEye::at(Point2::new(380.3, 181.2)),
+        ];
+        let (lit, dark) = scene.render();
+        let (_, logs) = capture_logs(tracing::Level::TRACE, || {
+            detector.detect_pair(lit.view(), dark.view())
+        });
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "pair rejected" && r.target == "eye_detect::ir")
+            .expect("event emitted");
+        assert_eq!(rec.fields[field::REASON], Value::Str("no_pair".into()));
+        assert_eq!(rec.fields["candidates"], Value::U64(2));
+
+        let pupil_rec = logs
+            .iter()
+            .find(|r| r.message == "pair rejected" && r.target == "eye_detect::ir::pupil")
+            .expect("pupil event emitted");
+        assert_eq!(pupil_rec.level, LogLevel::Trace);
+        assert_eq!(
+            pupil_rec.fields[field::REASON],
+            Value::Str("separation".into())
+        );
+        match pupil_rec.fields["dist_px"] {
+            Value::F64(d) => assert!((119.0..121.0).contains(&d), "dist_px {d} out of range"),
+            ref other => panic!("expected F64 dist_px, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_logs_pupil_at_trace() {
+        use eye_log::testing::capture_logs;
+        use eye_log::{Level as LogLevel, Value};
+
+        let detector = IrClassicDetector::new(IrClassicOptions::default());
+        let scene = SyntheticIr::default_scene();
+        let (lit, dark) = scene.render();
+        let (_, logs) = capture_logs(tracing::Level::TRACE, || {
+            detector.detect_pair(lit.view(), dark.view())
+        });
+
+        let pupils: Vec<_> = logs.iter().filter(|r| r.message == "pupil").collect();
+        assert_eq!(pupils.len(), 2);
+        assert_eq!(pupils[0].level, LogLevel::Trace);
+        assert_eq!(pupils[0].fields["side"], Value::Str("right".into()));
+        assert_eq!(pupils[1].fields["side"], Value::Str("left".into()));
+
+        for (rec, want_x) in pupils.iter().zip([290.3, 350.6]) {
+            match (&rec.fields["x"], &rec.fields["sigma"], &rec.fields["glint"]) {
+                (Value::F64(x), Value::F64(sigma), Value::Bool(glint)) => {
+                    assert!(
+                        (x - want_x).abs() <= 0.05,
+                        "x {x} not within 0.05 of {want_x}"
+                    );
+                    assert!(*sigma > 0.0 && *sigma <= 0.3, "sigma {sigma} out of range");
+                    assert!(!glint);
+                }
+                other => panic!("unexpected field types: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_logs_glint_at_trace() {
+        use eye_log::testing::capture_logs;
+        use eye_log::{Level as LogLevel, Value};
+
+        let mut det: Box<dyn Detector> =
+            Box::new(IrClassicDetector::from_config(&toml::Table::new(), &nominal_rig()).unwrap());
+        let mut scene = SyntheticIr::default_scene();
+        let offset = nalgebra::Vector2::new(0.7, -0.4);
+        let right_truth = scene.eyes[0].pupil_center;
+        let left_truth = scene.eyes[1].pupil_center;
+        scene.eyes[0].glint = Some((right_truth + offset, 0.6, 255.0));
+        scene.eyes[1].glint = Some((left_truth + offset, 0.6, 255.0));
+        let (lit, dark) = scene.render();
+
+        let dark_frames = FrameSet::single(ir_frame(Illumination::IrDark, 0, 0, &dark));
+        det.detect(&dark_frames).unwrap();
+        let lit_frames = FrameSet::single(ir_frame(Illumination::IrLit, 68_000_000, 1, &lit));
+        let (_, logs) = capture_logs(tracing::Level::TRACE, || det.detect(&lit_frames).unwrap());
+
+        let glints: Vec<_> = logs.iter().filter(|r| r.message == "glint").collect();
+        assert_eq!(glints.len(), 2);
+        for rec in &glints {
+            assert_eq!(rec.level, LogLevel::Trace);
+            assert_eq!(rec.fields["saturated"], Value::Bool(false));
+            assert_eq!(rec.fields["sigma"], Value::F64(0.5));
+        }
+
+        let pupils: Vec<_> = logs.iter().filter(|r| r.message == "pupil").collect();
+        assert_eq!(pupils.len(), 2);
+        for rec in &pupils {
+            assert_eq!(rec.fields["glint"], Value::Bool(true));
+        }
+    }
+
+    #[test]
+    fn test_logs_fit_fallback_at_debug() {
+        use eye_log::testing::capture_logs;
+        use eye_log::{Level as LogLevel, Value};
+
+        let options = IrClassicOptions {
+            edge_rays: 4,
+            glints: false,
+            ..IrClassicOptions::default()
+        };
+        let detector = IrClassicDetector::new(options);
+        let scene = SyntheticIr::default_scene();
+        let (lit, dark) = scene.render();
+        let (eyes, logs) = capture_logs(tracing::Level::TRACE, || {
+            detector.detect_pair(lit.view(), dark.view())
+        });
+        let eyes = eyes.unwrap().expect("face detected");
+
+        let fallbacks: Vec<_> = logs
+            .iter()
+            .filter(|r| r.message == "ellipse fit fell back to circle")
+            .collect();
+        assert_eq!(fallbacks.len(), 2);
+        for rec in &fallbacks {
+            assert_eq!(rec.level, LogLevel::Debug);
+            assert_eq!(
+                rec.fields[field::REASON],
+                Value::Str("too_few_edges".into())
+            );
+            match rec.fields["edge_points"] {
+                Value::U64(n) => assert!(n <= 4, "edge_points {n}"),
+                ref other => panic!("expected U64 edge_points, got {other:?}"),
+            }
+        }
+        for eye in &eyes {
+            assert_eq!(eye.pupil.unwrap().sigma(), 0.5);
+        }
+    }
+
+    #[test]
+    fn test_logs_lit_frame_unpaired_at_debug() {
+        use eye_log::testing::capture_logs;
+        use eye_log::{Level as LogLevel, Value};
+
+        let mut detector = IrClassicDetector::new(IrClassicOptions::default());
+        let scene = SyntheticIr::default_scene();
+        let (lit, _dark) = scene.render();
+        let frames = FrameSet::single(ir_frame(Illumination::IrLit, 0, 0, &lit));
+        let (_, logs) = capture_logs(tracing::Level::TRACE, || {
+            detector.detect_frames(&frames).unwrap()
+        });
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "lit frame unpaired")
+            .expect("event emitted");
+        assert_eq!(rec.level, LogLevel::Debug);
+        assert_eq!(rec.fields[field::REASON], Value::Str("no_dark".into()));
+
+        let mut detector = IrClassicDetector::new(IrClassicOptions::default());
+        let scene = SyntheticIr::default_scene();
+        let (lit, dark) = scene.render();
+        let dark_frames = FrameSet::single(ir_frame(Illumination::IrDark, 900_000_000, 0, &dark));
+        detector.detect_frames(&dark_frames).unwrap();
+        let lit_frames = FrameSet::single(ir_frame(Illumination::IrLit, 1_068_000_000, 1, &lit));
+        let (_, logs) = capture_logs(tracing::Level::TRACE, || {
+            detector.detect_frames(&lit_frames).unwrap()
+        });
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "lit frame unpaired")
+            .expect("event emitted");
+        assert_eq!(rec.fields[field::REASON], Value::Str("dark_gap".into()));
+        assert_eq!(rec.fields["gap_ns"], Value::I64(168_000_000));
+        assert_eq!(rec.fields["max_pair_gap_ms"], Value::F64(100.0));
+    }
+
+    #[test]
+    fn test_logs_dark_frame_stored_at_debug() {
+        use eye_log::Level as LogLevel;
+        use eye_log::testing::capture_logs;
+
+        let mut detector = IrClassicDetector::new(IrClassicOptions::default());
+        let scene = SyntheticIr::default_scene();
+        let (_, dark) = scene.render();
+        let frames = FrameSet::single(ir_frame(Illumination::IrDark, 0, 0, &dark));
+        let (_, logs) = capture_logs(tracing::Level::TRACE, || {
+            detector.detect_frames(&frames).unwrap()
+        });
+
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "dark frame stored")
+            .expect("event emitted");
+        assert_eq!(rec.level, LogLevel::Debug);
+        assert!(!logs.iter().any(|r| r.message == "pair rejected"));
+    }
+
+    #[test]
+    fn test_logs_frame_elapsed_at_trace() {
+        use eye_log::testing::capture_logs;
+        use eye_log::{Level as LogLevel, Value};
+
+        let mut detector = IrClassicDetector::new(IrClassicOptions::default());
+        let scene = SyntheticIr::default_scene();
+        let (lit, dark) = scene.render();
+        let dark_frames = FrameSet::single(ir_frame(Illumination::IrDark, 0, 0, &dark));
+        detector.detect_frames(&dark_frames).unwrap();
+        let lit_frames = FrameSet::single(ir_frame(Illumination::IrLit, 68_000_000, 1, &lit));
+        let (_, logs) = capture_logs(tracing::Level::TRACE, || {
+            detector.detect_frames(&lit_frames).unwrap()
+        });
+
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "ir-classic frame")
+            .expect("event emitted");
+        assert_eq!(rec.level, LogLevel::Trace);
+        assert!(matches!(rec.fields[field::ELAPSED_US], Value::U64(_)));
+        assert_eq!(rec.fields["face"], Value::Bool(true));
+    }
+
+    #[test]
+    fn test_logs_frame_not_accepted_at_trace() {
+        use eye_log::testing::capture_logs;
+        use eye_log::{Level as LogLevel, Value};
+
+        let mut detector = IrClassicDetector::new(IrClassicOptions::default());
+        let scene = SyntheticIr::default_scene();
+        let (_lit, dark) = scene.render();
+        let dual = FrameSet::new(vec![
+            ir_frame(Illumination::IrDark, 0, 0, &dark),
+            rgb_frame(0),
+        ])
+        .unwrap();
+        let (_, logs) = capture_logs(tracing::Level::TRACE, || {
+            detector.detect_frames(&dual).unwrap()
+        });
+
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "frame not accepted")
+            .expect("event emitted");
+        assert_eq!(rec.level, LogLevel::Trace);
+        assert_eq!(rec.fields["format"], Value::Str("Rgb8".into()));
+        match rec.fields[field::ILLUMINATION] {
+            Value::Str(ref s) => assert!(!s.is_empty()),
+            ref other => panic!("expected Str illumination, got {other:?}"),
+        }
     }
 }
