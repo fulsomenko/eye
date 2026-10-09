@@ -17,6 +17,8 @@ pub enum LogFormat {
     Json,
 }
 
+pub const DEFAULT_SINK_FILTER: &str = "trace,ort=info,tract=info";
+
 #[derive(clap::Args, Debug, Clone)]
 pub struct LogArgs {
     /// Terminal filter (EnvFilter syntax). Falls back to EYE_LOG, then RUST_LOG, then `info`.
@@ -29,7 +31,7 @@ pub struct LogArgs {
         long,
         global = true,
         env = "EYE_LOG_FILE_LEVEL",
-        default_value = "trace",
+        default_value = DEFAULT_SINK_FILTER,
         value_name = "FILTER"
     )]
     pub log_file_level: String,
@@ -95,11 +97,19 @@ pub fn auto_path(run_id: &str) -> Result<PathBuf, LogError> {
     Ok(state_dir.join("eye/logs").join(format!("{run_id}.jsonl")))
 }
 
+fn default_terminal_filter() -> String {
+    let runtime_pins = DEFAULT_SINK_FILTER
+        .split_once(',')
+        .map(|(_, rest)| rest)
+        .unwrap_or("");
+    format!("info,{runtime_pins}")
+}
+
 fn resolve_level(flag: Option<&str>, env_rust_log: Option<String>) -> String {
     flag.map(str::to_string)
         .filter(|s| !s.trim().is_empty())
         .or_else(|| env_rust_log.filter(|s| !s.trim().is_empty()))
-        .unwrap_or_else(|| "info".to_string())
+        .unwrap_or_else(default_terminal_filter)
 }
 
 fn terminal_filter(spec: &str) -> Result<EnvFilter, LogError> {
@@ -251,8 +261,8 @@ mod tests {
             "warn"
         );
         assert_eq!(resolve_level(None, Some("debug".to_string())), "debug");
-        assert_eq!(resolve_level(None, None), "info");
-        assert_eq!(resolve_level(Some(""), None), "info");
+        assert_eq!(resolve_level(None, None), "info,ort=info,tract=info");
+        assert_eq!(resolve_level(Some(""), None), "info,ort=info,tract=info");
     }
 
     #[test]
@@ -288,5 +298,64 @@ mod tests {
             .unwrap_or(false);
         assert!(re_ok, "run id {id:?} does not match <stamp>-<pid>");
         assert!(id.contains('T') && id.contains('Z'));
+    }
+
+    fn capture_with_sink_filter(spec: &str, f: impl FnOnce()) -> Vec<crate::Record> {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = crate::testing::VecSink(std::sync::Arc::clone(&buf));
+        let (layer, handle) = SinkLayer::spawn(Box::new(sink), 1024);
+        let filter = file_filter(spec).expect("valid filter spec");
+        let subscriber = registry().with(layer.with_filter(filter));
+        tracing::subscriber::with_default(subscriber, f);
+        handle.shutdown();
+        buf.lock().expect("VecSink mutex poisoned").clone()
+    }
+
+    #[test]
+    fn test_default_file_filter_excludes_runtime_trace() {
+        let records = capture_with_sink_filter(DEFAULT_SINK_FILTER, || {
+            tracing::event!(target: "ort::lifetime", tracing::Level::TRACE, "ort trace");
+            tracing::event!(
+                target: "eye_detect::mediapipe::pipeline",
+                tracing::Level::TRACE,
+                "eye trace"
+            );
+        });
+
+        assert_eq!(
+            records.len(),
+            1,
+            "expected only the eye_detect record, got {records:?}"
+        );
+        assert_eq!(records[0].target, "eye_detect::mediapipe::pipeline");
+        assert_eq!(records[0].level, crate::Level::Trace);
+    }
+
+    #[test]
+    fn test_file_level_override_restores_runtime_trace() {
+        let records = capture_with_sink_filter("trace", || {
+            tracing::event!(target: "ort::lifetime", tracing::Level::TRACE, "ort trace");
+        });
+
+        assert_eq!(records.len(), 1, "expected the ort record, got {records:?}");
+        assert_eq!(records[0].target, "ort::lifetime");
+        assert_eq!(records[0].level, crate::Level::Trace);
+    }
+
+    #[test]
+    fn test_log_args_help_names_default_filter() {
+        use clap::CommandFactory;
+
+        let cmd = TestCli::command();
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "log_file_level")
+            .expect("log_file_level arg exists");
+        let defaults: Vec<String> = arg
+            .get_default_values()
+            .iter()
+            .map(|v| v.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(defaults, vec![DEFAULT_SINK_FILTER.to_string()]);
     }
 }
