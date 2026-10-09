@@ -16,9 +16,16 @@ use crate::options::parse_options;
 #[serde(deny_unknown_fields, default)]
 pub struct IrPupilOptions {
     pub ipd_mm: f64,
+    /// Sigma of the anchor placement given a correct re-anchor; the ray's origin covariance also
+    /// carries `origin_ambiguity_mm` squared per axis, the displacement the estimator cannot
+    /// detect (see FINDINGS 3).
     pub anchor_sigma_mm: f64,
     pub reanchor_distance_mm: f64,
     pub reanchor_margin: f64,
+    /// Undetectable displacement of the declared anchor, added in quadrature to the origin
+    /// covariance per axis; defaults to the re-anchor distance, the displacement below which no
+    /// re-anchor fires.
+    pub origin_ambiguity_mm: f64,
     pub apply_kappa: bool,
 }
 
@@ -29,6 +36,7 @@ impl Default for IrPupilOptions {
             anchor_sigma_mm: 0.5,
             reanchor_distance_mm: 5.0,
             reanchor_margin: 0.2,
+            origin_ambiguity_mm: 5.0,
             apply_kappa: true,
         }
     }
@@ -43,6 +51,10 @@ pub(crate) enum Trigger {
 
 /// IR-only baseline. Assumes a still, frontal head between re-anchors: head translation and eye
 /// rotation are indistinguishable without corners, head pose or glints.
+///
+/// Its rays are `Relative` for fusion (`FusedSource::reference_kind`): when the batch carries
+/// an RGB reference they are selected only after passing the gate against it; in an IR-only
+/// batch they are selected unchecked.
 #[derive(Debug)]
 pub struct IrPupilEstimator {
     options: IrPupilOptions,
@@ -200,7 +212,12 @@ impl IrPupilEstimator {
             }
         };
         let a = self.options.anchor_sigma_mm;
-        let cov = Matrix3::from_diagonal(&Vector3::new(a * a, a * a, 9.0 * a * a));
+        let d = self.options.origin_ambiguity_mm;
+        let cov = Matrix3::from_diagonal(&Vector3::new(
+            a * a + d * d,
+            a * a + d * d,
+            9.0 * a * a + d * d,
+        ));
         let ray_for = |side: Side, position: Point3<f64>, px: &Measured<Point2<f64>>| {
             gaze_ray(
                 side,
@@ -422,6 +439,7 @@ mod tests {
         let cam = rig.camera("ir").expect("rig has an ir camera");
         let estimator = IrPupilEstimator::new(IrPupilOptions {
             anchor_sigma_mm: 0.5,
+            origin_ambiguity_mm: 0.0,
             apply_kappa: false,
             ..Default::default()
         });
@@ -449,6 +467,11 @@ mod tests {
             left: Measured::new(left_px, sigma_px).expect("valid sigma"),
         };
 
+        let a = estimator.options.anchor_sigma_mm;
+        let origin_ambiguity = estimator.options.origin_ambiguity_mm;
+        let sigma_xy = (a * a + origin_ambiguity * origin_ambiguity).sqrt();
+        let sigma_z = (9.0 * a * a + origin_ambiguity * origin_ambiguity).sqrt();
+
         let n = 2000;
         let mut rng = SplitMix64::new(11);
         let mut samples = Vec::with_capacity(n);
@@ -470,15 +493,15 @@ mod tests {
             let noisy_anchor = [
                 EYE_CENTRES[0]
                     + Vector3::new(
-                        0.5 * rng.gaussian(),
-                        0.5 * rng.gaussian(),
-                        1.5 * rng.gaussian(),
+                        sigma_xy * rng.gaussian(),
+                        sigma_xy * rng.gaussian(),
+                        sigma_z * rng.gaussian(),
                     ),
                 EYE_CENTRES[1]
                     + Vector3::new(
-                        0.5 * rng.gaussian(),
-                        0.5 * rng.gaussian(),
-                        1.5 * rng.gaussian(),
+                        sigma_xy * rng.gaussian(),
+                        sigma_xy * rng.gaussian(),
+                        sigma_z * rng.gaussian(),
                     ),
             ];
             let rays = estimator.rays(&noisy_pair, cam, &noisy_anchor);
@@ -522,7 +545,42 @@ mod tests {
     }
 
     #[test]
-    fn test_origin_cov_is_anchor_cov() {
+    fn test_origin_cov_reanchor_term_propagates_through_jacobian() {
+        let rig = test_rig();
+        let cam = rig.camera("ir").expect("rig has an ir camera");
+        let obs = synthetic_ir_observation_at(&rig, EYE_CENTRES, Point2::new(100.0, 50.0), 0.0, 1);
+        let pair = PupilPair::from_observations(&[obs]).expect("a pair is present");
+
+        let angular_cov_at = |anchor_sigma_mm: f64, origin_ambiguity_mm: f64, sigma_px: f64| {
+            let estimator = IrPupilEstimator::new(IrPupilOptions {
+                anchor_sigma_mm,
+                origin_ambiguity_mm,
+                apply_kappa: false,
+                ..Default::default()
+            });
+            let pair_with_sigma = PupilPair {
+                camera: pair.camera.clone(),
+                timestamp: pair.timestamp,
+                right: Measured::new(*pair.right.value(), sigma_px).expect("valid sigma"),
+                left: Measured::new(*pair.left.value(), sigma_px).expect("valid sigma"),
+            };
+            estimator.rays(&pair_with_sigma, cam, &EYE_CENTRES)[0]
+                .clone()
+                .expect("right ray computed")
+                .angular_cov
+        };
+
+        let angular_cov_0 = angular_cov_at(0.5, 0.0, 0.2);
+        let angular_cov_5 = angular_cov_at(0.5, 5.0, 0.2);
+        let angular_cov_unit = angular_cov_at(0.0, 1.0, 0.0);
+
+        let lhs = angular_cov_5 - angular_cov_0;
+        let rhs = angular_cov_unit * 25.0;
+        assert_abs_diff_eq!(lhs, rhs, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_origin_cov_includes_reanchor_ambiguity() {
         let rig = test_rig();
         let cam = rig.camera("ir").expect("rig has an ir camera");
         let estimator = IrPupilEstimator::new(IrPupilOptions {
@@ -534,7 +592,7 @@ mod tests {
         let pair = PupilPair::from_observations(&[obs]).expect("a pair is present");
 
         let rays = estimator.rays(&pair, cam, &EYE_CENTRES);
-        let expected = Matrix3::from_diagonal(&Vector3::new(0.25, 0.25, 2.25));
+        let expected = Matrix3::from_diagonal(&Vector3::new(25.25, 25.25, 27.25));
         for ray in rays.map(|r| r.expect("ray computed")) {
             assert_abs_diff_eq!(ray.origin_cov, expected, epsilon = 1e-12);
         }
