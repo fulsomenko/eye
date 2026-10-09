@@ -54,6 +54,8 @@ pub struct AngularCorrection {
     pub quad_cross_cov: [[f64; 6]; 6],
     pub model: CorrectionModel,
     pub targets_used: u32,
+    /// RMS of the post-fit residual over the fitted targets, radians. Added as an isotropic
+    /// floor to every corrected ray's `angular_cov`.
     pub rms_after_rad: f64,
 }
 
@@ -179,6 +181,8 @@ impl GazeCorrection for UserProfile {
                 (head_frame_correct(&rot, &a, &th), propagate(&j, &cov8))
             }
         };
+        let residual = Matrix2::identity() * (c.rms_after_rad * c.rms_after_rad);
+        let angular_cov = angular_cov + residual;
         tracing::trace!(
             eye = eye_label(eye),
             model = ?c.model,
@@ -439,6 +443,38 @@ mod tests {
         let b = design(&a);
         let cov_theta = SMatrix::<f64, 6, 6>::from_fn(|r, k| cov[r][k]);
         let expected = ray.angular_cov + propagate(&b, &cov_theta);
+        assert_abs_diff_eq!(corrected.angular_cov, expected, epsilon = 1e-15);
+    }
+
+    #[test]
+    fn test_corrected_cov_includes_fit_residual_floor() {
+        let mut eyes = BTreeMap::new();
+        eyes.insert(
+            EyeKey::Right,
+            AngularCorrection {
+                theta: [0.0; 6],
+                cov: [[0.0; 6]; 6],
+                quad: [0.0; 6],
+                quad_cov: [[0.0; 6]; 6],
+                quad_cross_cov: [[0.0; 6]; 6],
+                model: CorrectionModel::Affine,
+                targets_used: 9,
+                rms_after_rad: 0.05,
+            },
+        );
+        let profile = UserProfile {
+            version: 1,
+            name: "max".into(),
+            created_unix_s: 0,
+            rig_fingerprint: String::new(),
+            estimator: "ir-pupil".into(),
+            eyes,
+        };
+        let mut ray = straight_ray(Some(eye_core::Side::Right));
+        ray.angular_cov = Matrix2::identity() * 1e-4;
+        let corrected = profile.correct(&ray);
+
+        let expected = Matrix2::identity() * 1e-4 + Matrix2::identity() * 0.0025;
         assert_abs_diff_eq!(corrected.angular_cov, expected, epsilon = 1e-15);
     }
 
