@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use eye_core::{CameraId, CameraInfo, Illumination, PixelFormat, Timestamp};
 
-pub use eye_core::session::{TargetClock, TargetRecord};
+pub use eye_core::session::{ProtocolConfig, TargetClock, TargetRecord};
 pub use id::SessionId;
 pub use reader::Recording;
 pub use replay::{Pacing, PacingOption, ReplayOptions, ReplaySource};
@@ -156,6 +156,9 @@ pub struct SessionMeta {
     pub rig: Option<toml::Table>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<toml::Table>,
+    /// The dot protocol the targets were shown with; `None` for free recordings and for files written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<ProtocolConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -218,6 +221,7 @@ mod tests {
                 );
                 table
             }),
+            protocol: None,
         }
     }
 
@@ -236,6 +240,33 @@ mod tests {
         let text = format!("bogus = 1\n{}", toml::to_string(&meta()).unwrap());
         let parsed: Result<SessionMeta, _> = toml::from_str(&text);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_session_meta_round_trips_protocol() {
+        let with_protocol = SessionMeta {
+            protocol: Some(ProtocolConfig {
+                grid: [4, 4],
+                lead_in_ms: 1000,
+                dwell_ms: 2500,
+                settle_ms: 1000,
+                window_ms: 1200,
+            }),
+            ..meta()
+        };
+        let text = toml::to_string(&with_protocol).unwrap();
+        assert!(text.contains("[protocol]"));
+        assert!(text.contains("grid = [4, 4]"));
+        let parsed: SessionMeta = toml::from_str(&text).unwrap();
+        assert_eq!(parsed, with_protocol);
+    }
+
+    #[test]
+    fn test_session_meta_without_protocol_parses_as_none() {
+        let text = toml::to_string(&meta()).unwrap();
+        assert!(!text.contains("[protocol]"));
+        let parsed: SessionMeta = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.protocol, None);
     }
 
     #[test]

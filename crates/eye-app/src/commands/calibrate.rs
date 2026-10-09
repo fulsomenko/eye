@@ -495,7 +495,7 @@ pub fn fit_recording(
 ) -> anyhow::Result<FitResult> {
     let mut replayed = replay_session(dir, config, registry, protocol)?;
     let run = &replayed.run;
-    let base_len = protocol.grid[0] * protocol.grid[1];
+    let base_len = run.protocol.grid[0] * run.protocol.grid[1];
     let samples = fit_samples(
         &run.windows,
         run.steps.iter().filter_map(|s| s.batch.as_ref()),

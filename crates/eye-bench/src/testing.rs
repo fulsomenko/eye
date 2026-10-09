@@ -9,6 +9,7 @@ use std::time::Duration;
 use eye::config::Config;
 use eye::error::ConfigError;
 use eye::registry::Registry;
+use eye_calibration::protocol::ProtocolConfig;
 use eye_calibration::store::rig_to_table;
 use eye_capture::session::{FORMAT_VERSION, RecordedCamera, SessionMeta, SessionWriter};
 use eye_core::session::{TargetClock, TargetRecord};
@@ -56,6 +57,7 @@ pub struct SyntheticSession {
     /// Camera ids, each recorded with identical Gray8 frames.
     pub cameras: Vec<&'static str>,
     pub with_rig: bool,
+    pub protocol: Option<ProtocolConfig>,
 }
 
 impl Default for SyntheticSession {
@@ -66,6 +68,7 @@ impl Default for SyntheticSession {
             code_frames: false,
             cameras: vec!["ir"],
             with_rig: true,
+            protocol: None,
         }
     }
 }
@@ -143,6 +146,7 @@ pub fn write_synthetic_session(
         cameras,
         rig: spec.with_rig.then(|| rig_to_table(&synthetic_rig())),
         probe: None,
+        protocol: spec.protocol,
     };
 
     let mut writer = SessionWriter::create(root, &meta).map_err(capture)?;

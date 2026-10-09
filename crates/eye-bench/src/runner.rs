@@ -34,6 +34,8 @@ pub struct SessionRun {
     /// `meta.session_id`.
     pub session: String,
     pub rig: Rig,
+    /// The protocol the windows were built from (the recording's, else the fallback).
+    pub protocol: ProtocolConfig,
     pub windows: Vec<FixationWindow>,
     pub steps: Vec<Step>,
 }
@@ -130,12 +132,14 @@ fn step(pipeline: &mut Pipeline, set: &FrameSet) -> Result<Step, BenchError> {
 }
 
 /// Replays one recording through a fresh pipeline without correction.
+///
+/// `fallback` is used only when the recording carries no protocol.
 #[allow(clippy::result_large_err)]
 pub fn replay_session(
     dir: &Path,
     config: &Config,
     registry: &Registry,
-    protocol: &ProtocolConfig,
+    fallback: &ProtocolConfig,
 ) -> Result<Replayed, BenchError> {
     let capture = |source| BenchError::Capture {
         session: dir.to_path_buf(),
@@ -161,7 +165,19 @@ pub fn replay_session(
                 })
         })
         .collect::<Result<Vec<CameraInfo>, _>>()?;
-    let windows = TargetProtocol::new(*protocol)
+    let protocol = match meta.protocol {
+        Some(recorded) => {
+            if recorded != *fallback {
+                tracing::info!(source = "recording", "protocol");
+            }
+            recorded
+        }
+        None => {
+            tracing::info!(source = "fallback", "protocol");
+            *fallback
+        }
+    };
+    let windows = TargetProtocol::new(protocol)
         .map_err(|e| BenchError::Calibration(Box::new(e)))?
         .fixation_windows(recording.targets(), rig.screen())
         .map_err(|e| BenchError::Calibration(Box::new(e)))?;
@@ -185,6 +201,7 @@ pub fn replay_session(
         run: SessionRun {
             session,
             rig,
+            protocol,
             windows,
             steps,
         },
@@ -703,6 +720,108 @@ mod tests {
         )
         .unwrap();
         assert_eq!(replayed.run.steps.len(), 61);
+    }
+
+    #[test]
+    fn test_replay_uses_recorded_protocol_over_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = ProtocolConfig {
+            grid: [3, 3],
+            lead_in_ms: 1000,
+            dwell_ms: 2500,
+            settle_ms: 1000,
+            window_ms: 1200,
+        };
+        let spec = SyntheticSession {
+            targets: vec![(960.0, 540.0)],
+            protocol: Some(recorded),
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let config = fixed_ray_config([155.0, 85.0, -500.0], [161.458333, 94.444444]);
+        let replayed = replay_session(
+            &session_dir,
+            &config,
+            &fake_registry(),
+            &ProtocolConfig::default(),
+        )
+        .unwrap();
+        let window = &replayed.run.windows[0];
+        assert_eq!(
+            window.start,
+            Timestamp(window.onset.0 + Duration::from_millis(1000))
+        );
+        assert_eq!(replayed.run.protocol.settle_ms, 1000);
+    }
+
+    #[test]
+    fn test_replay_without_recorded_protocol_uses_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: vec![(960.0, 540.0)],
+            protocol: None,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let config = fixed_ray_config([155.0, 85.0, -500.0], [161.458333, 94.444444]);
+        let fallback = ProtocolConfig::default();
+        let replayed = replay_session(&session_dir, &config, &fake_registry(), &fallback).unwrap();
+        assert_eq!(replayed.run.protocol, fallback);
+    }
+
+    #[test]
+    fn test_logs_protocol_source_at_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = ProtocolConfig {
+            grid: [3, 3],
+            lead_in_ms: 1000,
+            dwell_ms: 2500,
+            settle_ms: 1000,
+            window_ms: 1200,
+        };
+        let spec_with = SyntheticSession {
+            targets: vec![(960.0, 540.0)],
+            protocol: Some(recorded),
+            ..Default::default()
+        };
+        let session_with = write_synthetic_session(dir.path(), "with", &spec_with).unwrap();
+        let spec_without = SyntheticSession {
+            targets: vec![(960.0, 540.0)],
+            protocol: None,
+            ..Default::default()
+        };
+        let session_without =
+            write_synthetic_session(dir.path(), "without", &spec_without).unwrap();
+        let config = fixed_ray_config([155.0, 85.0, -500.0], [161.458333, 94.444444]);
+        let fallback = ProtocolConfig::default();
+
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::INFO, || {
+            replay_session(&session_with, &config, &fake_registry(), &fallback).unwrap();
+        });
+        let rec = records
+            .iter()
+            .find(|r| r.message == "protocol")
+            .expect("no 'protocol' record for the recorded case");
+        assert_eq!(rec.level, eye_log::Level::Info);
+        assert_eq!(rec.target, "eye_bench::runner");
+        assert_eq!(
+            rec.fields.get("source"),
+            Some(&eye_log::Value::Str("recording".to_string()))
+        );
+
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::INFO, || {
+            replay_session(&session_without, &config, &fake_registry(), &fallback).unwrap();
+        });
+        let rec = records
+            .iter()
+            .find(|r| r.message == "protocol")
+            .expect("no 'protocol' record for the fallback case");
+        assert_eq!(rec.level, eye_log::Level::Info);
+        assert_eq!(rec.target, "eye_bench::runner");
+        assert_eq!(
+            rec.fields.get("source"),
+            Some(&eye_log::Value::Str("fallback".to_string()))
+        );
     }
 
     #[test]

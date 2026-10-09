@@ -91,3 +91,49 @@ pub struct TargetTiming {
     pub window: Duration,
     pub dwell: Duration,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProtocolConfig {
+    pub grid: [u32; 2],
+    pub lead_in_ms: u64,
+    pub dwell_ms: u64,
+    pub settle_ms: u64,
+    pub window_ms: u64,
+}
+
+impl Default for ProtocolConfig {
+    fn default() -> Self {
+        Self {
+            grid: [3, 3],
+            lead_in_ms: 1000,
+            dwell_ms: 1500,
+            settle_ms: 600,
+            window_ms: 800,
+        }
+    }
+}
+
+#[cfg(test)]
+mod protocol_config_tests {
+    use super::*;
+
+    #[test]
+    fn test_protocol_config_toml_round_trip() {
+        let cfg = ProtocolConfig {
+            grid: [4, 4],
+            lead_in_ms: 1000,
+            dwell_ms: 2500,
+            settle_ms: 1000,
+            window_ms: 1200,
+        };
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("grid = [4, 4]"));
+        assert!(text.contains("lead_in_ms = 1000"));
+        assert!(text.contains("dwell_ms = 2500"));
+        assert!(text.contains("settle_ms = 1000"));
+        assert!(text.contains("window_ms = 1200"));
+        let parsed: ProtocolConfig = toml::from_str(&text).unwrap();
+        assert_eq!(parsed, cfg);
+    }
+}

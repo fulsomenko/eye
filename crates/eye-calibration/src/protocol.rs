@@ -8,29 +8,7 @@ use nalgebra::Point2;
 
 use crate::error::CalibrationError;
 
-#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ProtocolConfig {
-    pub grid: [u32; 2],
-    pub lead_in_ms: u64,
-    pub dwell_ms: u64,
-    pub settle_ms: u64,
-    pub window_ms: u64,
-}
-
-impl Default for ProtocolConfig {
-    fn default() -> Self {
-        Self {
-            grid: [3, 3],
-            lead_in_ms: 1000,
-            dwell_ms: 1500,
-            settle_ms: 600,
-            window_ms: 800,
-        }
-    }
-}
-
-pub use eye_core::session::TargetTiming;
+pub use eye_core::session::{ProtocolConfig, TargetTiming};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Target {

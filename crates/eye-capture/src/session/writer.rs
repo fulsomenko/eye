@@ -244,6 +244,7 @@ mod tests {
             ],
             rig: None,
             probe: None,
+            protocol: None,
         }
     }
 

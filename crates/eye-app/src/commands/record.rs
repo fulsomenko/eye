@@ -290,6 +290,7 @@ pub fn session_meta(
     rig: &Rig,
     probe: &ProbeReport,
     emitter_on: bool,
+    protocol: Option<ProtocolConfig>,
     now: SystemTime,
 ) -> anyhow::Result<SessionMeta> {
     let recorded_cameras = cameras
@@ -306,6 +307,7 @@ pub fn session_meta(
         cameras: recorded_cameras,
         rig: Some(rig_to_table(rig)),
         probe: Some(toml::Table::try_from(probe)?),
+        protocol,
     })
 }
 
@@ -389,6 +391,7 @@ pub fn record_session(
         &active_rig,
         &report,
         !guards.is_empty(),
+        opts.protocol,
         SystemTime::now(),
     )?;
     let writer = SessionWriter::create(&location.root, &meta)?;
@@ -981,7 +984,16 @@ mod tests {
         let active_rig = rig_fixture();
         let now = UNIX_EPOCH + Duration::from_secs(1_791_409_623);
 
-        let meta = session_meta(&id, &cameras_fixture(), &active_rig, &report, true, now).unwrap();
+        let meta = session_meta(
+            &id,
+            &cameras_fixture(),
+            &active_rig,
+            &report,
+            true,
+            None,
+            now,
+        )
+        .unwrap();
         assert_eq!(meta.git_rev, Some(GIT_REV.to_string()));
         assert_eq!(meta.created_unix_s, 1_791_409_623);
         assert_eq!(meta.format_version, 1);
@@ -990,8 +1002,52 @@ mod tests {
         assert_eq!(meta.rig, Some(rig_to_table(&active_rig)));
         assert_eq!(meta.emitter, Some(EmitterState::On));
 
-        let meta_off =
-            session_meta(&id, &cameras_fixture(), &active_rig, &report, false, now).unwrap();
+        let meta_off = session_meta(
+            &id,
+            &cameras_fixture(),
+            &active_rig,
+            &report,
+            false,
+            None,
+            now,
+        )
+        .unwrap();
         assert_eq!(meta_off.emitter, None);
+    }
+
+    #[test]
+    fn test_session_meta_records_protocol() {
+        let id = SessionId::new("20261007T221500Z").unwrap();
+        let report = probe_report();
+        let active_rig = rig_fixture();
+        let now = UNIX_EPOCH + Duration::from_secs(1_791_409_623);
+        let protocol = ProtocolConfig {
+            grid: [4, 4],
+            ..ProtocolConfig::default()
+        };
+
+        let meta = session_meta(
+            &id,
+            &cameras_fixture(),
+            &active_rig,
+            &report,
+            true,
+            Some(protocol),
+            now,
+        )
+        .unwrap();
+        assert_eq!(meta.protocol, Some(protocol));
+
+        let meta_without = session_meta(
+            &id,
+            &cameras_fixture(),
+            &active_rig,
+            &report,
+            true,
+            None,
+            now,
+        )
+        .unwrap();
+        assert_eq!(meta_without.protocol, None);
     }
 }
