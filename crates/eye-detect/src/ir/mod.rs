@@ -42,6 +42,9 @@ pub struct IrClassicOptions {
     pub glint_min_excess: f64,
     /// 1-sigma glint position noise in px (E2: 0.7 px pupil-glint vector std / sqrt(2)).
     pub glint_sigma_px: f64,
+    /// Lower bound on the 1-sigma pupil-centre noise from the ellipse fit, px
+    /// (EYE-106 replay: about 0.3 px frame to frame on real IR).
+    pub pupil_sigma_floor_px: f64,
 }
 
 impl Default for IrClassicOptions {
@@ -63,6 +66,7 @@ impl Default for IrClassicOptions {
             glint_search_radius: 2.0,
             glint_min_excess: 15.0,
             glint_sigma_px: 0.5,
+            pupil_sigma_floor_px: 0.3,
         }
     }
 }
@@ -360,6 +364,49 @@ mod tests {
             let sigma = eye.pupil.unwrap().sigma();
             assert!(sigma > 0.0 && sigma <= 0.3, "sigma {sigma} out of range");
         }
+    }
+
+    #[test]
+    fn test_pupil_sigma_respects_floor() {
+        let detector = IrClassicDetector::new(IrClassicOptions {
+            pupil_sigma_floor_px: 0.3,
+            ..IrClassicOptions::default()
+        });
+        let scene = SyntheticIr::default_scene();
+        let (lit, dark) = scene.render();
+        let eyes = detector
+            .detect_pair(lit.view(), dark.view())
+            .unwrap()
+            .expect("face detected");
+        for eye in &eyes {
+            assert_eq!(eye.pupil.unwrap().sigma(), 0.3);
+        }
+    }
+
+    #[test]
+    fn test_pupil_sigma_below_default_floor_without_option() {
+        let detector = IrClassicDetector::new(IrClassicOptions {
+            pupil_sigma_floor_px: 0.05,
+            ..IrClassicOptions::default()
+        });
+        let scene = SyntheticIr::default_scene();
+        let (lit, dark) = scene.render();
+        let eyes = detector
+            .detect_pair(lit.view(), dark.view())
+            .unwrap()
+            .expect("face detected");
+        for eye in &eyes {
+            let sigma = eye.pupil.unwrap().sigma();
+            assert!(
+                sigma < 0.3,
+                "sigma {sigma} did not come from the fit residual"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ir_classic_options_default_floor_is_0_3() {
+        assert_eq!(IrClassicOptions::default().pupil_sigma_floor_px, 0.3);
     }
 
     #[test]

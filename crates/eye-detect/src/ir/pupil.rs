@@ -82,7 +82,8 @@ pub(crate) fn pupil_from_candidate(
 
     let (ellipse, sigma) = match fit {
         Ok(fit) if plausible(&fit.ellipse, centroid, r) => {
-            let sigma = (fit.rms_residual * (2.0 / points.len() as f64).sqrt()).max(0.05);
+            let sigma = (fit.rms_residual * (2.0 / points.len() as f64).sqrt())
+                .max(options.pupil_sigma_floor_px);
             (fit.ellipse, sigma)
         }
         Ok(fit) => {
@@ -95,7 +96,10 @@ pub(crate) fn pupil_from_candidate(
                 semi_minor = fit.ellipse.semi_minor(),
                 "ellipse fit fell back to circle"
             );
-            (Ellipse2::circle(centroid, r)?, 0.5)
+            (
+                Ellipse2::circle(centroid, r)?,
+                options.pupil_sigma_floor_px.max(0.5),
+            )
         }
         Err(reason) => {
             tracing::debug!(
@@ -104,7 +108,10 @@ pub(crate) fn pupil_from_candidate(
                 r,
                 "ellipse fit fell back to circle"
             );
-            (Ellipse2::circle(centroid, r)?, 0.5)
+            (
+                Ellipse2::circle(centroid, r)?,
+                options.pupil_sigma_floor_px.max(0.5),
+            )
         }
     };
 
