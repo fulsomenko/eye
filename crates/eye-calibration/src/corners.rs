@@ -1,4 +1,5 @@
 use eye_core::image::GrayView;
+use eye_core::log::field;
 use nalgebra::{Matrix2, Point2, Vector2};
 
 use crate::error::CalibrationError;
@@ -70,6 +71,11 @@ pub(crate) fn candidates_in(l: &Smoothed, cfg: &CornerConfig) -> Vec<CornerCandi
     let s = saddle_response(l);
     let max_s = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if max_s.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+        tracing::debug!(
+            { field::REASON } = "flat_image",
+            max_response = max_s,
+            "no corner response"
+        );
         return Vec::new();
     }
     let threshold = cfg.rel_threshold * max_s;
@@ -90,6 +96,12 @@ pub(crate) fn candidates_in(l: &Smoothed, cfg: &CornerConfig) -> Vec<CornerCandi
             }
         }
     }
+    tracing::trace!(
+        candidates = out.len() as u64,
+        threshold,
+        max_response = max_s,
+        "corner candidates"
+    );
     out
 }
 

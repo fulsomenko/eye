@@ -1,6 +1,7 @@
 //! IR-from-RGB stereo extrinsics: the rigid transform between two cameras recovered from
 //! boards seen simultaneously by both, refined jointly with all board poses.
 
+use eye_core::log::field;
 use eye_core::{CameraId, Measured, Rig};
 use eye_geometry::camera::Intrinsics;
 use eye_geometry::lsq::{self, ResidualModel, SolveOptions};
@@ -208,6 +209,16 @@ fn solve_joint(
         sigma: cams.sigma,
     };
     let fit = lsq::solve(&problem, x0, opts)?;
+    tracing::trace!(
+        views = corners.len() as u64,
+        params = fit.x.len() as u64,
+        residuals = problem.num_residuals() as u64,
+        chi2 = fit.chi2,
+        dof = fit.dof as u64,
+        evaluations = fit.evaluations as u64,
+        chi2_reduced = fit.chi2_reduced(),
+        "lm solve"
+    );
     let b_from_a = problem.b_from_a(&fit.x);
     let board_poses = (0..corners.len())
         .map(|v| problem.a_from_board(&fit.x, v))
@@ -313,6 +324,13 @@ pub fn calibrate_stereo(
         / x_v.len() as f64;
     let qs: Vec<UnitQuaternion<f64>> = x_v.iter().map(|x| x.rotation).collect();
     let r0_x = mean_rotation(&qs);
+    tracing::trace!(
+        tx_mm = mean_t.x,
+        ty_mm = mean_t.y,
+        tz_mm = mean_t.z,
+        rotation_deg = r0_x.angle().to_degrees(),
+        "stereo initial estimate"
+    );
 
     let r0_v: Vec<UnitQuaternion<f64>> = poses_a.iter().map(|p| p.rotation).collect();
     let x0 = initial_params(mean_t, &poses_a);
@@ -331,7 +349,18 @@ pub fn calibrate_stereo(
         .map(|(pts, pose)| view_rms(intr_a, intr_b, &fit1.b_from_a, pose, pts))
         .collect();
 
-    let kept = reject_views(&per_view_rms1, cfg.view_outlier_factor);
+    let (kept, threshold_px) = reject_views(&per_view_rms1, cfg.view_outlier_factor);
+    for (view, &rms_px) in per_view_rms1.iter().enumerate() {
+        if !kept.contains(&view) {
+            tracing::debug!(
+                view = view as u64,
+                rms_px,
+                threshold_px,
+                { field::REASON } = "rms_above_threshold",
+                "view rejected"
+            );
+        }
+    }
     if kept.len() < cfg.min_views {
         return Err(CalibrationError::InsufficientData {
             what: "views",
@@ -367,6 +396,18 @@ pub fn calibrate_stereo(
         }
     }
     let rms_px = (sq_sum / (2.0 * n_total as f64)).sqrt();
+
+    let t = final_fit.b_from_a.translation.vector;
+    tracing::info!(
+        views = views.len() as u64,
+        views_used = kept.len() as u64,
+        rms_px,
+        tx_mm = t.x,
+        ty_mm = t.y,
+        tz_mm = t.z,
+        rotation_deg = final_fit.b_from_a.rotation.angle().to_degrees(),
+        "stereo fitted"
+    );
 
     Ok(StereoFit {
         b_from_a: final_fit.b_from_a,
@@ -595,6 +636,88 @@ mod tests {
             "views_used={:?}",
             fit.views_used
         );
+    }
+
+    #[test]
+    fn test_logs_stereo_fitted_at_info() {
+        let (truth, _, views) = synthetic_stereo_views(12, 23, 100, 200);
+        let intr_a = fixture_rgb_intrinsics();
+        let intr_b = fixture_ir_intrinsics();
+
+        let (_fit, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            calibrate_stereo(&intr_a, &intr_b, &views, &StereoConfig::default()).unwrap()
+        });
+
+        let fitted: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "stereo fitted")
+            .collect();
+        assert_eq!(fitted.len(), 1);
+        let rec = fitted[0];
+        assert_eq!(rec.level, eye_log::Level::Info);
+        assert_eq!(rec.fields["views"], eye_log::Value::U64(12));
+        assert_eq!(rec.fields["views_used"], eye_log::Value::U64(12));
+        match rec.fields["rms_px"] {
+            eye_log::Value::F64(v) => assert!((0.15..=0.25).contains(&v), "rms_px={v}"),
+            ref other => panic!("expected F64 rms_px, got {other:?}"),
+        }
+        for (field_name, truth_val) in [
+            ("tx_mm", truth.translation.vector.x),
+            ("ty_mm", truth.translation.vector.y),
+            ("tz_mm", truth.translation.vector.z),
+        ] {
+            match rec.fields[field_name] {
+                eye_log::Value::F64(v) => assert!((v - truth_val).abs() < 0.5, "{field_name}={v}"),
+                ref other => panic!("expected F64 {field_name}, got {other:?}"),
+            }
+        }
+
+        let initial: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "stereo initial estimate")
+            .collect();
+        assert_eq!(initial.len(), 1);
+
+        let lm_solve: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "lm solve" && r.target == "eye_calibration::stereo")
+            .collect();
+        assert_eq!(lm_solve.len(), 1);
+    }
+
+    #[test]
+    fn test_logs_stereo_view_rejected_at_debug() {
+        let (_, _, mut views) = synthetic_stereo_views(6, 0, 11, 12);
+        for c in &mut views[3].b.corners {
+            c.image_px.x += 3.0;
+        }
+        let intr_a = fixture_rgb_intrinsics();
+        let intr_b = fixture_ir_intrinsics();
+
+        let (fit, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            calibrate_stereo(&intr_a, &intr_b, &views, &StereoConfig::default()).unwrap()
+        });
+        assert!(!fit.views_used.contains(&3));
+
+        let rejected: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "view rejected" && r.target == "eye_calibration::stereo")
+            .collect();
+        assert_eq!(rejected.len(), 1);
+        let rec = rejected[0];
+        assert_eq!(rec.level, eye_log::Level::Debug);
+        assert_eq!(rec.fields["view"], eye_log::Value::U64(3));
+        assert!(rec.fields.contains_key("threshold_px"));
+        assert_eq!(
+            rec.fields[field::REASON],
+            eye_log::Value::Str("rms_above_threshold".to_string())
+        );
+
+        let lm_solve: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "lm solve" && r.target == "eye_calibration::stereo")
+            .collect();
+        assert_eq!(lm_solve.len(), 2);
     }
 
     #[test]

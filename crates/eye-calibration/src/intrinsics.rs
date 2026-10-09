@@ -1,6 +1,7 @@
 //! Zhang's camera calibration: per-view homographies, the closed-form intrinsics solution,
 //! pose recovery, and a joint Levenberg-Marquardt refinement over all views at once.
 
+use eye_core::log::field;
 use eye_core::{CameraId, Rig};
 use eye_geometry::GeometryError;
 use eye_geometry::camera::{Distortion, Intrinsics};
@@ -357,6 +358,16 @@ fn solve_joint(
         sigma: ctx.sigma,
     };
     let fit = lsq::solve(&problem, x0, opts)?;
+    tracing::trace!(
+        views = corners.len() as u64,
+        params = fit.x.len() as u64,
+        residuals = problem.num_residuals() as u64,
+        chi2 = fit.chi2,
+        dof = fit.dof as u64,
+        evaluations = fit.evaluations as u64,
+        chi2_reduced = fit.chi2_reduced(),
+        "lm solve"
+    );
     let intrinsics = problem.intrinsics(&fit.x);
     let poses = (0..corners.len())
         .map(|v| problem.pose(&fit.x, v))
@@ -413,8 +424,8 @@ fn view_rms(intr: &Intrinsics, pose: &Isometry3<f64>, pts: &ViewCorners) -> f64 
     (sq / (2.0 * pts.len() as f64)).sqrt()
 }
 
-/// Drops views whose RMS exceeds `factor * median`, returns kept indices.
-pub(crate) fn reject_views(per_view_rms: &[f64], factor: f64) -> Vec<usize> {
+/// Drops views whose RMS exceeds `factor * median`, returns (kept indices, threshold).
+pub(crate) fn reject_views(per_view_rms: &[f64], factor: f64) -> (Vec<usize>, f64) {
     let mut sorted = per_view_rms.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).expect("RMS values are finite"));
     let mid = sorted.len() / 2;
@@ -426,12 +437,13 @@ pub(crate) fn reject_views(per_view_rms: &[f64], factor: f64) -> Vec<usize> {
         (sorted[mid - 1] + sorted[mid]) / 2.0
     };
     let threshold = factor * median;
-    per_view_rms
+    let kept = per_view_rms
         .iter()
         .enumerate()
         .filter(|&(_, &r)| r <= threshold)
         .map(|(i, _)| i)
-        .collect()
+        .collect();
+    (kept, threshold)
 }
 
 pub fn calibrate_intrinsics(
@@ -473,6 +485,13 @@ pub fn calibrate_intrinsics(
         .collect::<Result<_, _>>()?;
 
     let k = zhang_closed_form(&homographies, width, height)?;
+    tracing::trace!(
+        fx = k[(0, 0)],
+        fy = k[(1, 1)],
+        cx = k[(0, 2)],
+        cy = k[(1, 2)],
+        "closed-form intrinsics"
+    );
     let init_poses: Vec<Isometry3<f64>> = homographies
         .iter()
         .map(|h| pose_from_homography(&k, h))
@@ -497,7 +516,18 @@ pub fn calibrate_intrinsics(
         .map(|(pts, pose)| view_rms(&fit1.intrinsics, pose, pts))
         .collect();
 
-    let kept = reject_views(&per_view_rms1, cfg.view_outlier_factor);
+    let (kept, threshold_px) = reject_views(&per_view_rms1, cfg.view_outlier_factor);
+    for (view, &rms_px) in per_view_rms1.iter().enumerate() {
+        if !kept.contains(&view) {
+            tracing::debug!(
+                view = view as u64,
+                rms_px,
+                threshold_px,
+                { field::REASON } = "rms_above_threshold",
+                "view rejected"
+            );
+        }
+    }
 
     if kept.len() < cfg.min_views {
         return Err(CalibrationError::InsufficientData {
@@ -526,6 +556,14 @@ pub fn calibrate_intrinsics(
         }
         (fit2, rms_all)
     };
+    for (view, &rms_px) in per_view_rms_px.iter().enumerate() {
+        tracing::trace!(
+            view = view as u64,
+            rms_px,
+            kept = kept.contains(&view),
+            "view residual"
+        );
+    }
 
     let mut cov = SMatrix::<f64, 9, 9>::zeros();
     let idxs = mask.full_indices();
@@ -549,14 +587,27 @@ pub fn calibrate_intrinsics(
     let rms_px = (sq_sum / (2.0 * n_total as f64)).sqrt();
 
     let module = identify_module(&final_fit.intrinsics);
-    let prior = focal_prior(width, height, &DELL_DIAG_FOV_DEG)?;
-    let prior_z = (final_fit.intrinsics.fx - prior.f_px) / prior.sigma_px;
-    if prior_z.abs() > 2.0 {
-        tracing::warn!(
-            prior_z,
-            "fitted focal length is outside both Dell lens modules' priors"
-        );
-    }
+    let prior_z = warn_if_outside_priors(&final_fit.intrinsics, width, height)?;
+
+    tracing::info!(
+        width = u64::from(width),
+        height = u64::from(height),
+        views = views.len() as u64,
+        views_used = kept.len() as u64,
+        rms_px,
+        fx = final_fit.intrinsics.fx,
+        fy = final_fit.intrinsics.fy,
+        cx = final_fit.intrinsics.cx,
+        cy = final_fit.intrinsics.cy,
+        k1 = final_fit.intrinsics.distortion.k1,
+        k2 = final_fit.intrinsics.distortion.k2,
+        p1 = final_fit.intrinsics.distortion.p1,
+        p2 = final_fit.intrinsics.distortion.p2,
+        k3 = final_fit.intrinsics.distortion.k3,
+        module = ?module,
+        prior_z,
+        "intrinsics fitted"
+    );
 
     Ok(IntrinsicsFit {
         intrinsics: final_fit.intrinsics,
@@ -568,6 +619,25 @@ pub fn calibrate_intrinsics(
         module,
         prior_z,
     })
+}
+
+fn warn_if_outside_priors(
+    intr: &Intrinsics,
+    width: u32,
+    height: u32,
+) -> Result<f64, CalibrationError> {
+    let prior = focal_prior(width, height, &DELL_DIAG_FOV_DEG)?;
+    let prior_z = (intr.fx - prior.f_px) / prior.sigma_px;
+    if prior_z.abs() > 2.0 {
+        tracing::warn!(
+            prior_z,
+            fx = intr.fx,
+            prior_f_px = prior.f_px,
+            prior_sigma_px = prior.sigma_px,
+            "fitted focal length is outside both Dell lens modules' priors"
+        );
+    }
+    Ok(prior_z)
 }
 
 /// Nearest Dell module: the module whose focal is within 5 % of `(fx + fy) / 2`; the two
@@ -1076,6 +1146,168 @@ mod tests {
             "prior_z={}",
             fit.prior_z
         );
+    }
+
+    #[test]
+    fn test_logs_intrinsics_fitted_at_info() {
+        let views = synthetic_views(15);
+
+        let (_fit, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            calibrate_intrinsics(640, 360, &views, &IntrinsicsConfig::default()).unwrap()
+        });
+
+        let fitted: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "intrinsics fitted")
+            .collect();
+        assert_eq!(fitted.len(), 1);
+        let rec = fitted[0];
+        assert_eq!(rec.level, eye_log::Level::Info);
+        assert_eq!(rec.fields["views"], eye_log::Value::U64(15));
+        assert_eq!(rec.fields["views_used"], eye_log::Value::U64(15));
+        match rec.fields["rms_px"] {
+            eye_log::Value::F64(v) => assert!((0.15..=0.25).contains(&v), "rms_px={v}"),
+            ref other => panic!("expected F64 rms_px, got {other:?}"),
+        }
+        match rec.fields["module"] {
+            eye_log::Value::Str(_) => {}
+            ref other => panic!("expected Str module, got {other:?}"),
+        }
+        match rec.fields["prior_z"] {
+            eye_log::Value::F64(v) => assert!((v - 0.655).abs() < 0.05, "prior_z={v}"),
+            ref other => panic!("expected F64 prior_z, got {other:?}"),
+        }
+
+        assert!(
+            !records.iter().any(|r| r.level == eye_log::Level::Warn),
+            "unexpected warn records: {records:?}"
+        );
+
+        let residuals: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "view residual")
+            .collect();
+        assert_eq!(residuals.len(), 15);
+        for r in &residuals {
+            assert_eq!(r.fields["kept"], eye_log::Value::Bool(true));
+        }
+
+        let rejected: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "view rejected")
+            .collect();
+        assert_eq!(rejected.len(), 0);
+
+        let lm_solve: Vec<_> = records.iter().filter(|r| r.message == "lm solve").collect();
+        assert_eq!(lm_solve.len(), 1);
+        match lm_solve[0].fields["evaluations"] {
+            eye_log::Value::U64(v) => assert!(v > 0),
+            ref other => panic!("expected U64 evaluations, got {other:?}"),
+        }
+        let (residuals, params) = match (
+            &lm_solve[0].fields["residuals"],
+            &lm_solve[0].fields["params"],
+        ) {
+            (eye_log::Value::U64(r), eye_log::Value::U64(p)) => (*r, *p),
+            other => panic!("expected U64 residuals/params, got {other:?}"),
+        };
+        assert_eq!(
+            lm_solve[0].fields["dof"],
+            eye_log::Value::U64(residuals - params)
+        );
+
+        let closed_form: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "closed-form intrinsics")
+            .collect();
+        assert_eq!(closed_form.len(), 1);
+    }
+
+    #[test]
+    fn test_logs_view_rejected_at_debug() {
+        let mut views = synthetic_views(15);
+        let intr = truth_intrinsics();
+        let mut pose_rng = SplitMix64::new(17);
+        let poses =
+            synthetic_board_poses(&mut pose_rng, 15, accept_in_bounds(&intr, &board_spec()));
+        views[7] = observation_from_pose(&intr, &poses[7], &board_spec(), None);
+        let mut noise_rng = SplitMix64::new(99);
+        for corner in &mut views[7].corners {
+            corner.image_px.x += 2.0 * noise_rng.gaussian();
+            corner.image_px.y += 2.0 * noise_rng.gaussian();
+        }
+
+        let (fit, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            calibrate_intrinsics(640, 360, &views, &IntrinsicsConfig::default()).unwrap()
+        });
+        assert!(!fit.views_used.contains(&7));
+
+        let rejected: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "view rejected")
+            .collect();
+        assert_eq!(rejected.len(), 1);
+        let rec = rejected[0];
+        assert_eq!(rec.level, eye_log::Level::Debug);
+        assert_eq!(rec.fields["view"], eye_log::Value::U64(7));
+        match (&rec.fields["rms_px"], &rec.fields["threshold_px"]) {
+            (eye_log::Value::F64(rms), eye_log::Value::F64(threshold)) => {
+                assert!(rms > threshold, "rms={rms} threshold={threshold}");
+            }
+            other => panic!("expected F64 rms_px/threshold_px, got {other:?}"),
+        }
+        assert_eq!(
+            rec.fields[field::REASON],
+            eye_log::Value::Str("rms_above_threshold".to_string())
+        );
+
+        let lm_solve: Vec<_> = records.iter().filter(|r| r.message == "lm solve").collect();
+        assert_eq!(lm_solve.len(), 2);
+
+        let residuals: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "view residual")
+            .collect();
+        assert_eq!(residuals.len(), 15);
+        for r in &residuals {
+            let kept = r.fields["kept"] == eye_log::Value::Bool(true);
+            let is_view_7 = r.fields["view"] == eye_log::Value::U64(7);
+            assert_eq!(
+                kept, !is_view_7,
+                "view={:?} kept={:?}",
+                r.fields["view"], r.fields["kept"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_logs_focal_prior_warning_at_warn() {
+        let (prior_z, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            warn_if_outside_priors(
+                &Intrinsics {
+                    fx: 300.0,
+                    ..truth_intrinsics()
+                },
+                640,
+                360,
+            )
+            .unwrap()
+        });
+
+        let warnings: Vec<_> = records
+            .iter()
+            .filter(|r| r.level == eye_log::Level::Warn)
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        let rec = warnings[0];
+        match rec.fields["prior_z"] {
+            eye_log::Value::F64(v) => assert!(v < -2.0, "prior_z={v}"),
+            ref other => panic!("expected F64 prior_z, got {other:?}"),
+        }
+        assert_eq!(rec.fields["fx"], eye_log::Value::F64(300.0));
+        assert!(rec.fields.contains_key("prior_f_px"));
+        assert!(rec.fields.contains_key("prior_sigma_px"));
+        assert_eq!(rec.fields["prior_z"], eye_log::Value::F64(prior_z));
     }
 
     fn edp1_rig() -> Rig {

@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::f64::consts::FRAC_1_SQRT_2;
 
 use eye_core::image::GrayView;
+use eye_core::log::field;
 use nalgebra::{Point2, Point3, Vector2};
 
 use crate::corners::{BoardSpec, CornerConfig, Smoothed, candidates_in};
@@ -49,18 +50,42 @@ pub fn detect_board(
 
     let l = Smoothed::new(img, cfg.corners.blur_sigma_px);
     let c = candidates_in(&l, &cfg.corners);
+    let candidates = c.len() as u64;
+    let needed = (cols * rows) as u64;
     if c.len() < cols * rows {
+        tracing::debug!(
+            { field::REASON } = "too_few_candidates",
+            candidates,
+            needed,
+            "board not detected"
+        );
         return Ok(None);
     }
     let pts: Vec<Point2<f64>> = c.iter().map(|cand| cand.px).collect();
 
     let Some((seed, u0, v0)) = seed_basis(&pts) else {
+        tracing::debug!(
+            { field::REASON } = "no_seed_basis",
+            candidates,
+            "board not detected"
+        );
         return Ok(None);
     };
     let Some(grid_map) = grow_grid(&pts, seed, u0, v0, cfg.match_tolerance) else {
+        tracing::debug!(
+            { field::REASON } = "grid_ambiguous",
+            candidates,
+            "board not detected"
+        );
         return Ok(None);
     };
     let Some(mut grid) = normalize_extents(&grid_map, cols, rows) else {
+        tracing::debug!(
+            { field::REASON } = "wrong_extents",
+            cells = grid_map.len() as u64,
+            needed,
+            "board not detected"
+        );
         return Ok(None);
     };
 
@@ -71,6 +96,7 @@ pub fn detect_board(
     let (p00, p10, p01) = (pts[grid[0][0]], pts[grid[1][0]], pts[grid[0][1]]);
     let (w, h) = (f64::from(img.width()), f64::from(img.height()));
     let Some(flip) = half_turn_check(&l, &p00, &p10, &p01, w, h) else {
+        tracing::debug!({ field::REASON } = "border_too_close", "board not detected");
         return Ok(None);
     };
     if flip {
@@ -88,6 +114,20 @@ pub fn detect_board(
             });
         }
     }
+
+    tracing::debug!(
+        cols = cols as u64,
+        rows = rows as u64,
+        flipped = flip,
+        "board detected"
+    );
+    tracing::trace!(
+        corners = corners.len() as u64,
+        candidates,
+        p00_x_px = corners[0].image_px.x,
+        p00_y_px = corners[0].image_px.y,
+        "board corners"
+    );
 
     Ok(Some(BoardObservation {
         spec: *spec,
@@ -469,5 +509,154 @@ mod tests {
         let err = detect_board(&img.view(), &spec, &DetectorConfig::default())
             .expect_err("even sum rejected");
         assert!(matches!(err, CalibrationError::Param { name: "board", .. }));
+    }
+
+    #[test]
+    fn test_logs_board_detected_at_debug() {
+        let spec = board_spec();
+        let (img, _truth) = render_board(
+            &fixture_ir_intrinsics(),
+            &pose(UnitQuaternion::identity(), 350.0),
+            &spec,
+            3,
+        );
+
+        let (observation, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            detect_board(&img.view(), &spec, &DetectorConfig::default())
+                .expect("valid spec")
+                .expect("board found")
+        });
+
+        let detected: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "board detected")
+            .collect();
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].level, eye_log::Level::Debug);
+        assert_eq!(detected[0].fields["cols"], eye_log::Value::U64(9));
+        assert_eq!(detected[0].fields["rows"], eye_log::Value::U64(6));
+
+        let board_corners: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "board corners")
+            .collect();
+        assert_eq!(board_corners.len(), 1);
+        assert_eq!(board_corners[0].level, eye_log::Level::Trace);
+        assert_eq!(board_corners[0].fields["corners"], eye_log::Value::U64(54));
+        assert_eq!(
+            board_corners[0].fields["p00_x_px"],
+            eye_log::Value::F64(observation.corners[0].image_px.x)
+        );
+        assert_eq!(
+            board_corners[0].fields["p00_y_px"],
+            eye_log::Value::F64(observation.corners[0].image_px.y)
+        );
+        let candidates = match board_corners[0].fields["candidates"] {
+            eye_log::Value::U64(v) => {
+                assert!(v >= 54, "candidates={v}");
+                v
+            }
+            ref other => panic!("expected U64 candidates, got {other:?}"),
+        };
+
+        let candidate_records: Vec<_> = records
+            .iter()
+            .filter(|r| r.target == "eye_calibration::corners" && r.message == "corner candidates")
+            .collect();
+        assert_eq!(candidate_records.len(), 1);
+        assert_eq!(
+            candidate_records[0].fields["candidates"],
+            eye_log::Value::U64(candidates)
+        );
+    }
+
+    #[test]
+    fn test_logs_board_not_detected_at_debug() {
+        let spec = board_spec();
+        let intr = fixture_ir_intrinsics();
+        let t = Vector3::new(55.0, -62.5, 350.0);
+        let camera_from_board =
+            Isometry3::from_parts(Translation3::from(t), UnitQuaternion::identity());
+        let (partial_img, _truth) = render_board(&intr, &camera_from_board, &spec, 8);
+
+        let (observation, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            detect_board(&partial_img.view(), &spec, &DetectorConfig::default())
+                .expect("valid spec")
+        });
+        assert!(observation.is_none());
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "board not detected")
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].level, eye_log::Level::Debug);
+        // Verified empirically (ran the test and read the recorded reason): the
+        // off-image column loses enough corner candidates to fail the count check
+        // before a grid is ever grown.
+        assert_eq!(
+            matches[0].fields[field::REASON],
+            eye_log::Value::Str("too_few_candidates".to_string())
+        );
+
+        let (w, h) = (640u32, 360u32);
+        let mut rng = SplitMix64::new(5);
+        let data: Vec<u8> = (0..(w as usize * h as usize))
+            .map(|_| (rng.uniform() * 256.0) as u8)
+            .collect();
+        let noise_img = GrayImage::new(w, h, data).expect("w * h bytes");
+
+        let (observation, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            detect_board(&noise_img.view(), &spec, &DetectorConfig::default()).expect("valid spec")
+        });
+        assert!(observation.is_none());
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "board not detected")
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].level, eye_log::Level::Debug);
+        // Verified empirically (ran the test and read the recorded reason): the
+        // noise yields plenty of candidates, but grid growth stalls at a tiny
+        // fragment (3 cells in a 2x2 box), which normalize_extents rejects.
+        assert_eq!(
+            matches[0].fields[field::REASON],
+            eye_log::Value::Str("wrong_extents".to_string())
+        );
+    }
+
+    #[test]
+    fn test_logs_reason_field_uses_vocabulary() {
+        let (w, h) = (640u32, 360u32);
+        let mut rng = SplitMix64::new(5);
+        let data: Vec<u8> = (0..(w as usize * h as usize))
+            .map(|_| (rng.uniform() * 256.0) as u8)
+            .collect();
+        let noise_img = GrayImage::new(w, h, data).expect("w * h bytes");
+
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            detect_board(&noise_img.view(), &board_spec(), &DetectorConfig::default())
+        });
+
+        let five_reasons = [
+            "too_few_candidates",
+            "no_seed_basis",
+            "grid_ambiguous",
+            "wrong_extents",
+            "border_too_close",
+        ];
+        let debug_records: Vec<_> = records
+            .iter()
+            .filter(|r| r.level == eye_log::Level::Debug)
+            .collect();
+        assert!(!debug_records.is_empty());
+        for rec in debug_records {
+            let value = &rec.fields[field::REASON];
+            match value {
+                eye_log::Value::Str(s) => {
+                    assert!(five_reasons.contains(&s.as_str()), "reason={s}");
+                }
+                other => panic!("expected Str reason, got {other:?}"),
+            }
+        }
     }
 }
