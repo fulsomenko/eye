@@ -36,3 +36,8 @@ pub(crate) fn dt_seconds(prev: Timestamp, now: Timestamp) -> Option<f64> {
         .map(|d| d.as_secs_f64())
         .filter(|&s| s > 0.0)
 }
+
+/// `(xx, xy, yy)` entries of a symmetric 2x2 covariance, for logging.
+pub(crate) fn cov_fields(m: &Matrix2<f64>) -> (f64, f64, f64) {
+    (m[(0, 0)], m[(0, 1)], m[(1, 1)])
+}

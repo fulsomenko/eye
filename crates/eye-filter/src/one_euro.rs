@@ -1,9 +1,10 @@
+use eye_core::log::field;
 use eye_core::stage::{GazeFilter, StageError};
 use eye_core::{GazePoint, Rig, ScreenModel, Timestamp};
 use nalgebra::{Matrix2, Vector2};
 
 use crate::FilterError;
-use crate::point::{dt_seconds, with_position};
+use crate::point::{cov_fields, dt_seconds, with_position};
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -89,19 +90,37 @@ impl GazeFilter for OneEuroFilter {
                 dx: Vector2::zeros(),
                 cov_lp: point.cov_mm,
             });
+            tracing::debug!(
+                { field::REASON } = "first_sample",
+                { field::TS_NS } = point.timestamp.as_nanos(),
+                "filter initialised"
+            );
             return point;
         };
         let Some(dt) = dt_seconds(prev.t, point.timestamp) else {
-            tracing::warn!(?point.timestamp, "non-increasing gaze timestamp, passing through");
+            tracing::warn!(
+                { field::REASON } = "non_increasing_timestamp",
+                { field::TS_NS } = point.timestamp.as_nanos(),
+                prev_ts_ns = prev.t.as_nanos(),
+                "non-increasing gaze timestamp, passing through"
+            );
             return point;
         };
         if dt > self.cfg.reset_after_s {
-            self.reset();
+            tracing::debug!(
+                { field::REASON } = "gap",
+                dt_s = dt,
+                reset_after_s = self.cfg.reset_after_s,
+                "filter reset"
+            );
+            self.state = None;
             return self.apply(point);
         }
         let a_d = alpha(self.cfg.d_cutoff, dt);
         let dx = a_d * (x - prev.x) / dt + (1.0 - a_d) * prev.dx;
-        let a = alpha(self.cfg.min_cutoff + self.cfg.beta * dx.norm(), dt);
+        let speed_mm_s = dx.norm();
+        let cutoff_hz = self.cfg.min_cutoff + self.cfg.beta * speed_mm_s;
+        let a = alpha(cutoff_hz, dt);
         let xf = a * x + (1.0 - a) * prev.x;
         let cov_lp = prev.cov_lp + (point.cov_mm - prev.cov_lp) * a;
         let cov = cov_lp * (a / (2.0 - a));
@@ -111,11 +130,32 @@ impl GazeFilter for OneEuroFilter {
             dx,
             cov_lp,
         });
+        let (in_cov_xx, in_cov_xy, in_cov_yy) = cov_fields(&point.cov_mm);
+        let (out_cov_xx, out_cov_xy, out_cov_yy) = cov_fields(&cov);
+        tracing::trace!(
+            dt_s = dt,
+            speed_mm_s,
+            cutoff_hz,
+            alpha = a,
+            alpha_d = a_d,
+            in_x_mm = x.x,
+            in_y_mm = x.y,
+            out_x_mm = xf.x,
+            out_y_mm = xf.y,
+            in_cov_xx,
+            in_cov_xy,
+            in_cov_yy,
+            out_cov_xx,
+            out_cov_xy,
+            out_cov_yy,
+            "filter step"
+        );
         with_position(point, xf.into(), cov, &self.screen)
     }
 
     fn reset(&mut self) {
         self.state = None;
+        tracing::debug!({ field::REASON } = "external", "filter reset");
     }
 }
 
@@ -433,6 +473,155 @@ mod tests {
         let a = alpha30();
         let expected = 100.0 * (a / (2.0 - a));
         approx::assert_abs_diff_eq!(out.cov_mm[(0, 0)], expected, epsilon = 1e-9);
+    }
+
+    fn find<'a>(records: &'a [eye_log::Record], message: &str) -> Vec<&'a eye_log::Record> {
+        records
+            .iter()
+            .filter(|r| r.target == "eye_filter::one_euro" && r.message == message)
+            .collect()
+    }
+
+    fn f64_field(record: &eye_log::Record, name: &str) -> f64 {
+        match record.fields.get(name) {
+            Some(eye_log::Value::F64(v)) => *v,
+            other => panic!("field {name}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_logs_filter_initialised_at_debug() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut f = filter(OneEuroConfig::default());
+            f.apply(pt(0, 10.0, 20.0));
+        });
+        let recs = find(&records, "filter initialised");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].level, eye_log::Level::Debug);
+        assert_eq!(
+            recs[0].fields.get("reason"),
+            Some(&eye_log::Value::Str("first_sample".to_string()))
+        );
+        assert_eq!(recs[0].fields.get("ts_ns"), Some(&eye_log::Value::U64(0)));
+    }
+
+    #[test]
+    fn test_logs_filter_step_at_trace() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut f = filter(OneEuroConfig::default());
+            f.apply(pt(0, 100.0, 0.0));
+            f.apply(pt(P30, 100.0, 0.0));
+        });
+        let recs = find(&records, "filter step");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].level, eye_log::Level::Trace);
+        approx::assert_abs_diff_eq!(f64_field(recs[0], "cutoff_hz"), 1.0, epsilon = 1e-9);
+        approx::assert_abs_diff_eq!(f64_field(recs[0], "in_x_mm"), 100.0, epsilon = 1e-9);
+        approx::assert_abs_diff_eq!(f64_field(recs[0], "out_x_mm"), 100.0, epsilon = 1e-9);
+        approx::assert_abs_diff_eq!(f64_field(recs[0], "in_cov_xx"), 100.0, epsilon = 1e-9);
+        assert!(f64_field(recs[0], "out_cov_xx") < 100.0);
+        for v in recs[0].fields.values() {
+            assert!(matches!(v, eye_log::Value::F64(_)));
+        }
+    }
+
+    #[test]
+    fn test_logs_filter_reset_at_debug_on_gap() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut f = filter(OneEuroConfig::default());
+            f.apply(pt(0, 0.0, 0.0));
+            f.apply(pt(1_000_000_000, 50.0, 0.0));
+        });
+        let resets = find(&records, "filter reset");
+        assert_eq!(resets.len(), 1);
+        assert_eq!(resets[0].level, eye_log::Level::Debug);
+        assert_eq!(
+            resets[0].fields.get("reason"),
+            Some(&eye_log::Value::Str("gap".to_string()))
+        );
+        assert!((f64_field(resets[0], "dt_s") - 1.0).abs() < 1e-9);
+        approx::assert_abs_diff_eq!(f64_field(resets[0], "reset_after_s"), 0.5, epsilon = 1e-9);
+        let inits = find(&records, "filter initialised");
+        assert_eq!(
+            inits.len(),
+            2,
+            "first sample plus the re-apply after the gap"
+        );
+    }
+
+    #[test]
+    fn test_logs_external_reset_at_debug() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut f = filter(OneEuroConfig::default());
+            f.reset();
+        });
+        let recs = find(&records, "filter reset");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].level, eye_log::Level::Debug);
+        assert_eq!(
+            recs[0].fields.get("reason"),
+            Some(&eye_log::Value::Str("external".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_logs_non_increasing_timestamp_at_warn() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut f = filter(OneEuroConfig::default());
+            f.apply(pt(P30, 0.0, 0.0));
+            f.apply(pt(P30, 0.0, 0.0));
+        });
+        let recs: Vec<_> = records
+            .iter()
+            .filter(|r| r.target == "eye_filter::one_euro" && r.level == eye_log::Level::Warn)
+            .collect();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].fields.get("ts_ns"), Some(&eye_log::Value::U64(P30)));
+        assert_eq!(
+            recs[0].fields.get("prev_ts_ns"),
+            Some(&eye_log::Value::U64(P30))
+        );
+        for v in recs[0].fields.values() {
+            if let eye_log::Value::Str(s) = v {
+                assert!(!s.contains("Timestamp("));
+            }
+        }
+    }
+
+    #[test]
+    fn test_logs_reason_field_uses_vocabulary() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut f = filter(OneEuroConfig::default());
+            f.apply(pt(0, 0.0, 0.0));
+            f.apply(pt(1_000_000_000, 50.0, 0.0));
+            f.reset();
+        });
+        let own: Vec<_> = records
+            .iter()
+            .filter(|r| r.target == "eye_filter::one_euro")
+            .collect();
+        assert!(!own.is_empty());
+        for r in &own {
+            if matches!(r.level, eye_log::Level::Debug | eye_log::Level::Warn) {
+                assert!(
+                    matches!(
+                        r.fields.get(eye_core::log::field::REASON),
+                        Some(eye_log::Value::Str(_))
+                    ),
+                    "{r:?}"
+                );
+            }
+            if r.message == "filter initialised" || r.level == eye_log::Level::Warn {
+                assert!(
+                    matches!(
+                        r.fields.get(eye_core::log::field::TS_NS),
+                        Some(eye_log::Value::U64(_))
+                    ),
+                    "{r:?}"
+                );
+            }
+            assert!(!r.fields.contains_key("timestamp"));
+        }
     }
 
     #[test]

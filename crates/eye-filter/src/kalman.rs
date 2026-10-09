@@ -1,9 +1,10 @@
+use eye_core::log::field;
 use eye_core::stage::{GazeFilter, StageError};
 use eye_core::{GazePoint, Rig, ScreenModel, Timestamp};
 use nalgebra::{Cholesky, Matrix2, Matrix2x4, Matrix4, Point2, Vector2, Vector4};
 
 use crate::FilterError;
-use crate::point::{dt_seconds, with_position};
+use crate::point::{cov_fields, dt_seconds, with_position};
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -116,27 +117,68 @@ impl GazeFilter for KalmanFilter {
         let z = point.mm.coords;
         let r = point.cov_mm + Matrix2::identity() * self.cfg.measurement_floor_mm.powi(2);
         let Some(st) = self.state else {
+            tracing::debug!(
+                { field::REASON } = "first_sample",
+                { field::TS_NS } = point.timestamp.as_nanos(),
+                "filter initialised"
+            );
             return self.init(point, z, r);
         };
         let Some(dt) = dt_seconds(st.t, point.timestamp) else {
-            tracing::warn!(?point.timestamp, "non-increasing gaze timestamp, passing through");
+            tracing::warn!(
+                { field::REASON } = "non_increasing_timestamp",
+                { field::TS_NS } = point.timestamp.as_nanos(),
+                prev_ts_ns = st.t.as_nanos(),
+                "non-increasing gaze timestamp, passing through"
+            );
             return point;
         };
         if dt > self.cfg.reset_after_s {
+            tracing::debug!(
+                { field::REASON } = "gap",
+                dt_s = dt,
+                reset_after_s = self.cfg.reset_after_s,
+                "filter reset"
+            );
             return self.init(point, z, r);
         }
         let (s_pred, p_pred) = predict(&st.s, &st.p, dt, self.cfg.accel_psd);
         let y = z - s_pred.fixed_rows::<2>(0);
         let s_cov = p_pred.fixed_view::<2, 2>(0, 0) + r;
         let Some(chol) = Cholesky::new(s_cov) else {
+            let (s_xx, s_xy, s_yy) = cov_fields(&s_cov);
+            tracing::warn!(
+                { field::REASON } = "cholesky_failed",
+                s_xx,
+                s_xy,
+                s_yy,
+                "innovation covariance not positive definite, re-initialising"
+            );
             return self.init(point, z, r);
         };
         let d2 = y.dot(&chol.solve(&y));
         if d2 > self.cfg.gate_chi2 {
             let outliers = st.outliers + 1;
             if outliers >= self.cfg.reset_after_outliers {
+                tracing::warn!(
+                    { field::REASON } = "outliers",
+                    outliers = u64::from(outliers),
+                    d2,
+                    { field::TS_NS } = point.timestamp.as_nanos(),
+                    "filter reset after consecutive outliers"
+                );
                 return self.init(point, z, r);
             }
+            tracing::debug!(
+                { field::REASON } = "outlier",
+                d2,
+                gate_chi2 = self.cfg.gate_chi2,
+                outliers = u64::from(outliers),
+                reset_after_outliers = u64::from(self.cfg.reset_after_outliers),
+                out_x_mm = s_pred[0],
+                out_y_mm = s_pred[1],
+                "measurement gated"
+            );
             self.state = Some(KfState {
                 t: point.timestamp,
                 s: s_pred,
@@ -150,6 +192,26 @@ impl GazeFilter for KalmanFilter {
         let s_new = s_pred + k * y;
         let i_kh = Matrix4::identity() - k * Matrix2x4::identity();
         let p_new = i_kh * p_pred * i_kh.transpose() + k * r * k.transpose();
+        let (in_cov_xx, in_cov_xy, in_cov_yy) = cov_fields(&point.cov_mm);
+        let (out_cov_xx, out_cov_xy, out_cov_yy) =
+            cov_fields(&p_new.fixed_view::<2, 2>(0, 0).into_owned());
+        tracing::trace!(
+            dt_s = dt,
+            d2,
+            in_x_mm = z.x,
+            in_y_mm = z.y,
+            in_cov_xx,
+            in_cov_xy,
+            in_cov_yy,
+            out_x_mm = s_new[0],
+            out_y_mm = s_new[1],
+            out_cov_xx,
+            out_cov_xy,
+            out_cov_yy,
+            vx_mm_s = s_new[2],
+            vy_mm_s = s_new[3],
+            "filter step"
+        );
         self.state = Some(KfState {
             t: point.timestamp,
             s: s_new,
@@ -161,6 +223,7 @@ impl GazeFilter for KalmanFilter {
 
     fn reset(&mut self) {
         self.state = None;
+        tracing::debug!({ field::REASON } = "external", "filter reset");
     }
 }
 
@@ -373,6 +436,198 @@ mod tests {
         approx::assert_abs_diff_eq!(out2.mm.x, 250.0, epsilon = 1e-9);
         approx::assert_abs_diff_eq!(out2.mm.y, 100.0, epsilon = 1e-9);
         approx::assert_abs_diff_eq!(out2.cov_mm, Matrix2::identity() * 26.0, epsilon = 1e-9);
+    }
+
+    fn find<'a>(records: &'a [eye_log::Record], message: &str) -> Vec<&'a eye_log::Record> {
+        records
+            .iter()
+            .filter(|r| r.target == "eye_filter::kalman" && r.message == message)
+            .collect()
+    }
+
+    fn f64_field(record: &eye_log::Record, name: &str) -> f64 {
+        match record.fields.get(name) {
+            Some(eye_log::Value::F64(v)) => *v,
+            other => panic!("field {name}: {other:?}"),
+        }
+    }
+
+    fn u64_field(record: &eye_log::Record, name: &str) -> u64 {
+        match record.fields.get(name) {
+            Some(eye_log::Value::U64(v)) => *v,
+            other => panic!("field {name}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_logs_filter_initialised_at_debug() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut f = filter(KalmanConfig::default());
+            f.apply(pt_var(0, 100.0, 100.0, 25.0));
+        });
+        let recs = find(&records, "filter initialised");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].level, eye_log::Level::Debug);
+        assert_eq!(
+            recs[0].fields.get("reason"),
+            Some(&eye_log::Value::Str("first_sample".to_string()))
+        );
+        assert_eq!(recs[0].fields.get("ts_ns"), Some(&eye_log::Value::U64(0)));
+    }
+
+    #[test]
+    fn test_logs_filter_step_at_trace() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut f = filter(KalmanConfig::default());
+            f.apply(pt_var(0, 100.0, 100.0, 25.0));
+            f.apply(pt_var(P30, 100.0, 100.0, 25.0));
+        });
+        let recs = find(&records, "filter step");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].level, eye_log::Level::Trace);
+        assert!(f64_field(recs[0], "d2").is_finite());
+        assert!(f64_field(recs[0], "out_cov_xx") < f64_field(recs[0], "in_cov_xx"));
+        assert!(recs[0].fields.contains_key("vx_mm_s"));
+        assert!(recs[0].fields.contains_key("vy_mm_s"));
+    }
+
+    #[test]
+    fn test_logs_filter_reset_at_debug_on_gap() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut f = filter(KalmanConfig::default());
+            f.apply(pt(0, 0.0, 0.0));
+            f.apply(pt(1_000_000_000, 50.0, 0.0));
+        });
+        let resets = find(&records, "filter reset");
+        assert_eq!(resets.len(), 1);
+        assert_eq!(resets[0].level, eye_log::Level::Debug);
+        assert_eq!(
+            resets[0].fields.get("reason"),
+            Some(&eye_log::Value::Str("gap".to_string()))
+        );
+        assert!((f64_field(resets[0], "dt_s") - 1.0).abs() < 1e-9);
+        let inits = find(&records, "filter initialised");
+        assert_eq!(
+            inits.len(),
+            1,
+            "the gap branch calls init() directly, which is event-free"
+        );
+    }
+
+    #[test]
+    fn test_logs_external_reset_at_debug() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut f = filter(KalmanConfig::default());
+            f.reset();
+        });
+        let recs = find(&records, "filter reset");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].level, eye_log::Level::Debug);
+        assert_eq!(
+            recs[0].fields.get("reason"),
+            Some(&eye_log::Value::Str("external".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_logs_non_increasing_timestamp_at_warn() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut f = filter(KalmanConfig::default());
+            f.apply(pt(P30, 0.0, 0.0));
+            f.apply(pt(P30, 0.0, 0.0));
+        });
+        let recs: Vec<_> = records
+            .iter()
+            .filter(|r| r.target == "eye_filter::kalman" && r.level == eye_log::Level::Warn)
+            .collect();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].fields.get("ts_ns"), Some(&eye_log::Value::U64(P30)));
+        assert_eq!(
+            recs[0].fields.get("prev_ts_ns"),
+            Some(&eye_log::Value::U64(P30))
+        );
+        for v in recs[0].fields.values() {
+            if let eye_log::Value::Str(s) = v {
+                assert!(!s.contains("Timestamp("));
+            }
+        }
+    }
+
+    #[test]
+    fn test_logs_measurement_gated_at_debug() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut f = filter(KalmanConfig::default());
+            for k in 0..30u64 {
+                f.apply(pt_var(k * P30, 100.0, 100.0, 25.0));
+            }
+            f.apply(pt_var(30 * P30, 300.0, 100.0, 25.0));
+            f.apply(pt_var(31 * P30, 100.0, 100.0, 25.0));
+            f.apply(pt_var(32 * P30, 300.0, 100.0, 25.0));
+        });
+        let gated = find(&records, "measurement gated");
+        assert_eq!(gated.len(), 2);
+        for rec in &gated {
+            assert_eq!(u64_field(rec, "outliers"), 1);
+            assert!(f64_field(rec, "d2") > 13.82);
+            approx::assert_abs_diff_eq!(f64_field(rec, "gate_chi2"), 13.82, epsilon = 1e-9);
+        }
+        let warns: Vec<_> = records
+            .iter()
+            .filter(|r| r.level == eye_log::Level::Warn)
+            .collect();
+        assert!(warns.is_empty(), "{warns:?}");
+    }
+
+    #[test]
+    fn test_logs_outlier_reset_at_warn() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut f = filter(KalmanConfig::default());
+            for k in 0..30u64 {
+                f.apply(pt_var(k * P30, 100.0, 100.0, 25.0));
+            }
+            f.apply(pt_var(30 * P30, 250.0, 100.0, 25.0));
+            f.apply(pt_var(31 * P30, 250.0, 100.0, 25.0));
+        });
+        let warns: Vec<_> = records
+            .iter()
+            .filter(|r| {
+                r.target == "eye_filter::kalman"
+                    && r.message == "filter reset after consecutive outliers"
+            })
+            .collect();
+        assert_eq!(warns.len(), 1);
+        assert_eq!(warns[0].level, eye_log::Level::Warn);
+        assert_eq!(u64_field(warns[0], "outliers"), 2);
+        let gated = find(&records, "measurement gated");
+        assert_eq!(gated.len(), 1);
+    }
+
+    /// `s_cov = p_pred[0:2,0:2] + r`, and `predict` always adds
+    /// `Q_pos = dt^3/3 * accel_psd * I` (about 0.25 for `dt = 1/30`,
+    /// `accel_psd = 2e4`) to `p_pred`, so `s_cov` stays positive definite
+    /// even with `measurement_floor_mm = 0.0` and a zero-variance point.
+    /// This asserts that derivation: no `cholesky_failed` record is ever
+    /// produced on a converged, finite run.
+    #[test]
+    fn test_logs_cholesky_failed_at_warn() {
+        let cfg = KalmanConfig {
+            measurement_floor_mm: 0.0,
+            ..KalmanConfig::default()
+        };
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut f = filter(cfg);
+            for k in 0..60u64 {
+                f.apply(pt_var(k * P30, 100.0, 100.0, 0.0));
+            }
+        });
+        let warns: Vec<_> = records
+            .iter()
+            .filter(|r| r.target == "eye_filter::kalman" && r.level == eye_log::Level::Warn)
+            .collect();
+        assert!(
+            warns.is_empty(),
+            "cholesky_failed should be unreachable with finite inputs: {warns:?}"
+        );
     }
 
     #[test]

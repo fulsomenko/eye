@@ -8,6 +8,7 @@
 
 use std::collections::VecDeque;
 
+use eye_core::log::field;
 use eye_core::{GazePoint, Timestamp};
 use nalgebra::{Point2, Vector2};
 
@@ -96,6 +97,12 @@ impl IvtClassifier {
         if let Some(&(last, _)) = self.history.back()
             && dt_seconds(last, t).is_none()
         {
+            tracing::warn!(
+                { field::REASON } = "non_increasing_timestamp",
+                { field::TS_NS } = t.as_nanos(),
+                prev_ts_ns = last.as_nanos(),
+                "non-increasing gaze timestamp, history cleared"
+            );
             self.history.clear();
             return EyeMovement::Unknown;
         }
@@ -111,21 +118,46 @@ impl IvtClassifier {
         self.history.push_back((t, point.mm));
         let (t0, p0) = self.history[0];
         let Some(dt) = dt_seconds(t0, t) else {
+            tracing::trace!(
+                label = "unknown",
+                { field::REASON } = "insufficient_history",
+                history_s = 0.0,
+                "sample labelled"
+            );
             return EyeMovement::Unknown;
         };
         if dt < window / 2.0 {
+            tracing::trace!(
+                label = "unknown",
+                { field::REASON } = "insufficient_history",
+                history_s = dt,
+                "sample labelled"
+            );
             return EyeMovement::Unknown;
         }
         let deg_s = ((point.mm - p0).norm() / self.cfg.viewing_distance_mm).to_degrees() / dt;
-        if deg_s > self.cfg.velocity_threshold_deg_s {
+        let movement = if deg_s > self.cfg.velocity_threshold_deg_s {
             EyeMovement::Saccade
         } else {
             EyeMovement::Fixation
-        }
+        };
+        tracing::trace!(
+            label = if movement == EyeMovement::Saccade {
+                "saccade"
+            } else {
+                "fixation"
+            },
+            velocity_deg_s = deg_s,
+            threshold_deg_s = self.cfg.velocity_threshold_deg_s,
+            history_s = dt,
+            "sample labelled"
+        );
+        movement
     }
 
     pub fn reset(&mut self) {
         self.history.clear();
+        tracing::debug!({ field::REASON } = "external", "classifier reset");
     }
 }
 
@@ -177,6 +209,7 @@ pub fn fixations(points: &[GazePoint], cfg: &IvtConfig) -> Result<Vec<Fixation>,
             samples: n,
         });
     }
+    let num_candidates = candidates.len();
 
     let mut merged: Vec<Fixation> = Vec::new();
     for f in candidates {
@@ -193,14 +226,41 @@ pub fn fixations(points: &[GazePoint], cfg: &IvtConfig) -> Result<Vec<Fixation>,
                 );
                 last.samples = n;
                 last.end = f.end;
+                tracing::debug!(
+                    { field::REASON } = "near",
+                    gap_ms,
+                    angle_deg,
+                    samples = last.samples as u64,
+                    "fixations merged"
+                );
                 continue;
             }
         }
         merged.push(f);
     }
 
-    merged.retain(|f| dt_seconds(f.start, f.end).unwrap_or(0.0) * 1000.0 >= cfg.min_fixation_ms);
-    Ok(merged)
+    let mut result = Vec::with_capacity(merged.len());
+    for f in merged {
+        let duration_ms = dt_seconds(f.start, f.end).unwrap_or(0.0) * 1000.0;
+        if duration_ms >= cfg.min_fixation_ms {
+            result.push(f);
+        } else {
+            tracing::debug!(
+                { field::REASON } = "too_short",
+                duration_ms,
+                min_fixation_ms = cfg.min_fixation_ms,
+                "fixation discarded"
+            );
+        }
+    }
+
+    tracing::info!(
+        points = points.len() as u64,
+        candidates = num_candidates as u64,
+        fixations = result.len() as u64,
+        "fixations labelled"
+    );
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -459,5 +519,239 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn find<'a>(records: &'a [eye_log::Record], message: &str) -> Vec<&'a eye_log::Record> {
+        records
+            .iter()
+            .filter(|r| r.target == "eye_filter::fixation" && r.message == message)
+            .collect()
+    }
+
+    fn f64_field(record: &eye_log::Record, name: &str) -> f64 {
+        match record.fields.get(name) {
+            Some(eye_log::Value::F64(v)) => *v,
+            other => panic!("field {name}: {other:?}"),
+        }
+    }
+
+    fn u64_field(record: &eye_log::Record, name: &str) -> u64 {
+        match record.fields.get(name) {
+            Some(eye_log::Value::U64(v)) => *v,
+            other => panic!("field {name}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_logs_sample_labelled_at_trace() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut c = classifier(IvtConfig::default());
+            c.classify(&pt(0, 100.0, 100.0));
+            c.classify(&pt(P30, 100.0, 100.0));
+            c.classify(&pt(2 * P30, 100.0, 100.0));
+        });
+        let recs = find(&records, "sample labelled");
+        assert_eq!(recs.len(), 3);
+        for r in &recs {
+            assert_eq!(r.level, eye_log::Level::Trace);
+        }
+        assert_eq!(
+            recs[0].fields.get("label"),
+            Some(&eye_log::Value::Str("unknown".to_string()))
+        );
+        assert_eq!(
+            recs[0].fields.get("reason"),
+            Some(&eye_log::Value::Str("insufficient_history".to_string()))
+        );
+        approx::assert_abs_diff_eq!(f64_field(recs[0], "history_s"), 0.0, epsilon = 1e-9);
+
+        assert_eq!(
+            recs[1].fields.get("label"),
+            Some(&eye_log::Value::Str("unknown".to_string()))
+        );
+        assert_eq!(
+            recs[1].fields.get("reason"),
+            Some(&eye_log::Value::Str("insufficient_history".to_string()))
+        );
+        assert!((f64_field(recs[1], "history_s") - P30 as f64 * 1e-9).abs() < 1e-9);
+
+        assert_eq!(
+            recs[2].fields.get("label"),
+            Some(&eye_log::Value::Str("fixation".to_string()))
+        );
+        assert!(recs[2].fields.contains_key("velocity_deg_s"));
+        approx::assert_abs_diff_eq!(f64_field(recs[2], "threshold_deg_s"), 30.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_logs_non_increasing_timestamp_at_warn() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut c = classifier(IvtConfig::default());
+            for k in 0..5u64 {
+                c.classify(&pt(k * P30, 100.0, 100.0));
+            }
+            c.classify(&pt(4 * P30, 999.0, 999.0));
+        });
+        let recs: Vec<_> = records
+            .iter()
+            .filter(|r| r.target == "eye_filter::fixation" && r.level == eye_log::Level::Warn)
+            .collect();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].fields.get("prev_ts_ns"),
+            Some(&eye_log::Value::U64(4 * P30))
+        );
+    }
+
+    #[test]
+    fn test_logs_external_reset_at_debug() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut c = classifier(IvtConfig::default());
+            c.classify(&pt(0, 100.0, 100.0));
+            c.reset();
+        });
+        let recs = find(&records, "classifier reset");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].level, eye_log::Level::Debug);
+        assert_eq!(
+            recs[0].fields.get("reason"),
+            Some(&eye_log::Value::Str("external".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_logs_fixations_labelled_at_info() {
+        let a = (100.0, 100.0);
+        let b = (200.0, 100.0);
+        let c = (200.0, 0.0);
+        let segments = [
+            (0.0, 0.3, a, a),
+            (0.3, 0.34, a, b),
+            (0.34, 0.64, b, b),
+            (0.64, 0.68, b, c),
+            (0.68, 1.0, c, c),
+        ];
+        let points = path(&segments, 30, 4, 1.0);
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::INFO, || {
+            fixations(&points, &IvtConfig::default()).unwrap();
+        });
+        let own: Vec<_> = records
+            .iter()
+            .filter(|r| r.target == "eye_filter::fixation")
+            .collect();
+        for r in &own {
+            assert_eq!(r.level, eye_log::Level::Info, "{r:?}");
+        }
+        let recs = find(&records, "fixations labelled");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(u64_field(recs[0], "points"), 30);
+        assert_eq!(u64_field(recs[0], "candidates"), 3);
+        assert_eq!(u64_field(recs[0], "fixations"), 3);
+    }
+
+    /// 32 points: `x = 100.0` for `k < 12`, a 200 mm spike at `k == 12`, `140.0`
+    /// for `13..=18` (a 40 mm step from the 100.0 baseline), a second spike at
+    /// `k == 19`, then `100.0`. The middle
+    /// candidate run (`k = 16..=18`, 66.7 ms) is far enough from its
+    /// neighbours (4.58 deg at 500 mm) that it is never merged, so
+    /// `min_fixation_ms = 100.0` discards it on its own.
+    fn discard_fixture() -> Vec<GazePoint> {
+        (0..32u64)
+            .map(|k| {
+                let x = match k {
+                    0..=11 => 100.0,
+                    12 => 300.0,
+                    13..=18 => 140.0,
+                    19 => 300.0,
+                    _ => 100.0,
+                };
+                pt_var(k * P30, x, 100.0, 1.0)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_logs_fixation_discarded_at_debug() {
+        let points = discard_fixture();
+        let (result, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            fixations(&points, &IvtConfig::default()).unwrap()
+        });
+        assert_eq!(result.len(), 2, "{result:?}");
+        let recs = find(&records, "fixation discarded");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].level, eye_log::Level::Debug);
+        assert_eq!(
+            recs[0].fields.get("reason"),
+            Some(&eye_log::Value::Str("too_short".to_string()))
+        );
+        assert!((f64_field(recs[0], "duration_ms") - 2.0 * P30 as f64 * 1e-6).abs() < 1e-6);
+        approx::assert_abs_diff_eq!(f64_field(recs[0], "min_fixation_ms"), 100.0, epsilon = 1e-9);
+        assert!(find(&records, "fixations merged").is_empty());
+        let info = find(&records, "fixations labelled");
+        assert_eq!(info.len(), 1);
+        assert_eq!(u64_field(info[0], "candidates"), 3);
+        assert_eq!(u64_field(info[0], "fixations"), 2);
+    }
+
+    /// 24 points, no noise: `x = 100.0` for `k < 12`, `104.36` after, with a
+    /// 200 mm spike at `k == 12`. This yields three candidate fixations
+    /// (`k=2..=11`, `13..=14`, `16..=23`) close enough (<= 1 deg, <= 150 ms
+    /// gap) to merge pairwise into one.
+    fn merge_fixture() -> Vec<GazePoint> {
+        (0..24u64)
+            .map(|k| {
+                let base_x = if k < 12 { 100.0 } else { 100.0 + 4.36 };
+                let x = if k == 12 { base_x + 200.0 } else { base_x };
+                pt_var(k * P30, x, 100.0, 1.0)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_logs_fixations_merged_at_debug() {
+        let points = merge_fixture();
+        let (result, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            fixations(&points, &IvtConfig::default()).unwrap()
+        });
+        assert_eq!(result.len(), 1, "{result:?}");
+        let recs = find(&records, "fixations merged");
+        assert_eq!(recs.len(), 2);
+        for r in &recs {
+            assert_eq!(r.level, eye_log::Level::Debug);
+            assert!((f64_field(r, "gap_ms") - 2.0 * P30 as f64 * 1e-6).abs() < 1e-6);
+            assert!(f64_field(r, "angle_deg") <= 1.0);
+        }
+        assert_eq!(u64_field(recs[0], "samples"), 12);
+        assert_eq!(u64_field(recs[1], "samples"), 20);
+        assert_eq!(u64_field(recs[1], "samples"), result[0].samples as u64);
+        let info = find(&records, "fixations labelled");
+        assert_eq!(info.len(), 1);
+        assert_eq!(u64_field(info[0], "candidates"), 3);
+        assert_eq!(u64_field(info[0], "fixations"), 1);
+    }
+
+    #[test]
+    fn test_logs_reason_field_uses_vocabulary() {
+        let points = discard_fixture();
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            fixations(&points, &IvtConfig::default()).unwrap();
+        });
+        let own: Vec<_> = records
+            .iter()
+            .filter(|r| r.target == "eye_filter::fixation")
+            .collect();
+        assert!(!own.is_empty());
+        for r in &own {
+            if matches!(r.level, eye_log::Level::Debug | eye_log::Level::Warn) {
+                assert!(
+                    matches!(
+                        r.fields.get(eye_core::log::field::REASON),
+                        Some(eye_log::Value::Str(_))
+                    ),
+                    "{r:?}"
+                );
+            }
+            assert!(!r.fields.contains_key("timestamp"));
+        }
     }
 }
