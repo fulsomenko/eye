@@ -4,6 +4,8 @@ use crossbeam_channel::Receiver;
 use eye::config::{OutputConfig, OutputMode};
 use eye::registry::Registry;
 use eye::tracker::{Tracker, TrackerStats};
+#[cfg(test)]
+use eye_calibration::correction::Provenance;
 use eye_calibration::correction::{UserProfile, rig_fingerprint};
 use eye_calibration::store::ProfileStore;
 use eye_core::stage::GazeCorrection;
@@ -427,6 +429,8 @@ mod tests {
             rig_fingerprint: "0000".to_string(),
             estimator: "ir-pupil".to_string(),
             eyes: BTreeMap::new(),
+            calibration_pose: None,
+            provenance: Provenance::default(),
         };
         store
             .save_profile("default", &profile)

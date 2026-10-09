@@ -3,11 +3,13 @@ use std::collections::{BTreeMap, HashMap};
 use eye_core::log::field;
 use eye_core::{GazeRay, Rig};
 use eye_geometry::angles::yaw_pitch_from_direction;
-use nalgebra::{Cholesky, Matrix2, Point2, Point3, SMatrix, SVector, Unit, Vector2};
+use nalgebra::{
+    Cholesky, Matrix2, Point2, Point3, Quaternion, SMatrix, SVector, Unit, UnitQuaternion, Vector2,
+};
 
 use crate::correction::{
-    AngularCorrection, CorrectionModel, EyeKey, UserProfile, design, design_quad, design12,
-    eye_label,
+    AngularCorrection, CalibrationPose, CorrectionModel, EyeKey, Provenance, UserProfile, design,
+    design_quad, design12, eye_label,
 };
 use crate::error::CalibrationError;
 
@@ -17,7 +19,7 @@ pub struct FitSample {
     pub target_mm: Point2<f64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FitConfig {
     pub sample_outlier_mads: f64,
@@ -61,6 +63,7 @@ pub struct ProfileMeta {
     pub name: String,
     pub created_unix_s: u64,
     pub estimator: String,
+    pub provenance: Provenance,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +170,7 @@ impl DotSessionFit {
         cfg: &FitConfig,
         meta: ProfileMeta,
     ) -> Result<FitOutcome, CalibrationError> {
+        let calibration_pose = calibration_pose(samples);
         let model_override = cfg.model_override.or_else(|| {
             samples
                 .iter()
@@ -643,9 +647,55 @@ impl DotSessionFit {
                 rig_fingerprint,
                 estimator: meta.estimator,
                 eyes,
+                calibration_pose: Some(calibration_pose),
+                provenance: meta.provenance,
             },
             reports,
         })
+    }
+}
+
+/// Mean origin per eye over ALL input samples; quaternion mean over the samples that carry a
+/// pose, with each quaternion sign-aligned to the first so antipodal representations do not
+/// cancel.
+fn calibration_pose(samples: &[FitSample]) -> CalibrationPose {
+    let mut origin_sum: BTreeMap<EyeKey, ([f64; 3], u32)> = BTreeMap::new();
+    for s in samples {
+        let e = origin_sum
+            .entry(EyeKey::from(s.ray.side))
+            .or_insert(([0.0; 3], 0));
+        for k in 0..3 {
+            e.0[k] += s.ray.origin[k];
+        }
+        e.1 += 1;
+    }
+    let eye_origin_mm = origin_sum
+        .into_iter()
+        .map(|(k, (sum, n))| (k, sum.map(|v| v / f64::from(n))))
+        .collect();
+
+    let mut first: Option<Quaternion<f64>> = None;
+    let mut q_sum = nalgebra::Vector4::<f64>::zeros();
+    let mut with_pose = 0u32;
+    for q in samples.iter().filter_map(|s| s.ray.head_rotation) {
+        let q0 = *first.get_or_insert(*q);
+        let sign = if q.coords.dot(&q0.coords) < 0.0 {
+            -1.0
+        } else {
+            1.0
+        };
+        q_sum += sign * q.coords;
+        with_pose += 1;
+    }
+    let head_rotation = (with_pose > 0).then(|| {
+        let mean = UnitQuaternion::from_quaternion(Quaternion::from(q_sum));
+        [mean.i, mean.j, mean.k, mean.w]
+    });
+    CalibrationPose {
+        head_rotation,
+        samples_with_head_pose: with_pose,
+        samples_total: samples.len() as u32,
+        eye_origin_mm,
     }
 }
 
@@ -2069,5 +2119,139 @@ mod tests {
                 assert_eq!(k, iterations.len() - 1, "converged before the last record");
             }
         }
+    }
+
+    fn pose_ray(
+        side: Option<Side>,
+        origin: Point3<f64>,
+        head_rotation: Option<UnitQuaternion<f64>>,
+    ) -> GazeRay {
+        GazeRay {
+            side,
+            timestamp: eye_core::Timestamp::from_nanos(0),
+            origin,
+            direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
+            angular_cov: Matrix2::identity() * 1e-4,
+            origin_cov: Matrix3::identity(),
+            head_rotation,
+        }
+    }
+
+    #[test]
+    fn test_calibration_pose_mean_origin_and_rotation() {
+        let rot = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), 10.0_f64.to_radians());
+        let origins = [
+            Point3::new(145.0, 75.0, -500.0),
+            Point3::new(155.0, 85.0, -500.0),
+        ];
+        let target_mm = Point2::new(150.0, 80.0);
+        let mut samples = Vec::new();
+        for &origin in &origins {
+            samples.push(FitSample {
+                ray: pose_ray(Some(Side::Right), origin, Some(rot)),
+                target_mm,
+            });
+            samples.push(FitSample {
+                ray: pose_ray(Some(Side::Right), origin, None),
+                target_mm,
+            });
+        }
+
+        let pose = calibration_pose(&samples);
+        assert_eq!(pose.samples_total, 4);
+        assert_eq!(pose.samples_with_head_pose, 2);
+        let origin_mm = pose.eye_origin_mm[&EyeKey::Right];
+        assert_abs_diff_eq!(origin_mm[0], 150.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(origin_mm[1], 80.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(origin_mm[2], -500.0, epsilon = 1e-9);
+        let coords = pose.head_rotation.expect("pose recorded");
+        assert_abs_diff_eq!(coords[0], rot.i, epsilon = 1e-9);
+        assert_abs_diff_eq!(coords[1], rot.j, epsilon = 1e-9);
+        assert_abs_diff_eq!(coords[2], rot.k, epsilon = 1e-9);
+        assert_abs_diff_eq!(coords[3], rot.w, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_calibration_pose_without_head_pose_records_none_rotation() {
+        let target_mm = Point2::new(150.0, 80.0);
+        let origin = Point3::new(150.0, 80.0, -500.0);
+        let samples = vec![
+            FitSample {
+                ray: pose_ray(Some(Side::Right), origin, None),
+                target_mm,
+            },
+            FitSample {
+                ray: pose_ray(Some(Side::Right), origin, None),
+                target_mm,
+            },
+        ];
+
+        let pose = calibration_pose(&samples);
+        assert_eq!(pose.head_rotation, None);
+        assert_eq!(pose.samples_with_head_pose, 0);
+        assert_eq!(pose.samples_total, 2);
+    }
+
+    #[test]
+    fn test_fit_records_calibration_pose_mean_origin_and_rotation() {
+        let rot = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), 10.0_f64.to_radians());
+        let mut samples = generate_session(&SessionConfig::default());
+        for (i, s) in samples.iter_mut().enumerate() {
+            if i % 2 == 0 {
+                s.ray.head_rotation = Some(rot);
+            }
+        }
+        let posed = samples
+            .iter()
+            .filter(|s| s.ray.head_rotation.is_some())
+            .count();
+        let expected_pose = calibration_pose(&samples);
+
+        let meta = ProfileMeta {
+            provenance: Provenance {
+                session_id: Some("sess-1".to_string()),
+                ..Provenance::default()
+            },
+            ..ProfileMeta::default()
+        };
+        let outcome = DotSessionFit::fit_with(
+            &samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            meta.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.profile.calibration_pose,
+            Some(expected_pose.clone())
+        );
+        assert_eq!(expected_pose.samples_total as usize, samples.len());
+        assert_eq!(expected_pose.samples_with_head_pose as usize, posed);
+        let coords = expected_pose.head_rotation.expect("pose recorded");
+        assert_abs_diff_eq!(coords[0], rot.i, epsilon = 1e-9);
+        assert_abs_diff_eq!(coords[1], rot.j, epsilon = 1e-9);
+        assert_abs_diff_eq!(coords[2], rot.k, epsilon = 1e-9);
+        assert_abs_diff_eq!(coords[3], rot.w, epsilon = 1e-9);
+        assert_eq!(outcome.profile.provenance, meta.provenance);
+    }
+
+    #[test]
+    fn test_fit_without_head_pose_records_none_rotation() {
+        let samples = generate_session(&SessionConfig::default());
+        assert!(samples.iter().all(|s| s.ray.head_rotation.is_none()));
+
+        let outcome = DotSessionFit::fit_with(
+            &samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap();
+
+        let pose = outcome.profile.calibration_pose.expect("pose recorded");
+        assert_eq!(pose.head_rotation, None);
+        assert_eq!(pose.samples_with_head_pose, 0);
+        assert_eq!(pose.samples_total as usize, samples.len());
     }
 }

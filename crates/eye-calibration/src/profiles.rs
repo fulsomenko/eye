@@ -190,6 +190,8 @@ mod tests {
             rig_fingerprint: "0123456789abcdef".into(),
             estimator: "ir-pupil".into(),
             eyes,
+            calibration_pose: None,
+            provenance: crate::correction::Provenance::default(),
         }
     }
 
@@ -312,6 +314,28 @@ mod tests {
         assert_eq!(rec.level, eye_log::Level::Debug);
         assert_eq!(rec.fields.get("count"), Some(&eye_log::Value::U64(1)));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_profile_without_new_blocks_loads_with_defaults() {
+        let dir = test_dir("no-new-blocks");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.toml");
+        std::fs::write(
+            &path,
+            r#"version = 1
+name = "max"
+created_unix_s = 1700000000
+rig_fingerprint = "deadbeefcafef00d"
+estimator = "ir-pupil"
+[eyes]
+"#,
+        )
+        .unwrap();
+        let profile = read_profile(&path).unwrap();
+        assert_eq!(profile.calibration_pose, None);
+        assert_eq!(profile.provenance, crate::correction::Provenance::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

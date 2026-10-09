@@ -12,7 +12,7 @@ use eye_bench::calibration::{
 };
 use eye_bench::metrics::{MetricParams, SessionMetrics, compute};
 use eye_bench::runner::replay_session;
-use eye_calibration::correction::UserProfile;
+use eye_calibration::correction::{Provenance, UserProfile};
 use eye_calibration::protocol::{ProtocolConfig, TargetProtocol, TargetTiming};
 use eye_calibration::store::ProfileStore;
 use eye_calibration::user_fit::{
@@ -613,6 +613,7 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         name: args.profile.clone(),
         created_unix_s: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         estimator: config.estimate.kind.clone(),
+        provenance: Provenance::default(),
     };
     if let Some(location) = recording.location() {
         let shutdown_rx = shutdown::install()?;
@@ -892,6 +893,7 @@ mod tests {
             name: "alice".to_string(),
             created_unix_s: 1_791_409_623,
             estimator: "test-kappa-ray".to_string(),
+            provenance: Provenance::default(),
         };
         let result = fit_recording(
             &session_dir,
@@ -990,6 +992,8 @@ mod tests {
             rig_fingerprint: String::new(),
             estimator: String::new(),
             eyes: std::collections::BTreeMap::new(),
+            calibration_pose: None,
+            provenance: Provenance::default(),
         }
     }
 

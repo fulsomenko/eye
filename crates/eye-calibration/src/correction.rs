@@ -73,6 +73,31 @@ pub enum CorrectionModel {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CalibrationPose {
+    /// Normalised mean of the fitted samples' head rotations, unit quaternion `[x, y, z, w]`
+    /// (screen frame); `None` when no fitted sample carried a pose.
+    pub head_rotation: Option<[f64; 4]>,
+    pub samples_with_head_pose: u32,
+    pub samples_total: u32,
+    /// Mean ray origin per eye, screen frame mm.
+    pub eye_origin_mm: BTreeMap<EyeKey, [f64; 3]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Provenance {
+    pub session_id: Option<String>,
+    pub git_rev: Option<String>,
+    /// `text_fingerprint` of the serialized `[estimate]` table the rays were produced with.
+    pub estimator_fingerprint: Option<String>,
+    pub protocol: Option<eye_core::session::ProtocolConfig>,
+    pub fit: Option<crate::user_fit::FitConfig>,
+    /// Bench leave-one-target-out mean angular error on the fitted session, degrees.
+    pub expected_loto_mean_deg: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserProfile {
     pub version: u32,
     pub name: String,
@@ -80,6 +105,10 @@ pub struct UserProfile {
     pub rig_fingerprint: String,
     pub estimator: String,
     pub eyes: BTreeMap<EyeKey, AngularCorrection>,
+    #[serde(default)]
+    pub calibration_pose: Option<CalibrationPose>,
+    #[serde(default)]
+    pub provenance: Provenance,
 }
 
 pub(crate) fn design(o: &Vector2<f64>) -> SMatrix<f64, 2, 6> {
@@ -255,6 +284,12 @@ pub fn rig_fingerprint(rig: &Rig) -> String {
     format!("{hash:016x}")
 }
 
+pub fn text_fingerprint(text: &str) -> String {
+    let mut hash = FNV_OFFSET;
+    fnv_feed_bytes(&mut hash, text.as_bytes());
+    format!("{hash:016x}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -322,6 +357,8 @@ mod tests {
             rig_fingerprint: "deadbeefcafef00d".into(),
             estimator: "ir-pupil".into(),
             eyes,
+            calibration_pose: None,
+            provenance: Provenance::default(),
         }
     }
 
@@ -435,6 +472,8 @@ mod tests {
             rig_fingerprint: String::new(),
             estimator: "ir-pupil".into(),
             eyes,
+            calibration_pose: None,
+            provenance: Provenance::default(),
         };
         let ray = straight_ray(Some(eye_core::Side::Right));
         let corrected = profile.correct(&ray);
@@ -469,6 +508,8 @@ mod tests {
             rig_fingerprint: String::new(),
             estimator: "ir-pupil".into(),
             eyes,
+            calibration_pose: None,
+            provenance: Provenance::default(),
         };
         let mut ray = straight_ray(Some(eye_core::Side::Right));
         ray.angular_cov = Matrix2::identity() * 1e-4;
@@ -496,7 +537,21 @@ mod tests {
 
     #[test]
     fn test_profile_toml_round_trip() {
-        let profile = fixture_profile();
+        let mut profile = fixture_profile();
+        profile.calibration_pose = Some(CalibrationPose {
+            head_rotation: Some([0.0, 0.0, 0.0, 1.0]),
+            samples_with_head_pose: 42,
+            samples_total: 50,
+            eye_origin_mm: BTreeMap::from([(EyeKey::Right, [155.0, 85.0, -500.0])]),
+        });
+        profile.provenance = Provenance {
+            session_id: Some("sess-1".into()),
+            git_rev: Some("abc123".into()),
+            estimator_fingerprint: Some(text_fingerprint("kind = \"fused\"\n")),
+            protocol: None,
+            fit: None,
+            expected_loto_mean_deg: Some(0.42),
+        };
         let text = toml::to_string(&profile).unwrap();
         let back: UserProfile = toml::from_str(&text).unwrap();
         assert_eq!(back, profile);
@@ -504,6 +559,13 @@ mod tests {
         let mut with_extra = text;
         with_extra.push_str("\nfoo = 1\n");
         assert!(toml::from_str::<UserProfile>(&with_extra).is_err());
+    }
+
+    #[test]
+    fn test_text_fingerprint_stable_and_sensitive() {
+        const FIXTURE: &str = "8a277ef72b61e921";
+        assert_eq!(text_fingerprint("kind = \"fused\"\n"), FIXTURE);
+        assert_ne!(text_fingerprint("kind = \"fusee\"\n"), FIXTURE);
     }
 
     fn single_eye_profile(model: CorrectionModel, theta: [f64; 6]) -> UserProfile {
@@ -528,6 +590,8 @@ mod tests {
             rig_fingerprint: String::new(),
             estimator: "landmark".into(),
             eyes,
+            calibration_pose: None,
+            provenance: Provenance::default(),
         }
     }
 
@@ -606,6 +670,8 @@ mod tests {
             rig_fingerprint: String::new(),
             estimator: "landmark".into(),
             eyes,
+            calibration_pose: None,
+            provenance: Provenance::default(),
         };
 
         let mut ray = straight_ray(Some(eye_core::Side::Right));
