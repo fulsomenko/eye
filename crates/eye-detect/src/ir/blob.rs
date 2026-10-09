@@ -1,4 +1,5 @@
 use eye_core::image::GrayView;
+use eye_core::log::field;
 use nalgebra::Point2;
 
 use crate::image::Roi;
@@ -15,6 +16,16 @@ pub(crate) struct Candidate {
     pub outer_mean: f64,
     pub contrast: f64,
     pub aspect: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct GateCounts {
+    pub area: u64,
+    pub aspect: u64,
+    pub contrast: u64,
+    pub iris_ratio: u64,
+    pub truncated: bool,
+    pub components_total: u64,
 }
 
 fn window_reduce_rows(data: &[u8], width: u32, height: u32, half: i64, max: bool) -> Vec<u8> {
@@ -168,7 +179,10 @@ fn annulus_mean(diff: GrayView<'_>, centroid: Point2<f64>, r_min: f64, r_max: f6
 /// Threshold, connected components and the per-blob filters of the IR pupil algorithm (steps 2
 /// to 5). Returns the surviving candidates, sorted by peak value before the area/aspect/contrast
 /// filters are applied.
-pub(crate) fn candidates(diff: GrayView<'_>, options: &IrClassicOptions) -> Vec<Candidate> {
+pub(crate) fn candidates(
+    diff: GrayView<'_>,
+    options: &IrClassicOptions,
+) -> (Vec<Candidate>, GateCounts) {
     let (w, h) = (diff.width(), diff.height());
     let bg = opening(diff, options.background_size);
     let th: Vec<u8> = diff
@@ -196,8 +210,27 @@ pub(crate) fn candidates(diff: GrayView<'_>, options: &IrClassicOptions) -> Vec<
         (0u64, 0u64, 0u64, 0u64);
     for (pixels, peak) in components {
         let area = pixels.len() as u32;
+
+        let n = f64::from(area);
+        let (mut sx, mut sy) = (0.0, 0.0);
+        for &idx in &pixels {
+            let (x, y) = (idx as u32 % w, idx as u32 / w);
+            sx += f64::from(x) + 0.5;
+            sy += f64::from(y) + 0.5;
+        }
+        let centroid = Point2::new(sx / n, sy / n);
+
         if area < options.pupil_area_px[0] || area > options.pupil_area_px[1] {
             rejected_area += 1;
+            tracing::trace!(
+                { field::REASON } = "area",
+                x = centroid.x,
+                y = centroid.y,
+                value = f64::from(area),
+                min = f64::from(options.pupil_area_px[0]),
+                max = f64::from(options.pupil_area_px[1]),
+                "component rejected"
+            );
             continue;
         }
 
@@ -216,15 +249,6 @@ pub(crate) fn candidates(diff: GrayView<'_>, options: &IrClassicOptions) -> Vec<
             height: max_y - min_y + 1,
         };
 
-        let n = f64::from(area);
-        let (mut sx, mut sy) = (0.0, 0.0);
-        for &idx in &pixels {
-            let (x, y) = (idx as u32 % w, idx as u32 / w);
-            sx += f64::from(x) + 0.5;
-            sy += f64::from(y) + 0.5;
-        }
-        let centroid = Point2::new(sx / n, sy / n);
-
         let (mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0);
         for &idx in &pixels {
             let (x, y) = (idx as u32 % w, idx as u32 / w);
@@ -237,6 +261,14 @@ pub(crate) fn candidates(diff: GrayView<'_>, options: &IrClassicOptions) -> Vec<
         let aspect = covariance_aspect(sxx / n, syy / n, sxy / n);
         if aspect < options.min_aspect {
             rejected_aspect += 1;
+            tracing::trace!(
+                { field::REASON } = "aspect",
+                x = centroid.x,
+                y = centroid.y,
+                value = aspect,
+                min = options.min_aspect,
+                "component rejected"
+            );
             continue;
         }
 
@@ -252,11 +284,27 @@ pub(crate) fn candidates(diff: GrayView<'_>, options: &IrClassicOptions) -> Vec<
         let contrast = blob_mean / iris_mean;
         if contrast < options.min_pupil_contrast {
             rejected_contrast += 1;
+            tracing::trace!(
+                { field::REASON } = "contrast",
+                x = centroid.x,
+                y = centroid.y,
+                value = contrast,
+                min = options.min_pupil_contrast,
+                "component rejected"
+            );
             continue;
         }
         let iris_ratio = iris_mean / outer_mean;
         if iris_ratio > options.max_iris_ratio {
             rejected_iris_ratio += 1;
+            tracing::trace!(
+                { field::REASON } = "iris_ratio",
+                x = centroid.x,
+                y = centroid.y,
+                value = iris_ratio,
+                max = options.max_iris_ratio,
+                "component rejected"
+            );
             continue;
         }
 
@@ -283,19 +331,28 @@ pub(crate) fn candidates(diff: GrayView<'_>, options: &IrClassicOptions) -> Vec<
         });
     }
 
+    let counts = GateCounts {
+        area: rejected_area,
+        aspect: rejected_aspect,
+        contrast: rejected_contrast,
+        iris_ratio: rejected_iris_ratio,
+        truncated,
+        components_total,
+    };
+
     tracing::debug!(
         threshold = u64::from(t),
-        components = components_total,
-        truncated,
-        rejected_area,
-        rejected_aspect,
-        rejected_contrast,
-        rejected_iris_ratio,
+        components = counts.components_total,
+        truncated = counts.truncated,
+        rejected_area = counts.area,
+        rejected_aspect = counts.aspect,
+        rejected_contrast = counts.contrast,
+        rejected_iris_ratio = counts.iris_ratio,
         accepted = out.len() as u64,
         "blob candidates"
     );
 
-    out
+    (out, counts)
 }
 
 #[cfg(test)]
@@ -308,7 +365,7 @@ mod tests {
         let scene = SyntheticIr::default_scene();
         let (lit, dark) = scene.render();
         let diff = crate::image::saturating_diff(lit.view(), dark.view()).unwrap();
-        let cands = candidates(diff.view(), &IrClassicOptions::default());
+        let (cands, _counts) = candidates(diff.view(), &IrClassicOptions::default());
         assert_eq!(cands.len(), 2);
     }
 
@@ -320,7 +377,7 @@ mod tests {
         let scene = SyntheticIr::default_scene();
         let (lit, dark) = scene.render();
         let diff = crate::image::saturating_diff(lit.view(), dark.view()).unwrap();
-        let (cands, logs) = capture_logs(tracing::Level::TRACE, || {
+        let ((cands, _counts), logs) = capture_logs(tracing::Level::TRACE, || {
             candidates(diff.view(), &IrClassicOptions::default())
         });
         assert_eq!(cands.len(), 2);
@@ -363,5 +420,35 @@ mod tests {
                 other => panic!("unexpected field types: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn test_logs_component_rejected_at_trace_with_gate_and_value() {
+        use eye_log::testing::capture_logs;
+        use eye_log::{Level as LogLevel, Value};
+
+        let (w, h) = (100u32, 100u32);
+        let mut data = vec![0u8; (w * h) as usize];
+        for x in 50..53 {
+            data[(50 * w + x) as usize] = 50;
+        }
+        let diff = eye_core::image::GrayImage::new(w, h, data).unwrap();
+
+        let ((cands, counts), logs) = capture_logs(tracing::Level::TRACE, || {
+            candidates(diff.view(), &IrClassicOptions::default())
+        });
+        assert_eq!(cands.len(), 0);
+        assert_eq!(counts.area, 1);
+
+        let recs: Vec<_> = logs
+            .iter()
+            .filter(|r| r.message == "component rejected")
+            .collect();
+        assert_eq!(recs.len(), 1);
+        let rec = recs[0];
+        assert_eq!(rec.level, LogLevel::Trace);
+        assert_eq!(rec.fields[field::REASON], Value::Str("area".into()));
+        assert_eq!(rec.fields["value"], Value::F64(3.0));
+        assert_eq!(rec.fields["min"], Value::F64(7.0));
     }
 }

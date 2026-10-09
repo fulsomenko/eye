@@ -106,7 +106,7 @@ impl IrClassicDetector {
     ) -> Result<Option<[EyeObservation; 2]>, DetectError> {
         let diff = saturating_diff(lit, dark)?;
         let diff = diff.view();
-        let cands = blob::candidates(diff, &self.options);
+        let (cands, counts) = blob::candidates(diff, &self.options);
         let Some((i, j)) = pupil::select_pair(&cands, &self.options) else {
             let reason = match cands.len() {
                 0 => "no_candidates",
@@ -116,6 +116,11 @@ impl IrClassicDetector {
             tracing::debug!(
                 { field::REASON } = reason,
                 candidates = cands.len() as u64,
+                rejected_area = counts.area,
+                rejected_aspect = counts.aspect,
+                rejected_contrast = counts.contrast,
+                rejected_iris_ratio = counts.iris_ratio,
+                components = counts.components_total,
                 "pair rejected"
             );
             return Ok(None);
@@ -721,7 +726,7 @@ mod tests {
         ];
         let (lit, dark) = scene.render();
         let diff = saturating_diff(lit.view(), dark.view()).unwrap();
-        let cands = blob::candidates(diff.view(), &IrClassicOptions::default());
+        let (cands, _counts) = blob::candidates(diff.view(), &IrClassicOptions::default());
         assert_eq!(cands.len(), 2);
         for c in &cands {
             assert!((3.0..=4.2).contains(&c.contrast));
@@ -1025,7 +1030,7 @@ mod tests {
                     GrayView::from_frame(dark).unwrap(),
                 )
                 .unwrap();
-                let cands = blob::candidates(diff.view(), &detector.options);
+                let (cands, _counts) = blob::candidates(diff.view(), &detector.options);
                 println!(
                     "seq {seq} dropout: candidates = {:?}",
                     cands
@@ -1114,7 +1119,15 @@ mod tests {
         assert_eq!(rec.fields["candidates"], Value::U64(1));
         let mut keys: Vec<&str> = rec.fields.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        let mut expected = vec![field::REASON, "candidates"];
+        let mut expected = vec![
+            field::REASON,
+            "candidates",
+            "rejected_area",
+            "rejected_aspect",
+            "rejected_contrast",
+            "rejected_iris_ratio",
+            "components",
+        ];
         expected.sort_unstable();
         assert_eq!(keys, expected);
 
@@ -1166,6 +1179,38 @@ mod tests {
         match pupil_rec.fields["dist_px"] {
             Value::F64(d) => assert!((119.0..121.0).contains(&d), "dist_px {d} out of range"),
             ref other => panic!("expected F64 dist_px, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_logs_pair_rejected_carries_gate_counts() {
+        use eye_log::testing::capture_logs;
+        use eye_log::{Level as LogLevel, Value};
+
+        let detector = IrClassicDetector::new(IrClassicOptions::default());
+        let mut scene = SyntheticIr::default_scene();
+        scene.eyes.truncate(1);
+        let (lit, dark) = scene.render();
+        let (_, logs) = capture_logs(tracing::Level::TRACE, || {
+            detector.detect_pair(lit.view(), dark.view())
+        });
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "pair rejected" && r.target == "eye_detect::ir")
+            .expect("event emitted");
+        assert_eq!(rec.level, LogLevel::Debug);
+        for key in [
+            "rejected_area",
+            "rejected_aspect",
+            "rejected_contrast",
+            "rejected_iris_ratio",
+            "components",
+        ] {
+            assert!(
+                matches!(rec.fields[key], Value::U64(_)),
+                "expected U64 {key}, got {:?}",
+                rec.fields[key]
+            );
         }
     }
 
