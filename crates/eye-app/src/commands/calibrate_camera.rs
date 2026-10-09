@@ -392,9 +392,11 @@ fn spawn_captures(
             .find(|(route_id, _)| route_id == &id)
             .map(|(_, tx)| tx.clone());
         let stop = Arc::clone(stop);
+        let parent = tracing::Span::current();
         let handle = std::thread::Builder::new()
             .name(format!("eye-cal-{id}"))
             .spawn(move || {
+                let _enter = parent.entered();
                 while !stop.load(Ordering::Relaxed) {
                     match source.next_frame() {
                         Ok(frame) => {

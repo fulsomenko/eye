@@ -61,9 +61,11 @@ fn spawn_reader(
     mut source: Box<dyn FrameSource>,
 ) -> Result<(JoinHandle<()>, Receiver<Reading>), TestError> {
     let (tx, rx) = crossbeam_channel::bounded::<Reading>(64);
+    let parent = tracing::Span::current();
     let handle = thread::Builder::new()
         .name(format!("eye-lab-{name}"))
         .spawn(move || {
+            let _enter = parent.entered();
             loop {
                 let item = source
                     .next_frame()

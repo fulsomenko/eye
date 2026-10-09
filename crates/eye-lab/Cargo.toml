@@ -22,6 +22,7 @@ eye-bench.workspace = true
 eye-calibration.workspace = true
 eye-capture.workspace = true
 eye-core.workspace = true
+eye-log.workspace = true
 eye-platform.workspace = true
 nalgebra.workspace = true
 serde.workspace = true
@@ -30,7 +31,6 @@ signal-hook.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [dev-dependencies]
 approx.workspace = true

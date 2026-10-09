@@ -363,3 +363,46 @@ fn test_cli_grace_s_zero_error_names_valid_range() {
     );
     assert!(!stderr.contains("0..=86400"), "{stderr}");
 }
+
+#[test]
+fn test_log_file_writes_jsonl_with_run_context() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log_path = tmp.path().join("p.jsonl");
+    let mut child = bin()
+        .arg("--log-file")
+        .arg(&log_path)
+        .arg("suites")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(0));
+
+    let contents = fs::read_to_string(&log_path).unwrap();
+    let first_line = contents.lines().next().expect("at least one log line");
+    let value: serde_json::Value = serde_json::from_str(first_line).unwrap();
+    assert_eq!(value["context"]["command"], "suites");
+    let run_id = value["context"]["run.id"]
+        .as_str()
+        .expect("run.id is a string")
+        .to_string();
+    assert!(!run_id.is_empty());
+    assert!(
+        run_id.ends_with(&pid.to_string()),
+        "run id {run_id:?} does not end in the child pid {pid}"
+    );
+    assert_eq!(value["schema"], 1);
+}
+
+#[test]
+fn test_bad_log_level_is_usage_error() {
+    let result = bin()
+        .args(["--log-level", "eye[", "suites"])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("invalid filter directive"), "{stderr}");
+}

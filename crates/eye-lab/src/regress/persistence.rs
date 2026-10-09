@@ -473,7 +473,9 @@ mod tests {
         fs::write(&status_path, "active\n").unwrap();
         let handle = {
             let status_path = status_path.clone();
+            let parent = tracing::Span::current();
             thread::spawn(move || {
+                let _enter = parent.entered();
                 thread::sleep(Duration::from_millis(300));
                 fs::write(&status_path, "suspended\n").unwrap();
             })

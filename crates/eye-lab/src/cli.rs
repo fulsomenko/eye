@@ -7,9 +7,9 @@ use std::{
 };
 
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
 
 use eye::config::EnvOverrides;
+use eye_core::log::{field, span};
 
 use crate::{
     case::{RunOptions, TestRegistry},
@@ -28,6 +28,8 @@ use crate::{
     about = "Headless camera-mode and test-sequence runner"
 )]
 pub struct Cli {
+    #[command(flatten)]
+    pub log: eye_log::cli::LogArgs,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -42,6 +44,17 @@ pub enum Command {
     Suites,
     /// Print the camera mode matrix, the emitter byte and the metadata node
     Modes(ModesArgs),
+}
+
+impl Command {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Run(_) => "run",
+            Self::ListTests => "list-tests",
+            Self::Suites => "suites",
+            Self::Modes(_) => "modes",
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -129,12 +142,15 @@ fn load_sequence(
 }
 
 fn run_main() -> u8 {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .try_init();
-
     let cli = Cli::parse();
+    let command = cli.command.name();
+    let _log = match eye_log::cli::init(&cli.log, command) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("eye-lab: {e}");
+            return 2;
+        }
+    };
 
     match cli.command {
         Command::ListTests => {
@@ -259,6 +275,9 @@ fn run_command(args: RunArgs) -> u8 {
         .unwrap_or(0);
     let start_instant = std::time::Instant::now();
 
+    let session_id = format!("{started_unix_s}-{name}");
+    let _session =
+        tracing::info_span!(span::SESSION, { field::SESSION_ID } = session_id.as_str()).entered();
     let outcome = runner::run(
         &planned,
         host.as_mut(),

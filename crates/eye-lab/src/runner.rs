@@ -342,9 +342,11 @@ fn run_one(
     );
     let case = Arc::clone(&step.case);
     let (tx, rx) = crossbeam_channel::bounded::<Returned>(1);
+    let parent = tracing::Span::current();
     let spawned = thread::Builder::new()
         .name(format!("eye-lab-{}", step.test))
         .spawn(move || {
+            let _enter = parent.entered();
             let returned = panic::catch_unwind(AssertUnwindSafe(|| case.run(&ctx)));
             let _ = tx.send(returned);
         });

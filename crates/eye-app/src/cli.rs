@@ -17,6 +17,8 @@ pub struct Cli {
     /// Where the subcommand writes its primary artifact (see `eye <command> --help`).
     #[arg(long, global = true, value_name = "PATH")]
     pub output: Option<PathBuf>,
+    #[command(flatten)]
+    pub log: eye_log::cli::LogArgs,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -39,16 +41,18 @@ pub enum Command {
     Bench(commands::bench::Args),
 }
 
-pub fn init_tracing() {
-    use tracing_subscriber::filter::LevelFilter;
-
-    let filter = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive(LevelFilter::INFO.into())
-        .from_env_lossy();
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
+impl Command {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Probe(_) => "probe",
+            Self::Emitter(_) => "emitter",
+            Self::Record(_) => "record",
+            Self::Calibrate(_) => "calibrate",
+            Self::CalibrateCamera(_) => "calibrate-camera",
+            Self::Run(_) => "run",
+            Self::Bench(_) => "bench",
+        }
+    }
 }
 
 pub fn dispatch(cli: Cli) -> anyhow::Result<()> {

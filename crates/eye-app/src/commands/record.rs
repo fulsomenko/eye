@@ -11,6 +11,7 @@ use eye_calibration::store::{ProfileStore, rig_to_table};
 use eye_capture::session::{
     EmitterState, FORMAT_VERSION, RecordedCamera, SessionId, SessionMeta, SessionWriter,
 };
+use eye_core::log::{field, span};
 use eye_core::session::TargetRecord;
 use eye_core::{CameraInfo, Frame, Rig, ScreenModel, Timestamp};
 use eye_geometry::screen::px_logical_to_mm;
@@ -348,6 +349,8 @@ pub fn record_session(
     shutdown: &Receiver<()>,
     observer: &mut dyn PumpObserver,
 ) -> anyhow::Result<RecordSummary> {
+    let _session =
+        tracing::info_span!(span::SESSION, { field::SESSION_ID } = location.id.as_str()).entered();
     let protocol = opts.protocol.map(TargetProtocol::new).transpose()?;
     let probes = Probes::system();
     let report = collect(&probes);

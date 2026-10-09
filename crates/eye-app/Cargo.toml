@@ -31,6 +31,7 @@ eye-capture.workspace = true
 eye-core.workspace = true
 eye-detect.workspace = true
 eye-geometry.workspace = true
+eye-log.workspace = true
 eye-overlay.workspace = true
 eye-platform.workspace = true
 nalgebra.workspace = true
@@ -40,7 +41,6 @@ signal-hook.workspace = true
 tempfile.workspace = true
 toml.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true

@@ -532,6 +532,7 @@ dependencies = [
  "eye-core",
  "eye-detect",
  "eye-geometry",
+ "eye-log",
  "eye-overlay",
  "eye-platform",
  "nalgebra",
@@ -543,7 +544,6 @@ dependencies = [
  "tempfile",
  "toml",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -687,6 +687,7 @@ dependencies = [
  "eye-calibration",
  "eye-capture",
  "eye-core",
+ "eye-log",
  "eye-platform",
  "nalgebra",
  "nix",
@@ -697,7 +698,6 @@ dependencies = [
  "thiserror",
  "toml",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

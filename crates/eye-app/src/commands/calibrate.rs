@@ -14,6 +14,7 @@ use eye_calibration::correction::UserProfile;
 use eye_calibration::protocol::{ProtocolConfig, TargetProtocol, TargetTiming};
 use eye_calibration::store::ProfileStore;
 use eye_calibration::user_fit::{DotSessionFit, FitConfig, FitSample, ProfileMeta};
+use eye_core::log::{field, span};
 use eye_core::{CameraInfo, Frame, Rig, Timestamp};
 use eye_geometry::screen::px_logical_to_mm;
 use eye_overlay::ellipse::{cov_mm_to_logical_px, logical_px_per_mm};
@@ -510,6 +511,19 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
             "calibration interrupted; nothing saved"
         );
     }
+    let session_id = recording
+        .location()
+        .map(|l| l.id.as_str().to_owned())
+        .unwrap_or_else(|| {
+            recording
+                .session_dir()
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+    let _session =
+        tracing::info_span!(span::SESSION, { field::SESSION_ID } = session_id.as_str()).entered();
+
     tracing::info!("fitting...");
     let protocol = fit_protocol(&args);
     let result = fit_recording(
