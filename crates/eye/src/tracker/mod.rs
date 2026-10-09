@@ -191,11 +191,24 @@ impl Tracker {
             pipeline: None,
             finished: false,
         };
+        let cameras = worker.captures.len();
+        let sinks = worker.sinks.len();
+        let parent = tracing::Span::current();
         let handle = std::thread::Builder::new()
             .name("eye-pipeline".into())
-            .spawn(move || worker.run())
+            .spawn(move || {
+                let _parent = parent.entered();
+                worker.run()
+            })
             .map_err(TrackerError::Spawn)?;
         tracker.pipeline = Some(handle);
+        tracing::info!(
+            cameras,
+            capture_capacity = options.capture_capacity,
+            output_capacity,
+            sinks,
+            "tracker started"
+        );
         Ok(tracker)
     }
 
@@ -272,10 +285,23 @@ impl Tracker {
     fn stop_and_join(&mut self) -> Result<(), TrackerError> {
         self.shared.stop.store(true, Ordering::Release);
         self.output = None;
+        let should_log = self.pipeline.is_some();
         let result = self.join_pipeline();
         let mut capture_panicked = false;
         for handle in self.captures.drain(..) {
             capture_panicked |= handle.join().is_err();
+        }
+        if should_log {
+            let stats = self.shared.snapshot();
+            tracing::info!(
+                framesets = stats.framesets,
+                points_emitted = stats.points_emitted,
+                no_gaze = stats.no_gaze,
+                stage_errors = stats.stage_errors,
+                frames_dropped = stats.frames_dropped.values().sum::<u64>(),
+                subscriber_drops = stats.subscriber_drops,
+                "tracker stopped"
+            );
         }
         match result {
             Ok(()) if capture_panicked => Err(TrackerError::Panicked("capture")),
@@ -303,82 +329,13 @@ mod tests {
 
     use eye_capture::pairing::Pairer;
     use eye_core::stage::Detector;
-    use eye_core::{CameraInfo, Illumination, PixelFormat, SinkError, Timestamp};
+    use eye_core::{Illumination, PixelFormat, Timestamp};
 
     use super::*;
     use crate::registry::PassThroughFilter;
-    use crate::testkit::{self, FakeDetector, FakeEstimator};
-
-    #[derive(Debug)]
-    struct ScriptSource {
-        info: CameraInfo,
-        script: VecDeque<Result<eye_core::Frame, CaptureError>>,
-        endless: Option<(u64, Duration)>,
-        gate: Option<Receiver<()>>,
-        dropped: Arc<AtomicBool>,
-    }
-
-    impl FrameSource for ScriptSource {
-        fn camera(&self) -> &CameraInfo {
-            &self.info
-        }
-
-        fn next_frame(&mut self) -> Result<eye_core::Frame, CaptureError> {
-            if let Some(gate) = self.gate.take()
-                && gate.recv().is_err()
-            {
-                return Err(CaptureError::EndOfStream);
-            }
-            if let Some(result) = self.script.pop_front() {
-                return result;
-            }
-            match &mut self.endless {
-                Some((seq, pause)) => {
-                    std::thread::sleep(*pause);
-                    let frame = testkit::frame("ir", *seq, *seq, Illumination::IrLit);
-                    *seq += 1;
-                    Ok(frame)
-                }
-                None => Err(CaptureError::EndOfStream),
-            }
-        }
-    }
-
-    impl Drop for ScriptSource {
-        fn drop(&mut self) {
-            self.dropped.store(true, Ordering::SeqCst);
-        }
-    }
-
-    struct FakeSink {
-        pushes: Arc<AtomicUsize>,
-        fail_on: usize,
-    }
-
-    impl GazeSink for FakeSink {
-        fn name(&self) -> &'static str {
-            "fake"
-        }
-
-        fn push(&mut self, _point: &GazePoint) -> Result<(), SinkError> {
-            let n = self.pushes.fetch_add(1, Ordering::SeqCst) + 1;
-            if n == self.fail_on {
-                Err(SinkError::Closed)
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    fn script_source(frames: Vec<Result<eye_core::Frame, CaptureError>>) -> ScriptSource {
-        ScriptSource {
-            info: testkit::info("ir", PixelFormat::Gray8, 66),
-            script: frames.into(),
-            endless: None,
-            gate: None,
-            dropped: Arc::new(AtomicBool::new(false)),
-        }
-    }
+    use crate::testkit::{
+        self, FakeDetector, FakeEstimator, FakeSink, ScriptSource, script_source,
+    };
 
     fn start(
         source: ScriptSource,
@@ -633,6 +590,36 @@ mod tests {
         let t = start(source, 2, Vec::new(), Box::new(FakeDetector::new("fake")));
         drop(t);
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_logs_tracker_started_and_stopped_at_info_once() {
+        let frames = (0..3u64)
+            .map(|seq| Ok(testkit::frame("ir", seq, seq, Illumination::IrLit)))
+            .collect();
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::INFO, || {
+            let t = start(
+                script_source(frames),
+                8,
+                Vec::new(),
+                Box::new(FakeDetector::new("fake")),
+            );
+            t.shutdown()
+        });
+        let started: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "tracker started")
+            .collect();
+        assert_eq!(started.len(), 1);
+        let stopped: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "tracker stopped")
+            .collect();
+        assert_eq!(stopped.len(), 1);
+        assert!(matches!(
+            stopped[0].fields.get("frames_dropped"),
+            Some(eye_log::Value::U64(_))
+        ));
     }
 
     #[test]

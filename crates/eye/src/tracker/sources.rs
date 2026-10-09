@@ -1,4 +1,5 @@
 use eye_capture::{FrameSource, TaggedSource, TaggerConfig, V4l2Config, V4l2Source};
+use eye_core::log::field;
 
 use crate::config::{CameraFormat, Config};
 use crate::tracker::TrackerError;
@@ -23,12 +24,18 @@ pub fn open_sources(config: &Config) -> Result<Vec<Box<dyn FrameSource>>, Tracke
             })?;
             Ok(match c.format {
                 CameraFormat::Gray => {
-                    Box::new(TaggedSource::new(source, TaggerConfig::default()).map_err(
-                        |source| TrackerError::Capture {
-                            camera: c.id.to_string(),
-                            source,
-                        },
-                    )?) as Box<dyn FrameSource>
+                    let tagged =
+                        TaggedSource::new(source, TaggerConfig::default()).map_err(|source| {
+                            TrackerError::Capture {
+                                camera: c.id.to_string(),
+                                source,
+                            }
+                        })?;
+                    tracing::debug!(
+                        { field::CAMERA } = c.id.as_str(),
+                        "brightness tagger attached"
+                    );
+                    Box::new(tagged) as Box<dyn FrameSource>
                 }
                 CameraFormat::Mjpeg => Box::new(source),
             })

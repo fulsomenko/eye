@@ -1,12 +1,15 @@
-//! Test fakes shared by `pipeline` tests.
+//! Test fakes shared by `pipeline` and `tracker` tests.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use crossbeam_channel::Receiver;
+use eye_capture::{CaptureError, FrameSource};
 use eye_core::{
-    CameraId, CameraInfo, CameraModel, Frame, FrameHeader, FrameSet, GazePoint, GazeRay,
-    Illumination, Observations, OutputId, PixelFormat, Rig, ScreenModel, Timestamp,
+    CameraId, CameraInfo, CameraModel, Frame, FrameHeader, FrameSet, GazePoint, GazeRay, GazeSink,
+    Illumination, Observations, OutputId, PixelFormat, Rig, ScreenModel, SinkError, Timestamp,
     stage::{Detector, GazeCorrection, GazeEstimator, GazeFilter, StageError},
 };
 use nalgebra::{Matrix2, Matrix3, Point2, Rotation3, UnitQuaternion, Vector2, Vector3};
@@ -251,4 +254,75 @@ pub(crate) fn fake_registry() -> Registry {
         })
         .expect("\"fake\" estimator name is unique");
     registry
+}
+
+#[derive(Debug)]
+pub(crate) struct ScriptSource {
+    pub(crate) info: CameraInfo,
+    pub(crate) script: VecDeque<Result<Frame, CaptureError>>,
+    pub(crate) endless: Option<(u64, Duration)>,
+    pub(crate) gate: Option<Receiver<()>>,
+    pub(crate) dropped: Arc<AtomicBool>,
+}
+
+impl FrameSource for ScriptSource {
+    fn camera(&self) -> &CameraInfo {
+        &self.info
+    }
+
+    fn next_frame(&mut self) -> Result<Frame, CaptureError> {
+        if let Some(gate) = self.gate.take()
+            && gate.recv().is_err()
+        {
+            return Err(CaptureError::EndOfStream);
+        }
+        if let Some(result) = self.script.pop_front() {
+            return result;
+        }
+        match &mut self.endless {
+            Some((seq, pause)) => {
+                std::thread::sleep(*pause);
+                let frame = self::frame("ir", *seq, *seq, Illumination::IrLit);
+                *seq += 1;
+                Ok(frame)
+            }
+            None => Err(CaptureError::EndOfStream),
+        }
+    }
+}
+
+impl Drop for ScriptSource {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+pub(crate) fn script_source(frames: Vec<Result<Frame, CaptureError>>) -> ScriptSource {
+    ScriptSource {
+        info: info("ir", PixelFormat::Gray8, 66),
+        script: frames.into(),
+        endless: None,
+        gate: None,
+        dropped: Arc::new(AtomicBool::new(false)),
+    }
+}
+
+pub(crate) struct FakeSink {
+    pub(crate) pushes: Arc<AtomicUsize>,
+    pub(crate) fail_on: usize,
+}
+
+impl GazeSink for FakeSink {
+    fn name(&self) -> &'static str {
+        "fake"
+    }
+
+    fn push(&mut self, _point: &GazePoint) -> Result<(), SinkError> {
+        let n = self.pushes.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == self.fail_on {
+            Err(SinkError::Closed)
+        } else {
+            Ok(())
+        }
+    }
 }

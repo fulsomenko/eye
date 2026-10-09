@@ -509,12 +509,14 @@ dependencies = [
  "eye-estimate",
  "eye-filter",
  "eye-geometry",
+ "eye-log",
  "nalgebra",
  "proptest",
  "serde",
  "thiserror",
  "toml",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

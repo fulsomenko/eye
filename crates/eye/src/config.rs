@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use eye_core::log::field;
 use eye_core::{CameraId, CameraInfo, PixelFormat};
 use serde::{Deserialize, Deserializer, de::Error as _};
 
@@ -210,6 +211,19 @@ impl Config {
         };
         let applied_env = config.apply_env(env);
         config.validate()?;
+        let source_str = match &source {
+            ConfigSource::File(path) => path.display().to_string(),
+            ConfigSource::BuiltinDefault => "builtin".to_string(),
+        };
+        tracing::info!(
+            source = %source_str,
+            cameras = config.cameras.len(),
+            detectors = config.detect.len(),
+            estimate = config.estimate.kind.as_str(),
+            filter = config.filter.kind.as_str(),
+            applied_env = applied_env.len(),
+            "config loaded"
+        );
         Ok(LoadedConfig {
             config,
             source,
@@ -250,8 +264,20 @@ impl Config {
                 Some(cam) => {
                     cam.device = PathBuf::from(device);
                     applied.push(var);
+                    tracing::debug!(
+                        var,
+                        { field::CAMERA } = id,
+                        device = device.as_str(),
+                        "env override applied"
+                    );
                 }
-                None => tracing::warn!(var, camera = id, "ignored: no camera with this id"),
+                None => {
+                    tracing::warn!(
+                        var,
+                        { field::CAMERA } = id,
+                        "ignored: no camera with this id"
+                    );
+                }
             }
         }
         if let Some(target) = &env.output {
@@ -795,6 +821,47 @@ mod tests {
             PathBuf::from("/dev/video9")
         );
         std::fs::remove_file(&path).expect("remove temp file");
+    }
+
+    #[test]
+    fn test_logs_config_loaded_at_info_and_env_override_at_debug() {
+        let (_, override_records) = eye_log::testing::capture_logs(tracing::Level::DEBUG, || {
+            let mut config =
+                Config::from_toml_str(&two_camera_and_estimate_with_detect()).expect("parses");
+            config.apply_env(&EnvOverrides {
+                camera: None,
+                ir_camera: Some("/dev/video9".to_string()),
+                output: None,
+            });
+        });
+        let debug_rec = override_records
+            .iter()
+            .find(|r| r.message == "env override applied")
+            .expect("debug record present");
+        assert_eq!(debug_rec.level, eye_log::Level::Debug);
+        assert_eq!(
+            debug_rec.fields.get("var"),
+            Some(&eye_log::Value::Str("EYE_IR_CAMERA".to_string()))
+        );
+
+        let path = write_temp_toml("log-config-loaded", &two_camera_and_estimate_with_detect());
+        let (_, loaded_records) = eye_log::testing::capture_logs(tracing::Level::DEBUG, || {
+            Config::load_with(Some(&path), &EnvOverrides::default()).expect("loads")
+        });
+        std::fs::remove_file(&path).expect("remove temp file");
+        let info_rec = loaded_records
+            .iter()
+            .find(|r| r.message == "config loaded")
+            .expect("info record present");
+        assert_eq!(info_rec.level, eye_log::Level::Info);
+        assert_eq!(
+            info_rec.fields.get("cameras"),
+            Some(&eye_log::Value::U64(2))
+        );
+        assert_eq!(
+            info_rec.fields.get("applied_env"),
+            Some(&eye_log::Value::U64(0))
+        );
     }
 
     proptest! {

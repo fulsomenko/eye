@@ -19,6 +19,16 @@ impl fmt::Display for StageKind {
     }
 }
 
+impl StageKind {
+    pub fn span_kind(self) -> &'static str {
+        match self {
+            Self::Detector => "detect",
+            Self::Estimator => "estimate",
+            Self::Filter => "filter",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("reading {path}: {source}")]
@@ -85,5 +95,12 @@ mod tests {
         assert_eq!(StageKind::Detector.to_string(), "detector");
         assert_eq!(StageKind::Estimator.to_string(), "estimator");
         assert_eq!(StageKind::Filter.to_string(), "filter");
+    }
+
+    #[test]
+    fn test_stage_kind_span_kind_matches_vocabulary() {
+        assert_eq!(StageKind::Detector.span_kind(), "detect");
+        assert_eq!(StageKind::Estimator.span_kind(), "estimate");
+        assert_eq!(StageKind::Filter.span_kind(), "filter");
     }
 }

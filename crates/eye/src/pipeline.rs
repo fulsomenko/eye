@@ -5,6 +5,7 @@ use std::fmt;
 
 use eye_capture::CaptureError;
 use eye_capture::pairing::{Pairer, PairingConfig};
+use eye_core::log::{field, span};
 use eye_core::{
     CameraId, CameraInfo, Frame, FrameSet, GazePoint, GazeRay, PixelFormat, Rig, ScreenModel,
     Timestamp,
@@ -58,6 +59,7 @@ pub struct Pipeline {
     detectors: Vec<(CameraId, Box<dyn Detector>)>,
     estimator: Box<dyn GazeEstimator>,
     filter: Box<dyn GazeFilter>,
+    filter_name: String,
     correction: Option<Box<dyn GazeCorrection>>,
     max_consecutive_errors: u32,
     consecutive_errors: u32,
@@ -103,7 +105,9 @@ impl Pipeline {
         }
         .map_err(PipelineError::Pairing)?;
 
-        Ok(Self::new(
+        let detector_count = detectors.len();
+        let estimator_name = estimator.name();
+        let mut pipeline = Self::new(
             rig,
             pairer,
             detectors,
@@ -111,7 +115,18 @@ impl Pipeline {
             filter,
             correction,
             config.tracker.max_consecutive_stage_errors,
-        ))
+        );
+        pipeline.filter_name = config.filter.kind.clone();
+        tracing::info!(
+            cameras = cameras.len(),
+            detectors = detector_count,
+            estimator = estimator_name,
+            filter = pipeline.filter_name.as_str(),
+            max_consecutive_errors = pipeline.max_consecutive_errors,
+            rgb_offset_ns = config.capture.rgb_offset_ns,
+            "pipeline built"
+        );
+        Ok(pipeline)
     }
 
     pub fn new(
@@ -130,6 +145,7 @@ impl Pipeline {
             detectors,
             estimator,
             filter,
+            filter_name: "custom".to_string(),
             correction,
             max_consecutive_errors,
             consecutive_errors: 0,
@@ -185,10 +201,34 @@ impl Pipeline {
                 .cloned()
                 .collect();
             if frames.is_empty() {
+                tracing::debug!(
+                    { field::CAMERA } = camera.as_str(),
+                    { field::STAGE_NAME } = detector.name(),
+                    { field::REASON } = "no_accepted_frame",
+                    "detector skipped"
+                );
                 continue;
             }
             let subset = FrameSet::new(frames).expect("a subset of a valid FrameSet is valid");
-            match detector.detect(&subset) {
+            let started = std::time::Instant::now();
+            let result = {
+                let _stage = tracing::debug_span!(
+                    span::STAGE,
+                    { field::STAGE_KIND } = StageKind::Detector.span_kind(),
+                    { field::STAGE_NAME } = detector.name(),
+                )
+                .entered();
+                let result = detector.detect(&subset);
+                if let Ok(obs) = &result {
+                    tracing::trace!(
+                        { field::ELAPSED_US } = elapsed_us(started),
+                        observations = obs.len(),
+                        "stage done"
+                    );
+                }
+                result
+            };
+            match result {
                 Ok(obs) => observations.extend(obs),
                 Err(e) => {
                     failure = Some((StageKind::Detector, detector.name(), e));
@@ -201,16 +241,36 @@ impl Pipeline {
         }
         if observations.is_empty() {
             self.consecutive_errors = 0;
+            tracing::debug!({ field::REASON } = "no_observations", "no gaze");
             return Ok(RayStep::NoGaze);
         }
-        match self.estimator.estimate(&observations, &self.rig) {
+        let started = std::time::Instant::now();
+        let result = {
+            let _stage = tracing::debug_span!(
+                span::STAGE,
+                { field::STAGE_KIND } = StageKind::Estimator.span_kind(),
+                { field::STAGE_NAME } = self.estimator.name(),
+            )
+            .entered();
+            let result = self.estimator.estimate(&observations, &self.rig);
+            if let Ok(rays) = &result {
+                tracing::trace!(
+                    { field::ELAPSED_US } = elapsed_us(started),
+                    rays = rays.len(),
+                    "stage done"
+                );
+            }
+            result
+        };
+        match result {
             Ok(rays) => {
                 self.consecutive_errors = 0;
-                Ok(if rays.is_empty() {
-                    RayStep::NoGaze
+                if rays.is_empty() {
+                    tracing::debug!({ field::REASON } = "no_rays", "no gaze");
+                    Ok(RayStep::NoGaze)
                 } else {
-                    RayStep::Rays(RayBatch { timestamp, rays })
-                })
+                    Ok(RayStep::Rays(RayBatch { timestamp, rays }))
+                }
             }
             Err(e) => {
                 let name = self.estimator.name();
@@ -235,8 +295,8 @@ impl Pipeline {
             });
         }
         tracing::warn!(
-            %kind,
-            name,
+            { field::STAGE_KIND } = kind.span_kind(),
+            { field::STAGE_NAME } = name,
             error = %e,
             consecutive = self.consecutive_errors,
             "stage error, frame set skipped"
@@ -258,8 +318,27 @@ impl Pipeline {
             })
             .filter_map(|ray| gaze_point(&ray, screen, batch.timestamp))
             .collect();
-        let fused = fuse_points(&points, screen)?;
-        let point = self.filter.apply(fused);
+        let Some(fused) = fuse_points(&points, screen) else {
+            tracing::debug!(
+                { field::REASON } = "no_fused_point",
+                rays = batch.rays.len(),
+                points = points.len(),
+                "no gaze"
+            );
+            return None;
+        };
+        let started = std::time::Instant::now();
+        let point = {
+            let _stage = tracing::debug_span!(
+                span::STAGE,
+                { field::STAGE_KIND } = StageKind::Filter.span_kind(),
+                { field::STAGE_NAME } = self.filter_name.as_str(),
+            )
+            .entered();
+            let point = self.filter.apply(fused);
+            tracing::trace!({ field::ELAPSED_US } = elapsed_us(started), "stage done");
+            point
+        };
         if cfg!(debug_assertions)
             && let Err(e) = point.validate()
         {
@@ -273,7 +352,15 @@ impl Pipeline {
     pub fn set_correction(&mut self, correction: Option<Box<dyn GazeCorrection>>) {
         self.correction = correction;
         self.filter.reset();
+        tracing::debug!(
+            has_correction = self.correction.is_some(),
+            "correction replaced; filter reset"
+        );
     }
+}
+
+fn elapsed_us(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 impl fmt::Debug for Pipeline {
@@ -359,6 +446,213 @@ mod tests {
             None,
             max_consecutive_errors,
         )
+    }
+
+    #[test]
+    fn test_logs_stage_done_at_trace_inside_frame_and_stage_spans() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut pipeline = one_camera_pipeline(3);
+            let frame = testkit::frame("ir", 0, 100, Illumination::IrLit);
+            let set = FrameSet::single(frame);
+            let _frame = eye_core::log::frame_span("ir", 0, 100_000_000, "ir_lit", 1).entered();
+            let RayStep::Rays(batch) = pipeline.rays(&set).expect("rays succeeds") else {
+                panic!("expected a ray batch")
+            };
+            pipeline.finish(&batch);
+        });
+
+        let stage_done: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "stage done")
+            .collect();
+        assert_eq!(stage_done.len(), 3);
+        for rec in &stage_done {
+            assert_eq!(rec.level, eye_log::Level::Trace);
+            assert_eq!(
+                rec.context.get(field::CAMERA),
+                Some(&eye_log::Value::Str("ir".to_string()))
+            );
+            assert_eq!(rec.context.get(field::SEQ), Some(&eye_log::Value::U64(0)));
+            assert!(rec.context.contains_key(field::TS_NS));
+            assert!(rec.context.contains_key(field::ILLUMINATION));
+            assert_eq!(
+                rec.context.get(field::SET_CAMERAS),
+                Some(&eye_log::Value::U64(1))
+            );
+            assert!(matches!(
+                rec.fields.get(field::ELAPSED_US),
+                Some(eye_log::Value::U64(_))
+            ));
+        }
+        let kinds: Vec<&eye_log::Value> = stage_done
+            .iter()
+            .map(|r| {
+                r.context
+                    .get(field::STAGE_KIND)
+                    .expect("stage.kind present")
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                &eye_log::Value::Str("detect".to_string()),
+                &eye_log::Value::Str("estimate".to_string()),
+                &eye_log::Value::Str("filter".to_string()),
+            ]
+        );
+        assert_eq!(
+            stage_done[0].context.get(field::STAGE_NAME),
+            Some(&eye_log::Value::Str("fake".to_string()))
+        );
+        assert_eq!(
+            stage_done[1].context.get(field::STAGE_NAME),
+            Some(&eye_log::Value::Str("fake".to_string()))
+        );
+        assert_eq!(
+            stage_done[2].context.get(field::STAGE_NAME),
+            Some(&eye_log::Value::Str("custom".to_string()))
+        );
+        assert_eq!(
+            stage_done[0].fields.get("observations"),
+            Some(&eye_log::Value::U64(1))
+        );
+    }
+
+    #[test]
+    fn test_logs_detector_skipped_at_debug_with_reason() {
+        let detector = FakeDetector::new("fake").accepting(Illumination::IrLit);
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::DEBUG, || {
+            let mut pipeline = Pipeline::new(
+                testkit::rig(),
+                Pairer::new(&[testkit::info("ir", PixelFormat::Gray8, 66)])
+                    .expect("single-camera pairer"),
+                vec![(CameraId::from("ir"), Box::new(detector))],
+                Box::new(FakeEstimator),
+                Box::new(PassThroughFilter),
+                None,
+                3,
+            );
+            let set = FrameSet::single(testkit::frame("ir", 0, 100, Illumination::IrDark));
+            pipeline.rays(&set)
+        });
+        let skipped = records
+            .iter()
+            .find(|r| r.message == "detector skipped")
+            .expect("debug record present");
+        assert_eq!(skipped.level, eye_log::Level::Debug);
+        assert_eq!(
+            skipped.fields.get(field::REASON),
+            Some(&eye_log::Value::Str("no_accepted_frame".to_string()))
+        );
+        assert_eq!(
+            skipped.fields.get(field::STAGE_NAME),
+            Some(&eye_log::Value::Str("fake".to_string()))
+        );
+
+        let no_gaze = records
+            .iter()
+            .find(|r| r.message == "no gaze")
+            .expect("debug record present");
+        assert_eq!(no_gaze.level, eye_log::Level::Debug);
+        assert_eq!(
+            no_gaze.fields.get(field::REASON),
+            Some(&eye_log::Value::Str("no_observations".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_logs_no_gaze_at_debug_for_no_fused_point() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::DEBUG, || {
+            let mut pipeline = one_camera_pipeline(3);
+            let batch = RayBatch {
+                timestamp: Timestamp::from_nanos(0),
+                rays: vec![GazeRay {
+                    side: None,
+                    origin: nalgebra::Point3::new(155.0, 85.0, -500.0),
+                    direction: -nalgebra::Vector3::z_axis(),
+                    angular_cov: Matrix2::identity() * 1e-6,
+                    origin_cov: nalgebra::Matrix3::zeros(),
+                    head_rotation: nalgebra::UnitQuaternion::identity(),
+                }],
+            };
+            pipeline.finish(&batch)
+        });
+        let rec = records
+            .iter()
+            .find(|r| r.message == "no gaze")
+            .expect("debug record present");
+        assert_eq!(rec.level, eye_log::Level::Debug);
+        assert_eq!(
+            rec.fields.get(field::REASON),
+            Some(&eye_log::Value::Str("no_fused_point".to_string()))
+        );
+        assert_eq!(rec.fields.get("rays"), Some(&eye_log::Value::U64(1)));
+        assert_eq!(rec.fields.get("points"), Some(&eye_log::Value::U64(0)));
+    }
+
+    #[test]
+    fn test_logs_stage_error_at_warn_with_span_kind_fields() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::WARN, || {
+            let mut pipeline = Pipeline::new(
+                testkit::rig(),
+                Pairer::new(&[testkit::info("ir", PixelFormat::Gray8, 66)])
+                    .expect("single-camera pairer"),
+                vec![(CameraId::from("ir"), Box::new(FakeDetector::new("fake")))],
+                Box::new(FailingEstimator),
+                Box::new(PassThroughFilter),
+                None,
+                3,
+            );
+            let set = FrameSet::single(testkit::frame("ir", 0, 100, Illumination::IrLit));
+            pipeline.rays(&set)
+        });
+        let rec = records
+            .iter()
+            .find(|r| r.message == "stage error, frame set skipped")
+            .expect("warn record present");
+        assert_eq!(rec.level, eye_log::Level::Warn);
+        assert_eq!(
+            rec.fields.get(field::STAGE_KIND),
+            Some(&eye_log::Value::Str("estimate".to_string()))
+        );
+        assert_eq!(rec.fields.get("consecutive"), Some(&eye_log::Value::U64(1)));
+        assert!(!rec.fields.contains_key("kind"));
+    }
+
+    #[test]
+    fn test_logs_pipeline_built_at_info() {
+        let config = Config::from_toml_str(TWO_CAMERA_TOML).expect("parses");
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::DEBUG, || {
+            Pipeline::from_config(&fake_registry(), &config, testkit::rig(), &cameras, None)
+        });
+        let built = records
+            .iter()
+            .find(|r| r.message == "pipeline built")
+            .expect("info record present");
+        assert_eq!(built.level, eye_log::Level::Info);
+        assert_eq!(
+            built.fields.get("filter"),
+            Some(&eye_log::Value::Str("none".to_string()))
+        );
+        assert_eq!(built.fields.get("detectors"), Some(&eye_log::Value::U64(1)));
+        assert_eq!(
+            built.fields.get("rgb_offset_ns"),
+            Some(&eye_log::Value::I64(3_000_000))
+        );
+
+        let constructed: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "stage constructed")
+            .collect();
+        assert_eq!(constructed.len(), 3);
+        for rec in &constructed {
+            assert_eq!(rec.level, eye_log::Level::Debug);
+            assert!(matches!(
+                rec.fields.get(field::STAGE_KIND),
+                Some(eye_log::Value::Str(_))
+            ));
+        }
     }
 
     #[test]

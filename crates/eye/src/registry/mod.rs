@@ -8,6 +8,7 @@ use std::{
 
 use eye_core::{
     Rig,
+    log::field,
     stage::{Detector, GazeEstimator, GazeFilter, StageError},
 };
 
@@ -82,11 +83,21 @@ fn build<T>(
             available: map.keys().copied().collect(),
         });
     };
-    ctor(&section.options, rig).map_err(|source| ConfigError::Stage {
-        kind,
-        name: section.kind.clone(),
-        source,
-    })
+    match ctor(&section.options, rig) {
+        Ok(value) => {
+            tracing::debug!(
+                { field::STAGE_KIND } = kind.span_kind(),
+                { field::STAGE_NAME } = section.kind.as_str(),
+                "stage constructed"
+            );
+            Ok(value)
+        }
+        Err(source) => Err(ConfigError::Stage {
+            kind,
+            name: section.kind.clone(),
+            source,
+        }),
+    }
 }
 
 fn insert<C>(
