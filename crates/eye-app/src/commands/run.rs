@@ -6,7 +6,7 @@ use eye::registry::Registry;
 use eye::tracker::{Tracker, TrackerStats};
 #[cfg(test)]
 use eye_calibration::correction::Provenance;
-use eye_calibration::correction::{UserProfile, rig_fingerprint};
+use eye_calibration::correction::{UserProfile, rig_fingerprint, text_fingerprint};
 use eye_calibration::store::ProfileStore;
 use eye_core::stage::GazeCorrection;
 use eye_core::{GazePoint, Rig};
@@ -112,6 +112,7 @@ pub fn select_profile(
     args: &Args,
     rig: &Rig,
     estimator: &str,
+    estimator_fingerprint: &str,
 ) -> anyhow::Result<(Option<UserProfile>, Vec<String>)> {
     if args.no_profile {
         return Ok((None, Vec::new()));
@@ -136,7 +137,23 @@ pub fn select_profile(
             args.profile, profile.estimator
         ));
     }
+    if let Some(fp) = &profile.provenance.estimator_fingerprint
+        && fp != estimator_fingerprint
+    {
+        warnings.push(format!(
+            "profile \"{}\" was fitted with different estimator options; run eye calibrate again",
+            args.profile
+        ));
+    }
     Ok((Some(profile), warnings))
+}
+
+/// `[estimate]` table as written (kind first) hashed for `Provenance::estimator_fingerprint`.
+pub fn estimator_fingerprint(section: &eye::config::StageSection) -> String {
+    let mut table = toml::Table::new();
+    table.insert("kind".into(), toml::Value::String(section.kind.clone()));
+    table.extend(section.options.clone());
+    text_fingerprint(&toml::to_string(&table).expect("a toml table serializes"))
 }
 
 pub fn stats_line(
@@ -245,9 +262,25 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     let output = rig::target_output(&config, &report.outputs)?;
     let store = ProfileStore::open_default()?;
     let (rig, _) = rig::resolve_rig(&config, output, &store)?;
-    let (profile, warnings) = select_profile(&store, &args, &rig, &config.estimate.kind)?;
+    let (profile, warnings) = select_profile(
+        &store,
+        &args,
+        &rig,
+        &config.estimate.kind,
+        &estimator_fingerprint(&config.estimate),
+    )?;
     for warning in &warnings {
         tracing::warn!("{warning}");
+    }
+    if let Some(profile) = &profile {
+        tracing::info!(
+            name = %profile.name,
+            rig_fingerprint = %profile.rig_fingerprint,
+            estimator = %profile.estimator,
+            session_id = ?profile.provenance.session_id,
+            expected_loto_mean_deg = ?profile.provenance.expected_loto_mean_deg,
+            "profile applied"
+        );
     }
     let correction = profile.map(|p| Box::new(p) as Box<dyn GazeCorrection>);
     let shutdown = crate::shutdown::install()?;
@@ -403,7 +436,7 @@ mod tests {
         let store = ProfileStore::at(dir.path());
         let args = args_with(None, None);
         let (profile, warnings) =
-            select_profile(&store, &args, &synthetic_rig(), "fused").expect("resolves");
+            select_profile(&store, &args, &synthetic_rig(), "fused", "").expect("resolves");
         assert_eq!(profile, None);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("no profile \"default\""));
@@ -414,7 +447,8 @@ mod tests {
         let store = ProfileStore::at("/nonexistent/eye-store");
         let mut args = args_with(None, None);
         args.no_profile = true;
-        let result = select_profile(&store, &args, &synthetic_rig(), "fused").expect("resolves");
+        let result =
+            select_profile(&store, &args, &synthetic_rig(), "fused", "").expect("resolves");
         assert_eq!(result, (None, Vec::new()));
     }
 
@@ -438,7 +472,7 @@ mod tests {
         let args = args_with(None, None);
 
         let (found, warnings) =
-            select_profile(&store, &args, &synthetic_rig(), "fused").expect("resolves");
+            select_profile(&store, &args, &synthetic_rig(), "fused", "").expect("resolves");
         assert_eq!(found, Some(profile.clone()));
         assert_eq!(warnings.len(), 2);
         assert!(warnings[0].contains("another rig"));
@@ -453,9 +487,61 @@ mod tests {
             .save_profile("default", &matching)
             .expect("save profile");
         let (found, warnings) =
-            select_profile(&store, &args, &synthetic_rig(), "fused").expect("resolves");
+            select_profile(&store, &args, &synthetic_rig(), "fused", "").expect("resolves");
         assert_eq!(found, Some(matching));
         assert_eq!(warnings, Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_select_profile_warns_on_estimator_fingerprint_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ProfileStore::at(dir.path());
+        let profile = UserProfile {
+            version: 1,
+            name: "default".to_string(),
+            created_unix_s: 0,
+            rig_fingerprint: eye_calibration::correction::rig_fingerprint(&synthetic_rig()),
+            estimator: "fused".to_string(),
+            eyes: BTreeMap::new(),
+            calibration_pose: None,
+            provenance: Provenance {
+                estimator_fingerprint: Some("x".to_string()),
+                ..Provenance::default()
+            },
+        };
+        store
+            .save_profile("default", &profile)
+            .expect("save profile");
+        let args = args_with(None, None);
+
+        let (_, warnings) =
+            select_profile(&store, &args, &synthetic_rig(), "fused", "y").expect("resolves");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("different estimator options"));
+
+        let (_, warnings) =
+            select_profile(&store, &args, &synthetic_rig(), "fused", "x").expect("resolves");
+        assert_eq!(warnings, Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_estimator_fingerprint_depends_on_options() {
+        let bare = eye::config::StageSection {
+            kind: "fused".to_string(),
+            options: toml::Table::new(),
+        };
+        let mut options = toml::Table::new();
+        options.insert("ir".to_string(), toml::Value::String("pccr".to_string()));
+        let with_options = eye::config::StageSection {
+            kind: "fused".to_string(),
+            options,
+        };
+
+        assert_eq!(estimator_fingerprint(&bare), estimator_fingerprint(&bare));
+        assert_ne!(
+            estimator_fingerprint(&bare),
+            estimator_fingerprint(&with_options)
+        );
     }
 
     #[test]

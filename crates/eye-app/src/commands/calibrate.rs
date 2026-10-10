@@ -25,9 +25,11 @@ use eye_overlay::ellipse::{cov_mm_to_logical_px, logical_px_per_mm};
 use eye_overlay::targets::{AppendSender, Feedback, FeedbackSender, TargetShown, TargetSpec};
 use nalgebra::Point2;
 
+use crate::cli::GIT_REV;
 use crate::commands::record::{
     PumpObserver, RecordOptions, RecordSummary, SessionLocation, record_session,
 };
+use crate::commands::run::estimator_fingerprint;
 use crate::ctx::Ctx;
 use crate::shutdown;
 
@@ -512,7 +514,7 @@ pub fn fit_recording(
         .collect::<BTreeSet<_>>()
         .len();
     let outcome = DotSessionFit::fit_with(&samples, &run.rig, &FitConfig::default(), meta)?;
-    let profile = outcome.profile;
+    let mut profile = outcome.profile;
     let rejected_targets: Vec<u32> = outcome
         .reports
         .iter()
@@ -520,6 +522,7 @@ pub fn fit_recording(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    profile.provenance.protocol = Some(run.protocol);
     let expected = match loto(&mut replayed, &dot_session_fitter) {
         Ok(estimate) => {
             for warning in &estimate.warnings {
@@ -532,6 +535,10 @@ pub fn fit_recording(
             None
         }
     };
+    profile.provenance.expected_loto_mean_deg = expected
+        .as_ref()
+        .and_then(|m| m.angular_error_deg.as_ref())
+        .map(|s| s.mean);
     Ok(FitResult {
         profile,
         samples: samples.len(),
@@ -609,11 +616,28 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         args.keep,
         std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
     )?;
+    let session_id = recording
+        .location()
+        .map(|l| l.id.as_str().to_owned())
+        .unwrap_or_else(|| {
+            recording
+                .session_dir()
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
     let meta = ProfileMeta {
         name: args.profile.clone(),
         created_unix_s: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         estimator: config.estimate.kind.clone(),
-        provenance: Provenance::default(),
+        provenance: Provenance {
+            session_id: Some(session_id.clone()),
+            git_rev: Some(GIT_REV.to_string()),
+            estimator_fingerprint: Some(estimator_fingerprint(&config.estimate)),
+            protocol: None,
+            fit: Some(FitConfig::default()),
+            expected_loto_mean_deg: None,
+        },
     };
     if let Some(location) = recording.location() {
         let shutdown_rx = shutdown::install()?;
@@ -646,16 +670,6 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
             "calibration interrupted; nothing saved"
         );
     }
-    let session_id = recording
-        .location()
-        .map(|l| l.id.as_str().to_owned())
-        .unwrap_or_else(|| {
-            recording
-                .session_dir()
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        });
     let _session =
         tracing::info_span!(span::SESSION, { field::SESSION_ID } = session_id.as_str()).entered();
 
@@ -908,6 +922,30 @@ mod tests {
         assert_eq!(result.profile.created_unix_s, 1_791_409_623);
         assert_eq!(result.profile.estimator, "test-kappa-ray");
         assert!(!result.profile.rig_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn test_fit_recording_fills_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let config = kappa_ray_config(&FOUR_BY_FOUR_CENTRES, [3.0, -1.0], None);
+        let protocol = ProtocolConfig::default();
+        let result = fit_recording(
+            &session_dir,
+            &config,
+            &fake_registry(),
+            &protocol,
+            ProfileMeta::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.profile.provenance.protocol, Some(protocol));
+        assert!(result.profile.provenance.expected_loto_mean_deg.is_some());
     }
 
     #[test]
