@@ -54,7 +54,7 @@ impl Default for HideRules {
     fn default() -> Self {
         Self {
             margin_px: 24.0,
-            min_confidence: 0.2,
+            min_confidence: 0.02,
         }
     }
 }
@@ -613,6 +613,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_calibrated_residual_floor_keeps_point_visible() {
+        let mut buf = vec![0u8; 200 * 200 * 4];
+        let mut canvas = new_canvas(&mut buf);
+        let now = Instant::now();
+        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
+        let (p, received) = point_at(now, Matrix2::identity() * 55.5f64.powi(2), 0.062);
+        scene.on_msg(p, received);
+        scene.render(&mut canvas, received);
+        let px = bgra(&buf, 200, 100, 100);
+        let alpha = f64::from(px[3]) / 255.0;
+        assert!(alpha > 0.0, "point should be visible, alpha {alpha}");
+        for (channel, want) in [(px[2], 235u8), (px[1], 60), (px[0], 60)] {
+            assert_abs_diff_eq!(f64::from(channel), f64::from(want) * alpha, epsilon = 3.0);
+        }
+        assert_eq!(scene.presentation_mark(), Some(0));
+    }
+
+    #[test]
+    fn test_degenerate_ray_is_hidden() {
+        let mut buf = vec![0u8; 200 * 200 * 4];
+        let mut canvas = new_canvas(&mut buf);
+        let now = Instant::now();
+        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
+        let (p, received) = point_at(now, Matrix2::identity() * 105.0f64.powi(2), 0.005);
+        scene.on_msg(p, received);
+        scene.render(&mut canvas, received);
+        assert_alpha(&buf, 100, 100, 0.0, 0.5);
+    }
+
     fn new_canvas(buf: &mut [u8]) -> Canvas<'_> {
         Canvas::new(buf, (200, 200), 1).expect("size")
     }
@@ -907,7 +937,7 @@ mod tests {
             now,
             Point2::new(100.0, 100.0),
             Matrix2::new(100.0, 0.0, 0.0, 25.0),
-            0.1,
+            0.01,
         );
         scene.on_msg(p, received);
         scene.render(&mut canvas, received);

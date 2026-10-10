@@ -162,7 +162,7 @@ impl Default for OutputConfig {
             grid: [4, 4],
             easing_ms: 80,
             hide_margin_px: 24.0,
-            hide_below_confidence: 0.2,
+            hide_below_confidence: 0.02,
         }
     }
 }
@@ -445,7 +445,7 @@ mod tests {
                 grid: [4, 4],
                 easing_ms: 80,
                 hide_margin_px: 24.0,
-                hide_below_confidence: 0.2,
+                hide_below_confidence: 0.02,
             }
         );
         assert_eq!(config.rig, None);
@@ -585,7 +585,7 @@ mod tests {
                 grid: [4, 4],
                 easing_ms: 80,
                 hide_margin_px: 24.0,
-                hide_below_confidence: 0.2,
+                hide_below_confidence: 0.02,
             }
         );
     }
