@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eye::config::Config;
-use eye::pipeline::{Pipeline, RayStep};
+use eye::pipeline::{Pipeline, RayBatch, RayStep};
 use eye::registry::Registry;
 use eye_bench::calibration::{
     dot_session_fitter, fit_samples, latest_presentation, loto_with, position_key,
@@ -13,7 +13,9 @@ use eye_bench::calibration::{
 use eye_bench::metrics::{MetricParams, SessionMetrics, compute};
 use eye_bench::runner::replay_session;
 use eye_calibration::correction::{Provenance, UserProfile};
-use eye_calibration::protocol::{ProtocolConfig, TargetProtocol, TargetTiming};
+#[cfg(test)]
+use eye_calibration::protocol::TargetTiming;
+use eye_calibration::protocol::{FixationWindow, ProtocolConfig, TargetProtocol};
 use eye_calibration::store::ProfileStore;
 use eye_calibration::user_fit::{
     DotSessionFit, FitConfig, FitSample, ProfileMeta, TargetReject, TargetVerdict,
@@ -66,6 +68,16 @@ const FRAME_PERIOD_30HZ: Duration = Duration::from_nanos(1_000_000_000 / 30);
 /// At most this many retries per target position before an online rejection is left standing.
 const MAX_RETRIES: u8 = 2;
 
+/// Summary of the live preview fit: distinct target positions shown, samples selected (by the
+/// same selection the offline fit will make on the same events), and the worst-eye residual, so
+/// the live number and the saved profile's LOTO can be told apart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreviewFit {
+    pub targets: usize,
+    pub samples: usize,
+    pub rms_after_deg: f64,
+}
+
 /// Drives a synchronous `Pipeline` alongside `pump`'s frame loop, refitting the profile after
 /// every completed target and feeding the result back to the target overlay as a `Feedback` point.
 #[derive(Debug)]
@@ -75,11 +87,13 @@ pub struct LiveFeedback {
     pipeline: Option<Pipeline>,
     feedback: Option<FeedbackSender>,
     append: Option<AppendSender>,
-    timing: TargetTiming,
+    protocol: TargetProtocol,
+    base_len: u32,
+    windows: Vec<FixationWindow>,
+    batches: Vec<RayBatch>,
+    last_preview: Option<PreviewFit>,
     fit_cfg: FitConfig,
     meta: ProfileMeta,
-    current: Option<(Timestamp, Point2<f64>, Point2<f64>)>,
-    samples: Vec<FitSample>,
     retries: HashMap<(u64, u64), u8>,
     completed: usize,
     calibrated: bool,
@@ -94,21 +108,24 @@ impl LiveFeedback {
     pub fn new(
         registry: Registry,
         config: Config,
-        timing: TargetTiming,
+        protocol: TargetProtocol,
         fit_cfg: FitConfig,
         meta: ProfileMeta,
     ) -> Self {
+        let (cols, rows) = protocol.grid();
         Self {
             registry,
             config,
             pipeline: None,
             feedback: None,
             append: None,
-            timing,
+            protocol,
+            base_len: cols * rows,
+            windows: Vec::new(),
+            batches: Vec::new(),
+            last_preview: None,
             fit_cfg,
             meta,
-            current: None,
-            samples: Vec::new(),
             retries: HashMap::new(),
             completed: 0,
             calibrated: false,
@@ -123,21 +140,24 @@ impl LiveFeedback {
     #[cfg(test)]
     pub fn with_pipeline(
         pipeline: Pipeline,
-        timing: TargetTiming,
+        protocol: TargetProtocol,
         fit_cfg: FitConfig,
         meta: ProfileMeta,
     ) -> Self {
+        let (cols, rows) = protocol.grid();
         Self {
             registry: Registry::with_defaults(),
             config: Config::builtin_default(),
             pipeline: Some(pipeline),
             feedback: None,
             append: None,
-            timing,
+            protocol,
+            base_len: cols * rows,
+            windows: Vec::new(),
+            batches: Vec::new(),
+            last_preview: None,
             fit_cfg,
             meta,
-            current: None,
-            samples: Vec::new(),
             retries: HashMap::new(),
             completed: 0,
             calibrated: false,
@@ -146,6 +166,20 @@ impl LiveFeedback {
             skip_next_set: false,
             forced_rays_duration: None,
         }
+    }
+
+    /// The selection `fit_recording` will make on the same cached events: every ray whose own
+    /// timestamp falls in the latest presentation's window for its target.
+    pub fn fit_samples(&self) -> Vec<FitSample> {
+        fit_samples(
+            &self.windows,
+            self.batches.iter(),
+            latest_presentation(&self.windows, self.base_len),
+        )
+    }
+
+    pub fn last_preview(&self) -> Option<&PreviewFit> {
+        self.last_preview.as_ref()
     }
 
     pub fn is_calibrated(&self) -> bool {
@@ -199,20 +233,7 @@ impl LiveFeedback {
         let RayStep::Rays(batch) = ray_step else {
             return Ok(());
         };
-        if let Some((onset, target_mm, _px)) = self.current {
-            for ray in &batch.rays {
-                let elapsed =
-                    Duration::from_nanos(ray.timestamp.as_nanos().saturating_sub(onset.as_nanos()));
-                if elapsed >= self.timing.settle
-                    && elapsed < self.timing.settle + self.timing.window
-                {
-                    self.samples.push(FitSample {
-                        ray: ray.clone(),
-                        target_mm,
-                    });
-                }
-            }
-        }
+        self.batches.push(batch.clone());
         let pipeline = self
             .pipeline
             .as_mut()
@@ -237,16 +258,12 @@ impl LiveFeedback {
         if self.completed < self.fit_cfg.min_targets_offset {
             return;
         }
+        let samples = self.fit_samples();
         let pipeline = self
             .pipeline
             .as_mut()
             .expect("prepare() builds the pipeline before any target completes");
-        match DotSessionFit::fit_with(
-            &self.samples,
-            pipeline.rig(),
-            &self.fit_cfg,
-            self.meta.clone(),
-        ) {
+        match DotSessionFit::fit_with(&samples, pipeline.rig(), &self.fit_cfg, self.meta.clone()) {
             Ok(outcome) => {
                 for report in &outcome.reports {
                     tracing::info!(
@@ -256,11 +273,27 @@ impl LiveFeedback {
                         "live calibration refit"
                     );
                 }
+                let rms_after_deg = outcome
+                    .reports
+                    .iter()
+                    .map(|r| r.rms_after_deg)
+                    .fold(f64::MIN, f64::max);
+                let targets = self
+                    .windows
+                    .iter()
+                    .map(position_key)
+                    .collect::<BTreeSet<_>>()
+                    .len();
+                self.last_preview = Some(PreviewFit {
+                    targets,
+                    samples: samples.len(),
+                    rms_after_deg,
+                });
                 let verdicts = outcome.verdicts();
                 pipeline.set_correction(Some(Box::new(outcome.profile)));
                 self.calibrated = true;
                 if let Some((target_mm, px_logical)) = last_target {
-                    self.handle_verdict(target_mm, px_logical, &verdicts);
+                    self.handle_verdict(target_mm, px_logical, &samples, &verdicts);
                 }
             }
             Err(error) => {
@@ -279,10 +312,11 @@ impl LiveFeedback {
         &mut self,
         target_mm: Point2<f64>,
         px_logical: Point2<f64>,
+        samples: &[FitSample],
         verdicts: &[TargetVerdict],
     ) {
         let key = target_mm_key(target_mm);
-        let Some(index) = target_index_in_samples(&self.samples, target_mm) else {
+        let Some(index) = target_index_in_samples(samples, target_mm) else {
             return;
         };
         let verdict = verdicts.iter().find(|v| v.index == index);
@@ -320,7 +354,7 @@ impl LiveFeedback {
         if let Some(sender) = &self.append {
             let spec = TargetSpec {
                 px_logical,
-                timing: self.timing,
+                timing: self.protocol.timing(),
                 retry: true,
             };
             let _ = sender.append(spec);
@@ -393,15 +427,30 @@ impl PumpObserver for LiveFeedback {
             .rig()
             .screen();
         let target_mm = px_logical_to_mm(screen, &shown.px_logical);
-        let key = target_mm_key(target_mm);
-        if self.retries.contains_key(&key) {
-            self.samples.retain(|s| target_mm_key(s.target_mm) != key);
-        }
-        self.current = Some((shown.shown_at, target_mm, shown.px_logical));
+        let cell = self
+            .protocol
+            .cell_of_mm(&target_mm, screen)
+            .unwrap_or((0, 0));
+        let timing = self.protocol.timing();
+        let onset = shown.shown_at;
+        let start = Timestamp(onset.0 + timing.settle);
+        let end = Timestamp(start.0 + timing.window);
+        self.windows.push(FixationWindow {
+            index: shown.index as u32,
+            cell,
+            onset,
+            start,
+            end,
+            target_mm,
+            target_px_logical: shown.px_logical,
+        });
     }
 
     fn on_hidden(&mut self, index: usize, _at: Timestamp) {
-        let last_target = self.current.take().map(|(_, mm, px)| (mm, px));
+        let last_target = self
+            .windows
+            .last()
+            .map(|w| (w.target_mm, w.target_px_logical));
         self.completed += 1;
         self.refit(index, last_target);
         if let Some(sender) = &self.append {
@@ -486,6 +535,9 @@ pub struct FitResult {
     pub expected: Option<SessionMetrics>,
     /// Targets the final offline fit excluded, merged across eyes and deduplicated.
     pub rejected_targets: Vec<u32>,
+    /// The live run's own preview fit over the same kind of selection, for the printed summary
+    /// to show both numbers; `None` for `--from` or `--no-feedback`, where nothing ran live.
+    pub preview: Option<PreviewFit>,
 }
 
 pub fn fit_recording(
@@ -547,6 +599,7 @@ pub fn fit_recording(
         targets,
         expected,
         rejected_targets,
+        preview: None,
     })
 }
 
@@ -605,8 +658,12 @@ pub fn summary_line(result: &FitResult) -> String {
             result.rejected_targets
         )
     };
+    let preview = match &result.preview {
+        Some(p) => format!("; live preview residual: {:.2} deg", p.rms_after_deg),
+        None => String::new(),
+    };
     format!(
-        "{} targets, {} samples; expected accuracy (leave-one-target-out): {accuracy}{rejected}",
+        "{} targets, {} samples; expected accuracy (bench leave-one-target-out): {accuracy}{preview}{rejected}",
         result.targets, result.samples
     )
 }
@@ -641,6 +698,7 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
             expected_loto_mean_deg: None,
         },
     };
+    let mut preview = None;
     if let Some(location) = recording.location() {
         let shutdown_rx = shutdown::install()?;
         let live_protocol = protocol_for(args.targets, args.dwell_ms);
@@ -649,15 +707,17 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
             duration: None,
         };
         let summary: RecordSummary = if wants_feedback(&args) {
-            let timing = TargetProtocol::new(live_protocol)?.timing();
+            let protocol = TargetProtocol::new(live_protocol)?;
             let mut live = LiveFeedback::new(
                 Registry::with_defaults(),
                 config.clone(),
-                timing,
+                protocol,
                 FitConfig::default(),
                 meta.clone(),
             );
-            record_session(&config, location, &opts, &shutdown_rx, &mut live)?
+            let summary = record_session(&config, location, &opts, &shutdown_rx, &mut live)?;
+            preview = live.last_preview().cloned();
+            summary
         } else {
             record_session(
                 &config,
@@ -677,13 +737,14 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
 
     tracing::info!("fitting...");
     let protocol = fit_protocol(&args);
-    let result = fit_recording(
+    let mut result = fit_recording(
         &recording.session_dir(),
         &config,
         &Registry::with_defaults(),
         &protocol,
         meta,
     )?;
+    result.preview = preview;
     let saved = match &ctx.output {
         Some(path) => {
             eye_calibration::profiles::write_profile(path, &result.profile)?;
@@ -1028,6 +1089,7 @@ mod tests {
             targets,
             expected,
             rejected_targets,
+            preview: None,
         }
     }
 
@@ -1049,7 +1111,7 @@ mod tests {
         let result = fit_result(9, 2140, Some(1.84), 3.90, Some(1.0));
         assert_eq!(
             summary_line(&result),
-            "9 targets, 2140 samples; expected accuracy (leave-one-target-out): mean 1.84 deg, p95 3.90 deg, 3x3 hit 100.0 %"
+            "9 targets, 2140 samples; expected accuracy (bench leave-one-target-out): mean 1.84 deg, p95 3.90 deg, 3x3 hit 100.0 %"
         );
 
         let no_expected = FitResult {
@@ -1058,10 +1120,11 @@ mod tests {
             targets: 9,
             expected: None,
             rejected_targets: Vec::new(),
+            preview: None,
         };
         assert_eq!(
             summary_line(&no_expected),
-            "9 targets, 2140 samples; expected accuracy (leave-one-target-out): n/a"
+            "9 targets, 2140 samples; expected accuracy (bench leave-one-target-out): n/a"
         );
     }
 
@@ -1070,7 +1133,21 @@ mod tests {
         let result = fit_result_rejecting(9, 2140, Some(1.84), 3.90, Some(1.0), vec![4, 7]);
         assert_eq!(
             summary_line(&result),
-            "9 targets, 2140 samples; expected accuracy (leave-one-target-out): mean 1.84 deg, p95 3.90 deg, 3x3 hit 100.0 %; 2 targets rejected: [4, 7]"
+            "9 targets, 2140 samples; expected accuracy (bench leave-one-target-out): mean 1.84 deg, p95 3.90 deg, 3x3 hit 100.0 %; 2 targets rejected: [4, 7]"
+        );
+    }
+
+    #[test]
+    fn test_summary_line_prints_bench_loto_and_live_preview() {
+        let mut result = fit_result(9, 2140, Some(1.84), 3.90, Some(1.0));
+        result.preview = Some(PreviewFit {
+            targets: 9,
+            samples: 2140,
+            rms_after_deg: 2.37,
+        });
+        assert_eq!(
+            summary_line(&result),
+            "9 targets, 2140 samples; expected accuracy (bench leave-one-target-out): mean 1.84 deg, p95 3.90 deg, 3x3 hit 100.0 %; live preview residual: 2.37 deg"
         );
     }
 
@@ -1389,37 +1466,264 @@ mod tests {
             None,
             3,
         );
-        let timing = TargetTiming {
-            settle: Duration::from_millis(500),
-            window: Duration::from_millis(200),
-            dwell: Duration::from_millis(1000),
-        };
+        let protocol = TargetProtocol::new(ProtocolConfig {
+            grid: [3, 3],
+            lead_in_ms: 0,
+            dwell_ms: 1000,
+            settle_ms: 500,
+            window_ms: 200,
+        })
+        .unwrap();
         let mut live = LiveFeedback::with_pipeline(
             pipeline,
-            timing,
+            protocol,
             FitConfig::default(),
             ProfileMeta::default(),
         );
-        live.current = Some((
-            Timestamp::from_nanos(0),
-            Point2::new(10.0, 10.0),
-            Point2::new(0.0, 0.0),
-        ));
+        live.on_shown(&TargetShown {
+            index: 0,
+            output: OutputId::from("eDP-1"),
+            px_logical: Point2::new(0.0, 0.0),
+            shown_at: Timestamp::from_nanos(0),
+            clock: TargetClock::Commit,
+        });
 
         let rgb_frame = dual_camera_frame("rgb", 0, 600, PixelFormat::Rgb8, Illumination::Ambient);
         let ir_frame = dual_camera_frame("ir", 1, 750, PixelFormat::Gray8, Illumination::IrLit);
         live.process(&rgb_frame)
             .expect("rgb frame held, no set yet");
-        assert!(live.samples.is_empty(), "no set should have completed yet");
+        assert!(live.batches.is_empty(), "no set should have completed yet");
         live.process(&ir_frame)
             .expect("ir frame completes the pair");
 
         assert_eq!(
-            live.samples.len(),
+            live.fit_samples().len(),
             1,
             "the ray's own timestamp (600 ms) falls in the settle..settle+window \
              [500, 700) ms window even though the batch's timestamp (750 ms, the \
              newer IR frame) does not"
+        );
+    }
+
+    #[test]
+    fn test_live_preview_builds_window_from_shown_event() {
+        let targets_px = FOUR_BY_FOUR_CENTRES[..1].to_vec();
+        let config = kappa_ray_config(&targets_px, [0.0, 0.0], None);
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let protocol = TargetProtocol::new(ProtocolConfig::default()).unwrap();
+        let timing = protocol.timing();
+        let mut live = LiveFeedback::with_pipeline(
+            pipeline,
+            protocol,
+            FitConfig::default(),
+            ProfileMeta::default(),
+        );
+
+        let shown = TargetShown {
+            index: 3,
+            output: OutputId::from("eDP-1"),
+            px_logical: Point2::new(targets_px[0].0, targets_px[0].1),
+            shown_at: Timestamp::from_nanos(5_000_000_000),
+            clock: TargetClock::Commit,
+        };
+        live.on_shown(&shown);
+
+        assert_eq!(live.windows.len(), 1);
+        let window = &live.windows[0];
+        assert_eq!(window.index, 3);
+        assert_eq!(window.start, Timestamp(shown.shown_at.0 + timing.settle));
+        assert_eq!(window.end, Timestamp(window.start.0 + timing.window));
+    }
+
+    #[test]
+    fn test_live_preview_retry_keeps_latest_presentation_only() {
+        use eye_core::GazeRay;
+        use nalgebra::{Matrix2, Matrix3, Point3, Unit};
+
+        let targets_px = FOUR_BY_FOUR_CENTRES[..1].to_vec();
+        let config = kappa_ray_config(&targets_px, [0.0, 0.0], None);
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let protocol = TargetProtocol::new(ProtocolConfig::default()).unwrap();
+        let timing = protocol.timing();
+        let mut live = LiveFeedback::with_pipeline(
+            pipeline,
+            protocol,
+            FitConfig::default(),
+            ProfileMeta::default(),
+        );
+
+        let px = Point2::new(targets_px[0].0, targets_px[0].1);
+        let eye = Point3::new(155.0, 85.0, -500.0);
+        let direction = Unit::new_normalize(Point3::new(0.0, 0.0, 0.0) - eye);
+        let fake_ray = |ts_ns: u64| GazeRay {
+            side: None,
+            timestamp: Timestamp::from_nanos(ts_ns),
+            origin: eye,
+            direction,
+            angular_cov: Matrix2::identity() * 1e-6,
+            origin_cov: Matrix3::zeros(),
+            head_rotation: None,
+        };
+
+        let onset_a = 0u64;
+        live.on_shown(&TargetShown {
+            index: 0,
+            output: OutputId::from("eDP-1"),
+            px_logical: px,
+            shown_at: Timestamp::from_nanos(onset_a),
+            clock: TargetClock::Commit,
+        });
+        let mid_a = onset_a + timing.settle.as_nanos() as u64 + timing.window.as_nanos() as u64 / 2;
+        live.batches.push(RayBatch {
+            timestamp: Timestamp::from_nanos(mid_a),
+            rays: vec![fake_ray(mid_a)],
+        });
+
+        let onset_b = 10_000_000_000u64;
+        live.on_shown(&TargetShown {
+            index: 9,
+            output: OutputId::from("eDP-1"),
+            px_logical: px,
+            shown_at: Timestamp::from_nanos(onset_b),
+            clock: TargetClock::Commit,
+        });
+        let mid_b = onset_b + timing.settle.as_nanos() as u64 + timing.window.as_nanos() as u64 / 2;
+        live.batches.push(RayBatch {
+            timestamp: Timestamp::from_nanos(mid_b),
+            rays: vec![fake_ray(mid_b)],
+        });
+
+        let samples = live.fit_samples();
+        assert_eq!(
+            samples.len(),
+            1,
+            "only the retry's (index 9) presentation must be kept"
+        );
+        assert_eq!(samples[0].ray.timestamp, Timestamp::from_nanos(mid_b));
+    }
+
+    #[test]
+    fn test_live_preview_samples_equal_offline_selection_on_same_events() {
+        use eye_core::session::TargetRecord;
+
+        let targets_px = FOUR_BY_FOUR_CENTRES[..4].to_vec();
+        let config = kappa_ray_config(&targets_px, [0.0, 0.0], None);
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let protocol = TargetProtocol::new(ProtocolConfig {
+            grid: [2, 2],
+            ..ProtocolConfig::default()
+        })
+        .unwrap();
+        let (cols, rows) = protocol.grid();
+        let base_len = cols * rows;
+        let screen = synthetic_rig().screen().clone();
+        let mut live = LiveFeedback::with_pipeline(
+            pipeline,
+            protocol,
+            FitConfig::default(),
+            ProfileMeta::default(),
+        );
+
+        let mut shown_events = Vec::new();
+        let dwell_ns = 2_500_000_000u64;
+        for (k, &px) in targets_px.iter().enumerate() {
+            let onset_ns = k as u64 * dwell_ns;
+            let shown = TargetShown {
+                index: k,
+                output: OutputId::from("eDP-1"),
+                px_logical: Point2::new(px.0, px.1),
+                shown_at: Timestamp::from_nanos(onset_ns),
+                clock: TargetClock::Commit,
+            };
+            live.on_shown(&shown);
+            shown_events.push(shown);
+            live.process(&frame_at(k as u64, onset_ns + 1_100_000_000, (k + 1) as u8))
+                .expect("process succeeds");
+            if k == 0 {
+                live.process(&frame_at(100, onset_ns + 1_900_000_000, 1))
+                    .expect("process succeeds");
+            }
+            live.on_hidden(k, Timestamp::from_nanos(onset_ns + dwell_ns));
+        }
+
+        // Pushed after target 3's on_shown, but its timestamp falls in target 1's window:
+        // `process` must not gate on what the "current" target is at push time.
+        let late_ray_ts_ns = dwell_ns + 1_000_000_000;
+        live.process(&frame_at(150, late_ray_ts_ns, 2))
+            .expect("process succeeds");
+
+        let retry_index = targets_px.len();
+        let retry_onset_ns = targets_px.len() as u64 * dwell_ns;
+        let shown_a_retry = TargetShown {
+            index: retry_index,
+            output: OutputId::from("eDP-1"),
+            px_logical: shown_events[0].px_logical,
+            shown_at: Timestamp::from_nanos(retry_onset_ns),
+            clock: TargetClock::Commit,
+        };
+        live.on_shown(&shown_a_retry);
+        shown_events.push(shown_a_retry.clone());
+        live.process(&frame_at(200, retry_onset_ns + 1_100_000_000, 1))
+            .expect("process succeeds");
+        live.on_hidden(
+            retry_index,
+            Timestamp::from_nanos(retry_onset_ns + dwell_ns),
+        );
+
+        let records: Vec<TargetRecord> = shown_events
+            .iter()
+            .map(|s| target_record(s, None, &screen))
+            .collect();
+        let independent_windows = protocol.fixation_windows(&records, &screen).unwrap();
+        assert_eq!(live.windows, independent_windows);
+
+        let expected = fit_samples(
+            &independent_windows,
+            live.batches.iter(),
+            latest_presentation(&independent_windows, base_len),
+        );
+        let fingerprint = |samples: &[FitSample]| -> Vec<(u64, u64, u64)> {
+            samples
+                .iter()
+                .map(|s| {
+                    (
+                        s.ray.timestamp.as_nanos(),
+                        s.target_mm.x.to_bits(),
+                        s.target_mm.y.to_bits(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(fingerprint(&live.fit_samples()), fingerprint(&expected));
+
+        let target1_window = independent_windows
+            .iter()
+            .find(|w| w.index == 1)
+            .expect("target 1 has a window");
+        assert!(
+            expected
+                .iter()
+                .any(|s| s.ray.timestamp.as_nanos() == late_ray_ts_ns
+                    && s.target_mm == target1_window.target_mm),
+            "the late ray, pushed after target 3's on_shown, must still be selected for \
+             target 1's (non-superseded) window by timestamp, not by push order"
+        );
+
+        assert_eq!(
+            expected.len(),
+            5,
+            "target 0's base presentation (one in-window sample) is superseded by its retry; \
+             targets 1-3 and the retry each contribute one sample, plus the late sample for \
+             target 1"
         );
     }
 
@@ -1432,12 +1736,11 @@ mod tests {
         let pipeline =
             Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
                 .expect("builds without I/O");
-        let timing = TargetProtocol::new(ProtocolConfig::default())
-            .unwrap()
-            .timing();
+        let protocol = TargetProtocol::new(ProtocolConfig::default()).unwrap();
+        let timing = protocol.timing();
         let fit_cfg = FitConfig::default();
         let mut live =
-            LiveFeedback::with_pipeline(pipeline, timing, fit_cfg, ProfileMeta::default());
+            LiveFeedback::with_pipeline(pipeline, protocol, fit_cfg, ProfileMeta::default());
 
         let frames_per_target = (fit_cfg.min_samples_per_target * 2) as u64;
         let messages = live_session(&targets_px, timing, frames_per_target);
@@ -1486,12 +1789,11 @@ mod tests {
         let pipeline =
             Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
                 .expect("builds without I/O");
-        let timing = TargetProtocol::new(ProtocolConfig::default())
-            .unwrap()
-            .timing();
+        let protocol = TargetProtocol::new(ProtocolConfig::default()).unwrap();
+        let timing = protocol.timing();
         let fit_cfg = FitConfig::default();
         let mut live =
-            LiveFeedback::with_pipeline(pipeline, timing, fit_cfg, ProfileMeta::default());
+            LiveFeedback::with_pipeline(pipeline, protocol, fit_cfg, ProfileMeta::default());
 
         let frames_per_target = (fit_cfg.min_samples_per_target * 2) as u64;
         let messages = live_session(&targets_px, timing, frames_per_target);
@@ -1504,7 +1806,7 @@ mod tests {
         let before = fb_rx.try_recv().expect("feedback for the probe frame");
         assert!(before.calibrated);
 
-        live.samples.clear();
+        live.batches.clear();
         live.refit(99, None);
         assert!(
             live.is_calibrated(),
@@ -1546,12 +1848,11 @@ mod tests {
         let pipeline =
             Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
                 .expect("builds without I/O");
-        let timing = TargetProtocol::new(ProtocolConfig::default())
-            .unwrap()
-            .timing();
+        let protocol = TargetProtocol::new(ProtocolConfig::default()).unwrap();
+        let timing = protocol.timing();
         let fit_cfg = FitConfig::default();
         let mut live =
-            LiveFeedback::with_pipeline(pipeline, timing, fit_cfg, ProfileMeta::default());
+            LiveFeedback::with_pipeline(pipeline, protocol, fit_cfg, ProfileMeta::default());
         live.force_rays_duration(Duration::from_millis(100));
 
         let frames_per_target = 6u64;
@@ -1586,12 +1887,11 @@ mod tests {
         let pipeline =
             Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
                 .expect("builds without I/O");
-        let timing = TargetProtocol::new(ProtocolConfig::default())
-            .unwrap()
-            .timing();
+        let protocol = TargetProtocol::new(ProtocolConfig::default()).unwrap();
+        let timing = protocol.timing();
         let fit_cfg = FitConfig::default();
         let mut live =
-            LiveFeedback::with_pipeline(pipeline, timing, fit_cfg, ProfileMeta::default());
+            LiveFeedback::with_pipeline(pipeline, protocol, fit_cfg, ProfileMeta::default());
 
         let frames_per_target = (fit_cfg.min_samples_per_target * 2) as u64;
         let messages = live_session(&targets_px, timing, frames_per_target);
@@ -1612,16 +1912,15 @@ mod tests {
         let pipeline =
             Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
                 .expect("builds without I/O");
-        let timing = TargetProtocol::new(ProtocolConfig::default())
-            .unwrap()
-            .timing();
+        let protocol = TargetProtocol::new(ProtocolConfig::default()).unwrap();
+        let timing = protocol.timing();
         let fit_cfg = FitConfig::default();
         assert!(
             2 < fit_cfg.min_targets_offset,
             "test assumes no baseline yet"
         );
         let mut live =
-            LiveFeedback::with_pipeline(pipeline, timing, fit_cfg, ProfileMeta::default());
+            LiveFeedback::with_pipeline(pipeline, protocol, fit_cfg, ProfileMeta::default());
 
         let frames_per_target = (fit_cfg.min_samples_per_target * 2) as u64;
         let messages = live_session(&targets_px, timing, frames_per_target);
@@ -1643,12 +1942,11 @@ mod tests {
         let pipeline =
             Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
                 .expect("builds without I/O");
-        let timing = TargetProtocol::new(ProtocolConfig::default())
-            .unwrap()
-            .timing();
+        let protocol = TargetProtocol::new(ProtocolConfig::default()).unwrap();
+        let timing = protocol.timing();
         let fit_cfg = FitConfig::default();
         let mut live =
-            LiveFeedback::with_pipeline(pipeline, timing, fit_cfg, ProfileMeta::default());
+            LiveFeedback::with_pipeline(pipeline, protocol, fit_cfg, ProfileMeta::default());
 
         let frames_per_target = (fit_cfg.min_samples_per_target * 2) as u64;
         let messages = live_session(&targets_px, timing, frames_per_target);
@@ -1660,37 +1958,43 @@ mod tests {
         let screen = synthetic_rig().screen().clone();
         let bad_mm = px_logical_to_mm(&screen, &bad_px);
 
+        let onset_ns = 10_000_000_000_000u64;
         let shown = TargetShown {
             index: targets_px.len(),
             output: OutputId::from("eDP-1"),
             px_logical: bad_px,
-            shown_at: Timestamp::from_nanos(10_000_000_000_000),
+            shown_at: Timestamp::from_nanos(onset_ns),
             clock: TargetClock::Commit,
         };
         live.on_shown(&shown);
         assert!(
-            !live.samples.iter().any(|s| s.target_mm == bad_mm),
-            "the rejected presentation's samples must be dropped once its retry is shown"
+            !live.fit_samples().iter().any(|s| s.target_mm == bad_mm),
+            "the rejected presentation's samples must be superseded once its retry is shown"
         );
 
         let eye = Point3::new(155.0, 85.0, -500.0);
         let target_point = Point3::new(bad_mm.x, bad_mm.y, 0.0);
         let direction = Unit::new_normalize(target_point - eye);
-        for _ in 0..(fit_cfg.min_samples_per_target * 2) {
-            live.samples.push(FitSample {
-                ray: GazeRay {
+        let mid_ns =
+            onset_ns + timing.settle.as_nanos() as u64 + timing.window.as_nanos() as u64 / 2;
+        live.batches.push(RayBatch {
+            timestamp: Timestamp::from_nanos(mid_ns),
+            rays: (0..(fit_cfg.min_samples_per_target * 2))
+                .map(|_| GazeRay {
                     side: None,
-                    timestamp: Timestamp::from_nanos(0),
+                    timestamp: Timestamp::from_nanos(mid_ns),
                     origin: eye,
                     direction,
                     angular_cov: Matrix2::identity() * 1e-6,
                     origin_cov: Matrix3::zeros(),
                     head_rotation: None,
-                },
-                target_mm: bad_mm,
-            });
-        }
-        live.on_hidden(targets_px.len(), Timestamp::from_nanos(10_100_000_000_000));
+                })
+                .collect(),
+        });
+        live.on_hidden(
+            targets_px.len(),
+            Timestamp::from_nanos(onset_ns + 100_000_000_000),
+        );
 
         assert_eq!(
             drain_appended(&append_rx).len(),
@@ -1698,14 +2002,15 @@ mod tests {
             "a retry whose samples are now good must not be re-appended"
         );
 
+        let samples = live.fit_samples();
         let outcome = DotSessionFit::fit_with(
-            &live.samples,
+            &samples,
             live.pipeline.as_ref().unwrap().rig(),
             &fit_cfg,
             ProfileMeta::default(),
         )
         .unwrap();
-        let index = target_index_in_samples(&live.samples, bad_mm).unwrap();
+        let index = target_index_in_samples(&samples, bad_mm).unwrap();
         let verdict = outcome
             .verdicts()
             .into_iter()
@@ -1729,12 +2034,11 @@ mod tests {
         let pipeline =
             Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
                 .expect("builds without I/O");
-        let timing = TargetProtocol::new(ProtocolConfig::default())
-            .unwrap()
-            .timing();
+        let protocol = TargetProtocol::new(ProtocolConfig::default()).unwrap();
+        let timing = protocol.timing();
         let fit_cfg = FitConfig::default();
         let mut live =
-            LiveFeedback::with_pipeline(pipeline, timing, fit_cfg, ProfileMeta::default());
+            LiveFeedback::with_pipeline(pipeline, protocol, fit_cfg, ProfileMeta::default());
 
         let frames_per_target = (fit_cfg.min_samples_per_target * 2) as u64;
         let messages = live_session(&targets_px, timing, frames_per_target);
@@ -1761,20 +2065,22 @@ mod tests {
             live.on_shown(&shown);
             // Below `min_samples_per_target`: the fitter rejects this target as TooFewSamples
             // on every refit, regardless of the shared `direction`.
-            for _ in 0..2 {
-                live.samples.push(FitSample {
-                    ray: GazeRay {
+            let mid_ns =
+                at_ns + timing.settle.as_nanos() as u64 + timing.window.as_nanos() as u64 / 2;
+            live.batches.push(RayBatch {
+                timestamp: Timestamp::from_nanos(mid_ns),
+                rays: (0..2)
+                    .map(|_| GazeRay {
                         side: None,
-                        timestamp: Timestamp::from_nanos(0),
+                        timestamp: Timestamp::from_nanos(mid_ns),
                         origin: eye,
                         direction,
                         angular_cov: Matrix2::identity() * 1e-6,
                         origin_cov: Matrix3::zeros(),
                         head_rotation: None,
-                    },
-                    target_mm: bad_mm,
-                });
-            }
+                    })
+                    .collect(),
+            });
             live.on_hidden(retry_index, Timestamp::from_nanos(at_ns + 100_000_000_000));
         };
 
