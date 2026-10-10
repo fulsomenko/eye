@@ -3,10 +3,11 @@
 
 use eye::pipeline::RayBatch;
 use eye_calibration::correction::UserProfile;
+use eye_calibration::correction::legacy_source;
 use eye_calibration::protocol::FixationWindow;
 use eye_calibration::user_fit::{DotSessionFit, FitConfig, FitSample, ProfileMeta};
 use eye_core::log::{field, span};
-use eye_core::{GazePoint, Rig};
+use eye_core::{GazePoint, RaySource, Rig};
 
 use crate::metrics::EvalInput;
 use crate::runner::{Replayed, SessionRun, eval_input, window_at};
@@ -48,6 +49,7 @@ pub fn fit_samples<'a>(
     windows: &[FixationWindow],
     batches: impl IntoIterator<Item = &'a RayBatch>,
     include: impl Fn(&FixationWindow) -> bool,
+    source: RaySource,
 ) -> Vec<FitSample> {
     let mut out = Vec::new();
     for batch in batches {
@@ -61,6 +63,7 @@ pub fn fit_samples<'a>(
             out.push(FitSample {
                 ray: ray.clone(),
                 target_mm: w.target_mm,
+                source,
             });
         }
     }
@@ -128,6 +131,7 @@ pub fn cross(
         return Err("cross needs at least two recordings".to_string());
     }
 
+    let source = legacy_source(held_out.pipeline.estimator_name());
     let mut train = Vec::new();
     for other in others {
         let base_len = other.protocol.grid[0] * other.protocol.grid[1];
@@ -135,6 +139,7 @@ pub fn cross(
             &other.windows,
             other.steps.iter().filter_map(|s| s.batch.as_ref()),
             latest_presentation(&other.windows, base_len),
+            source,
         ));
     }
 
@@ -166,6 +171,7 @@ pub fn loto_with(
     .entered();
 
     let excluded_windows = replayed.run.windows.iter().filter(|w| !include(w)).count();
+    let source = legacy_source(replayed.pipeline.estimator_name());
 
     let mut warnings = Vec::new();
     let mut eval_windows = Vec::new();
@@ -177,6 +183,7 @@ pub fn loto_with(
             &replayed.run.windows,
             replayed.run.steps.iter().filter_map(|s| s.batch.as_ref()),
             |w| include(w) && position_key(w) != key,
+            source,
         );
         let profile = match fitter(&train, &replayed.run.rig) {
             Ok(profile) => profile,
@@ -304,7 +311,12 @@ mod tests {
         .unwrap();
         let held_out_mm = replayed.run.windows[2].target_mm;
         let batches = replayed.run.steps.iter().filter_map(|s| s.batch.as_ref());
-        let samples = fit_samples(&replayed.run.windows, batches, |w| w.index != 2);
+        let samples = fit_samples(
+            &replayed.run.windows,
+            batches,
+            |w| w.index != 2,
+            RaySource::RgbOnly,
+        );
         assert!(samples.iter().all(|s| s.target_mm != held_out_mm));
         let expected: usize = replayed
             .run
@@ -339,7 +351,7 @@ mod tests {
         )
         .unwrap();
         let batches = replayed.run.steps.iter().filter_map(|s| s.batch.as_ref());
-        let samples = fit_samples(&replayed.run.windows, batches, |_| true);
+        let samples = fit_samples(&replayed.run.windows, batches, |_| true, RaySource::RgbOnly);
         let in_window: usize = replayed
             .run
             .steps
@@ -376,7 +388,12 @@ mod tests {
             timestamp: eye_core::Timestamp::from_nanos(500_000_000),
             rays: vec![ray.clone(), ray],
         };
-        let samples = fit_samples(std::slice::from_ref(&window), [&batch], |_| true);
+        let samples = fit_samples(
+            std::slice::from_ref(&window),
+            [&batch],
+            |_| true,
+            RaySource::RgbOnly,
+        );
         assert_eq!(samples.len(), 2);
         assert!(samples.iter().all(|s| s.target_mm == window.target_mm));
     }
@@ -414,7 +431,12 @@ mod tests {
             timestamp: eye_core::Timestamp::from_nanos(1_600_000_000),
             rays: vec![ray(700_000_000), ray(1_600_000_000)],
         };
-        let samples = fit_samples(&[window_a.clone(), window_b.clone()], [&batch], |_| true);
+        let samples = fit_samples(
+            &[window_a.clone(), window_b.clone()],
+            [&batch],
+            |_| true,
+            RaySource::RgbOnly,
+        );
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].target_mm, window_a.target_mm);
         assert_eq!(samples[1].target_mm, window_b.target_mm);
@@ -838,6 +860,7 @@ mod tests {
             &replayed.run.windows,
             replayed.run.steps.iter().filter_map(|s| s.batch.as_ref()),
             |_| true,
+            RaySource::RgbOnly,
         );
         let profile = dot_session_fitter(&train, &replayed.run.rig).unwrap();
         let windows = replayed.run.windows.clone();

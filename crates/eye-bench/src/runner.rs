@@ -1622,6 +1622,7 @@ mod tests {
             &replayed.run.windows,
             replayed.run.steps.iter().filter_map(|s| s.batch.as_ref()),
             |_| true,
+            eye_core::RaySource::RgbOnly,
         );
         crate::calibration::dot_session_fitter(&train, &replayed.run.rig).unwrap()
     }

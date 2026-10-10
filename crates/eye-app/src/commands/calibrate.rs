@@ -12,13 +12,13 @@ use eye_bench::calibration::{
 };
 use eye_bench::metrics::{MetricParams, SessionMetrics, compute};
 use eye_bench::runner::replay_session;
-use eye_calibration::correction::{Provenance, UserProfile};
+use eye_calibration::correction::{Provenance, UserProfile, legacy_source};
 #[cfg(test)]
 use eye_calibration::protocol::TargetTiming;
 use eye_calibration::protocol::{FixationWindow, ProtocolConfig, TargetProtocol};
 use eye_calibration::store::ProfileStore;
 use eye_calibration::user_fit::{
-    DotSessionFit, FitConfig, FitSample, ProfileMeta, TargetReject, TargetVerdict,
+    DotSessionFit, EyeFitReport, FitConfig, FitSample, ProfileMeta, TargetReject, TargetVerdict,
 };
 use eye_core::log::{field, span};
 use eye_core::{CameraInfo, Frame, Rig, Timestamp};
@@ -175,6 +175,7 @@ impl LiveFeedback {
             &self.windows,
             self.batches.iter(),
             latest_presentation(&self.windows, self.base_len),
+            legacy_source(&self.meta.estimator),
         )
     }
 
@@ -533,11 +534,27 @@ pub struct FitResult {
     pub targets: usize,
     /// Leave-one-target-out estimate of the accuracy this profile gives on this pipeline; `None` if every fold failed.
     pub expected: Option<SessionMetrics>,
-    /// Targets the final offline fit excluded, merged across eyes and deduplicated.
+    /// Targets the primary source's fit excluded, merged across eyes and deduplicated.
     pub rejected_targets: Vec<u32>,
     /// The live run's own preview fit over the same kind of selection, for the printed summary
     /// to show both numbers; `None` for `--from` or `--no-feedback`, where nothing ran live.
     pub preview: Option<PreviewFit>,
+}
+
+/// Targets rejected by the primary source's reports (the lowest `source` among `reports`),
+/// merged across its eyes and deduplicated: a non-primary source's rejections (for example an
+/// IR-only glint dropout) must not appear as targets the offline fit excluded.
+fn primary_rejected_targets(reports: &[EyeFitReport]) -> Vec<u32> {
+    let Some(primary) = reports.iter().map(|r| r.source).min() else {
+        return Vec::new();
+    };
+    reports
+        .iter()
+        .filter(|r| r.source == primary)
+        .flat_map(|r| r.targets_rejected.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 pub fn fit_recording(
@@ -548,6 +565,7 @@ pub fn fit_recording(
     meta: ProfileMeta,
 ) -> anyhow::Result<FitResult> {
     let mut replayed = replay_session(dir, config, registry, protocol)?;
+    let source = legacy_source(replayed.pipeline.estimator_name());
     let run = &replayed.run;
     let base_len = run.protocol.grid[0] * run.protocol.grid[1];
     let windows = run.windows.clone();
@@ -556,6 +574,7 @@ pub fn fit_recording(
         &run.windows,
         run.steps.iter().filter_map(|s| s.batch.as_ref()),
         &include,
+        source,
     );
     anyhow::ensure!(
         !samples.is_empty(),
@@ -569,13 +588,7 @@ pub fn fit_recording(
         .len();
     let outcome = DotSessionFit::fit_with(&samples, &run.rig, &FitConfig::default(), meta)?;
     let mut profile = outcome.profile;
-    let rejected_targets: Vec<u32> = outcome
-        .reports
-        .iter()
-        .flat_map(|r| r.targets_rejected.iter().copied())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let rejected_targets = primary_rejected_targets(&outcome.reports);
     profile.provenance.protocol = Some(run.protocol);
     let expected = match loto_with(&mut replayed, &dot_session_fitter, &include) {
         Ok(estimate) => {
@@ -1127,6 +1140,30 @@ mod tests {
             summary_line(&no_expected),
             "9 targets, 2140 samples; expected accuracy (bench leave-one-target-out): n/a"
         );
+    }
+
+    #[test]
+    fn test_fit_recording_rejected_targets_come_from_primary_source() {
+        use eye_calibration::correction::{CorrectionModel, EyeKey};
+        use eye_core::RaySource;
+
+        let report = |source, targets_rejected: Vec<u32>| EyeFitReport {
+            source,
+            key: EyeKey::Right,
+            model: Some(CorrectionModel::Affine),
+            targets_used: Vec::new(),
+            targets_rejected,
+            rms_before_deg: 0.0,
+            rms_after_deg: 0.0,
+            loo_target_mean_deg: 0.0,
+            samples_without_head_pose: 0,
+            diagnostics: Vec::new(),
+        };
+        let reports = vec![
+            report(RaySource::RgbOnly, vec![1]),
+            report(RaySource::IrOnly, vec![3]),
+        ];
+        assert_eq!(primary_rejected_targets(&reports), vec![1]);
     }
 
     #[test]
@@ -1691,6 +1728,7 @@ mod tests {
             &independent_windows,
             live.batches.iter(),
             latest_presentation(&independent_windows, base_len),
+            legacy_source(&live.meta.estimator),
         );
         let fingerprint = |samples: &[FitSample]| -> Vec<(u64, u64, u64)> {
             samples

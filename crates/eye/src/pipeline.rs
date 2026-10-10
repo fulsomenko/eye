@@ -163,6 +163,10 @@ impl Pipeline {
         &self.rig
     }
 
+    pub fn estimator_name(&self) -> &'static str {
+        self.estimator.name()
+    }
+
     /// Pushes one frame into the Pairer (arrival order); never drops a frame. The Pairer may
     /// complete more than one set per push (e.g. a stale held frame released by a new arrival);
     /// extras are queued and returned by the next `pair`/`flush` call before any new frame.

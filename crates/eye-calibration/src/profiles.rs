@@ -688,7 +688,11 @@ foo = 1
                     origin_cov: Matrix3::identity(),
                     head_rotation: None,
                 };
-                samples.push(FitSample { ray, target_mm });
+                samples.push(FitSample {
+                    ray,
+                    target_mm,
+                    source: RaySource::RgbOnly,
+                });
             }
         }
         samples

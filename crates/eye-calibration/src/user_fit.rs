@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use eye_core::log::field;
-use eye_core::{GazeRay, Rig};
+use eye_core::{GazeRay, RaySource, Rig};
 use eye_geometry::angles::yaw_pitch_from_direction;
 use nalgebra::{
     Cholesky, Matrix2, Point2, Point3, Quaternion, SMatrix, SVector, Unit, UnitQuaternion, Vector2,
@@ -9,7 +9,7 @@ use nalgebra::{
 
 use crate::correction::{
     AngularCorrection, CalibrationPose, CorrectionModel, EyeKey, PROFILE_VERSION, Provenance,
-    UserProfile, design, design_quad, design12, eye_label, legacy_source,
+    UserProfile, design, design_quad, design12, eye_label,
 };
 use crate::error::CalibrationError;
 
@@ -17,6 +17,7 @@ use crate::error::CalibrationError;
 pub struct FitSample {
     pub ray: GazeRay,
     pub target_mm: Point2<f64>,
+    pub source: RaySource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -28,6 +29,9 @@ pub struct FitConfig {
     pub huber_k: f64,
     pub target_outlier_factor: f64,
     pub slope_prior_sigma: f64,
+    /// Ridge prior sigma on the four slope terms for every source except `rgb-only`
+    /// (`slope_prior_sigma` keeps applying to `rgb-only`).
+    pub ir_slope_prior_sigma: f64,
     pub offset_prior_sigma_deg: f64,
     pub quad_prior_sigma: f64,
     pub min_targets_affine: usize,
@@ -48,6 +52,7 @@ impl Default for FitConfig {
             huber_k: 1.345,
             target_outlier_factor: 3.0,
             slope_prior_sigma: 0.15,
+            ir_slope_prior_sigma: 0.5,
             offset_prior_sigma_deg: 10.0,
             quad_prior_sigma: 2.0,
             min_targets_affine: 6,
@@ -73,13 +78,17 @@ pub struct FitOutcome {
 }
 
 impl FitOutcome {
-    /// One verdict per target index, merged across eyes: an index is `rejected` if any eye's
-    /// diagnostics rejected it. When rejected, the reported `samples`/`residual_deg`/`reason` come
-    /// from whichever rejecting eye has the most samples; when not rejected, they come from
-    /// whichever eye has the most samples.
+    /// One verdict per target index, merged across the primary source's eyes (the lowest
+    /// `source` among `reports`): an index is `rejected` if any such eye's diagnostics rejected
+    /// it. When rejected, the reported `samples`/`residual_deg`/`reason` come from whichever
+    /// rejecting eye has the most samples; when not rejected, they come from whichever eye has
+    /// the most samples.
     pub fn verdicts(&self) -> Vec<TargetVerdict> {
+        let Some(primary) = self.reports.iter().map(|r| r.source).min() else {
+            return Vec::new();
+        };
         let mut merged: BTreeMap<u32, TargetVerdict> = BTreeMap::new();
-        for report in &self.reports {
+        for report in self.reports.iter().filter(|r| r.source == primary) {
             for v in &report.diagnostics {
                 match merged.entry(v.index) {
                     std::collections::btree_map::Entry::Vacant(e) => {
@@ -110,6 +119,7 @@ fn merge_verdicts(a: &TargetVerdict, b: &TargetVerdict) -> TargetVerdict {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EyeFitReport {
+    pub source: RaySource,
     pub key: EyeKey,
     pub model: Option<CorrectionModel>,
     pub targets_used: Vec<u32>,
@@ -170,33 +180,16 @@ impl DotSessionFit {
         cfg: &FitConfig,
         meta: ProfileMeta,
     ) -> Result<FitOutcome, CalibrationError> {
-        let calibration_pose = calibration_pose(samples);
-        let model_override = cfg.model_override.or_else(|| {
-            samples
-                .iter()
-                .any(|s| s.ray.head_rotation.is_some())
-                .then_some(CorrectionModel::HeadFrame)
-        });
-        let use_head_frame = model_override == Some(CorrectionModel::HeadFrame);
-        let (samples, without_pose): (Vec<&FitSample>, Vec<&FitSample>) = samples
+        let primary = samples.iter().map(|s| s.source).min();
+        let primary_samples: Vec<&FitSample> = samples
             .iter()
-            .partition(|s| !use_head_frame || s.ray.head_rotation.is_some());
-        if use_head_frame && samples.is_empty() {
-            return Err(CalibrationError::NoHeadPose {
-                samples: without_pose.len(),
-            });
-        }
-        if !without_pose.is_empty() {
-            tracing::debug!(
-                { field::REASON } = "no_head_pose",
-                dropped = without_pose.len() as u64,
-                "samples skipped"
-            );
-        }
+            .filter(|s| Some(s.source) == primary)
+            .collect();
+        let calibration_pose = calibration_pose(&primary_samples);
 
         let mut target_index_of: HashMap<(u64, u64), u32> = HashMap::new();
         let mut target_mm_of: Vec<Point2<f64>> = Vec::new();
-        for s in samples.iter().copied() {
+        for s in samples {
             let key = (s.target_mm.x.to_bits(), s.target_mm.y.to_bits());
             target_index_of.entry(key).or_insert_with(|| {
                 let idx = target_mm_of.len() as u32;
@@ -205,445 +198,79 @@ impl DotSessionFit {
             });
         }
 
-        let mut by_eye_target: HashMap<(EyeKey, u32), Vec<&FitSample>> = HashMap::new();
-        for s in samples.iter().copied() {
-            let key = (s.target_mm.x.to_bits(), s.target_mm.y.to_bits());
-            let idx = target_index_of[&key];
-            let eye = EyeKey::from(s.ray.side);
-            by_eye_target.entry((eye, idx)).or_default().push(s);
+        let mut by_source: BTreeMap<RaySource, Vec<&FitSample>> = BTreeMap::new();
+        for s in samples {
+            by_source.entry(s.source).or_default().push(s);
         }
 
-        let mut eyes_present: Vec<EyeKey> = by_eye_target.keys().map(|(e, _)| *e).collect();
-        eyes_present.sort();
-        eyes_present.dedup();
-
-        let jitter_rad = cfg.fixation_jitter_deg.to_radians();
-        let s_off = cfg.offset_prior_sigma_deg.to_radians();
-        let s_slope = cfg.slope_prior_sigma;
-        let prior6 = SMatrix::<f64, 6, 6>::from_diagonal(&SVector::<f64, 6>::from([
-            1.0 / (s_off * s_off),
-            1.0 / (s_slope * s_slope),
-            1.0 / (s_slope * s_slope),
-            1.0 / (s_off * s_off),
-            1.0 / (s_slope * s_slope),
-            1.0 / (s_slope * s_slope),
-        ]));
-        let s_quad = cfg.quad_prior_sigma;
-        let prior12 = {
-            let mut p = SMatrix::<f64, 12, 12>::zeros();
-            p.fixed_view_mut::<6, 6>(0, 0).copy_from(&prior6);
-            p.fixed_view_mut::<6, 6>(6, 6)
-                .copy_from(&SMatrix::<f64, 6, 6>::from_diagonal_element(
-                    1.0 / (s_quad * s_quad),
-                ));
-            p
-        };
-
-        let mut eyes = BTreeMap::new();
-        let mut reports = Vec::new();
-        let mut max_usable = 0usize;
-        let mut omitted: Vec<(EyeKey, &'static str, usize)> = Vec::new();
-
-        for eye in eyes_present {
-            let mut sample_rejected: Vec<u32> = Vec::new();
-            let mut usable: Vec<TargetAgg> = Vec::new();
-            let mut diagnostics: Vec<TargetVerdict> = Vec::new();
-
-            let mut target_indices: Vec<u32> = (0..target_mm_of.len() as u32)
-                .filter(|i| by_eye_target.contains_key(&(eye, *i)))
-                .collect();
-            target_indices.sort_unstable();
-
-            for idx in target_indices {
-                let group = &by_eye_target[&(eye, idx)];
-                let target_mm = target_mm_of[idx as usize];
-                let target_point = Point3::new(target_mm.x, target_mm.y, 0.0);
-
-                let mut os = Vec::with_capacity(group.len());
-                let mut ds = Vec::with_capacity(group.len());
-                let mut es = Vec::with_capacity(group.len());
-                for s in group.iter() {
-                    let desired_dir = Unit::new_normalize(target_point - s.ray.origin);
-                    let (o, d) = if use_head_frame {
-                        let inv = s.ray.head_rotation.expect("partitioned above").inverse();
-                        (
-                            yaw_pitch_from_direction(&(inv * s.ray.direction)),
-                            yaw_pitch_from_direction(&(inv * desired_dir)),
-                        )
-                    } else {
-                        (
-                            yaw_pitch_from_direction(&s.ray.direction),
-                            yaw_pitch_from_direction(&desired_dir),
-                        )
-                    };
-                    os.push(o);
-                    ds.push(d);
-                    es.push(o - d);
-                }
-
-                let keep = reject_sample_outliers(&es, cfg);
-                let n_keep = keep.iter().filter(|&&k| k).count();
-                if n_keep < cfg.min_samples_per_target {
-                    tracing::debug!(
-                        eye = eye_label(eye),
-                        target = idx as u64,
-                        { field::REASON } = "too_few_samples",
-                        samples = group.len() as u64,
-                        kept = n_keep as u64,
-                        min_samples_per_target = cfg.min_samples_per_target as u64,
-                        "target rejected"
-                    );
-                    sample_rejected.push(idx);
-                    let spread_deg = sample_spread_deg(&es);
-                    diagnostics.push(TargetVerdict {
-                        index: idx,
-                        samples: n_keep,
-                        residual_deg: spread_deg,
-                        rejected: true,
-                        reason: Some(TargetReject::TooFewSamples {
-                            have: n_keep,
-                            need: cfg.min_samples_per_target,
-                        }),
-                    });
-                    continue;
-                }
-
-                let kept_o: Vec<Vector2<f64>> = os
-                    .iter()
-                    .zip(&keep)
-                    .filter(|(_, k)| **k)
-                    .map(|(o, _)| *o)
-                    .collect();
-                let kept_d: Vec<Vector2<f64>> = ds
-                    .iter()
-                    .zip(&keep)
-                    .filter(|(_, k)| **k)
-                    .map(|(d, _)| *d)
-                    .collect();
-                let kept_e: Vec<Vector2<f64>> = es
-                    .iter()
-                    .zip(&keep)
-                    .filter(|(_, k)| **k)
-                    .map(|(e, _)| *e)
-                    .collect();
-
-                let n = kept_o.len() as f64;
-                let o_k = kept_o.iter().fold(Vector2::zeros(), |a, b| a + b) / n;
-                let d_k = kept_d.iter().fold(Vector2::zeros(), |a, b| a + b) / n;
-                let mean_e = kept_e.iter().fold(Vector2::zeros(), |a, b| a + b) / n;
-                let mut s_k = Matrix2::zeros();
-                for e in &kept_e {
-                    let diff = e - mean_e;
-                    s_k += diff * diff.transpose();
-                }
-                if kept_e.len() > 1 {
-                    s_k /= (kept_e.len() - 1) as f64;
-                }
-                let c_k = s_k / n + Matrix2::identity() * (jitter_rad * jitter_rad);
-                let cov_inv = c_k
-                    .try_inverse()
-                    .unwrap_or_else(|| Matrix2::identity() / (jitter_rad * jitter_rad));
-
-                tracing::trace!(
-                    eye = eye_label(eye),
-                    target = idx as u64,
-                    samples = kept_o.len() as u64,
-                    err_yaw_deg = mean_e.x.to_degrees(),
-                    err_pitch_deg = mean_e.y.to_degrees(),
-                    "target aggregated"
-                );
-
-                usable.push(TargetAgg {
-                    index: idx,
-                    samples: n_keep,
-                    observed: o_k,
-                    desired: d_k,
-                    cov_inv,
-                });
-            }
-
-            max_usable = max_usable.max(usable.len());
-
-            if usable.len() < cfg.min_targets_offset {
-                tracing::debug!(
-                    eye = eye_label(eye),
-                    { field::REASON } = "too_few_targets",
-                    usable = usable.len() as u64,
-                    min_targets_offset = cfg.min_targets_offset as u64,
-                    "eye omitted"
-                );
-                omitted.push((eye, "too_few_targets", usable.len()));
-                reports.push(EyeFitReport {
-                    key: eye,
-                    model: None,
-                    targets_used: Vec::new(),
-                    targets_rejected: sample_rejected,
-                    rms_before_deg: 0.0,
-                    rms_after_deg: 0.0,
-                    loo_target_mean_deg: 0.0,
-                    samples_without_head_pose: without_pose.len(),
-                    diagnostics,
-                });
-                continue;
-            }
-
-            let mut weights = vec![1.0; usable.len()];
-            let mut theta_prev: Option<SVector<f64, 6>> = None;
-            let mut rho = vec![0.0; usable.len()];
-            for iteration in 0..10u32 {
-                let (theta, _cov, _chi2) = solve_weighted(&usable, &weights, &prior6)
-                    .expect("ridge prior keeps the normal matrix positive definite");
-                rho = usable
-                    .iter()
-                    .map(|t| {
-                        let r = t.desired - (t.observed + design(&t.observed) * theta);
-                        (r.dot(&(t.cov_inv * r))).sqrt()
-                    })
-                    .collect();
-                let step = theta_prev.map(|p| (theta - p).norm());
-                let converged = step.map(|s| s < 1e-9).unwrap_or(false);
-                tracing::trace!(
-                    eye = eye_label(eye),
-                    iteration = u64::from(iteration),
-                    step = step.unwrap_or(0.0),
-                    converged,
-                    "irls iteration"
-                );
-                theta_prev = Some(theta);
-                if converged {
-                    break;
-                }
-                weights = rho
-                    .iter()
-                    .map(|&r| {
-                        if r > 0.0 {
-                            (cfg.huber_k / r).min(1.0)
-                        } else {
-                            1.0
-                        }
-                    })
-                    .collect();
-            }
-
-            let mut rho_sorted = rho.clone();
-            let median_rho = median(&mut rho_sorted);
-            let residual_limit = (cfg.target_outlier_factor * median_rho).max(3.0);
-            let mut huber_rejected = Vec::new();
-            let mut remaining = Vec::new();
-            for (t, &r) in usable.iter().zip(&rho) {
-                let rejected = r > residual_limit;
-                if rejected {
-                    tracing::debug!(
-                        eye = eye_label(eye),
-                        target = t.index as u64,
-                        { field::REASON } = "huber_outlier",
-                        rho = r,
-                        median_rho,
-                        target_outlier_factor = cfg.target_outlier_factor,
-                        "target rejected"
-                    );
-                    huber_rejected.push(t.index);
-                } else {
-                    tracing::debug!(
-                        eye = eye_label(eye),
-                        target = t.index as u64,
-                        rho = r,
-                        median_rho,
-                        "target residual"
-                    );
-                    remaining.push(t.clone());
-                }
-                diagnostics.push(TargetVerdict {
-                    index: t.index,
-                    samples: t.samples,
-                    residual_deg: r,
-                    rejected,
-                    reason: rejected.then_some(TargetReject::Residual {
-                        deg: r,
-                        limit: residual_limit,
-                    }),
-                });
-            }
-
-            let mut targets_rejected = sample_rejected.clone();
-            targets_rejected.extend(huber_rejected);
-            targets_rejected.sort_unstable();
-
-            if remaining.len() < cfg.min_targets_offset {
-                tracing::debug!(
-                    eye = eye_label(eye),
-                    { field::REASON } = "too_few_targets_after_rejection",
-                    remaining = remaining.len() as u64,
-                    min_targets_offset = cfg.min_targets_offset as u64,
-                    "eye omitted"
-                );
-                omitted.push((eye, "too_few_targets_after_rejection", remaining.len()));
-                reports.push(EyeFitReport {
-                    key: eye,
-                    model: None,
-                    targets_used: Vec::new(),
-                    targets_rejected,
-                    rms_before_deg: 0.0,
-                    rms_after_deg: 0.0,
-                    loo_target_mean_deg: 0.0,
-                    samples_without_head_pose: without_pose.len(),
-                    diagnostics,
-                });
-                continue;
-            }
-
-            let model = match model_override {
-                Some(m) => m,
-                None if remaining.len() >= cfg.min_targets_quadratic => CorrectionModel::Quadratic,
-                None if remaining.len() >= cfg.min_targets_affine => CorrectionModel::Affine,
-                None => CorrectionModel::OffsetOnly,
-            };
-
-            let ones = vec![1.0; remaining.len()];
-            let (
-                theta_final,
-                quad_final,
-                cov_final_raw,
-                quad_cov_final_raw,
-                cross_final_raw,
-                chi2_final,
-                dof,
-            ) = match model {
-                CorrectionModel::Affine | CorrectionModel::HeadFrame => {
-                    let (theta, cov, chi2) = solve_weighted(&remaining, &ones, &prior6)
-                        .expect("ridge prior keeps the normal matrix positive definite");
-                    (
-                        theta,
-                        SVector::<f64, 6>::zeros(),
-                        cov,
-                        SMatrix::<f64, 6, 6>::zeros(),
-                        SMatrix::<f64, 6, 6>::zeros(),
-                        chi2,
-                        2.0 * remaining.len() as f64 - 6.0,
-                    )
-                }
-                CorrectionModel::OffsetOnly => {
-                    let (theta2, cov2, chi2) = fit_offset_only(&remaining, s_off);
-                    let theta = SVector::<f64, 6>::from([theta2.x, 0.0, 0.0, theta2.y, 0.0, 0.0]);
-                    let mut cov = SMatrix::<f64, 6, 6>::zeros();
-                    cov[(0, 0)] = cov2[(0, 0)];
-                    cov[(0, 3)] = cov2[(0, 1)];
-                    cov[(3, 0)] = cov2[(1, 0)];
-                    cov[(3, 3)] = cov2[(1, 1)];
-                    (
-                        theta,
-                        SVector::<f64, 6>::zeros(),
-                        cov,
-                        SMatrix::<f64, 6, 6>::zeros(),
-                        SMatrix::<f64, 6, 6>::zeros(),
-                        chi2,
-                        2.0 * remaining.len() as f64 - 2.0,
-                    )
-                }
-                CorrectionModel::Quadratic => {
-                    let (theta12, cov12, chi2) = solve_weighted12(&remaining, &ones, &prior12)
-                        .expect("ridge prior keeps the normal matrix positive definite");
-                    let theta = SVector::<f64, 6>::from_fn(|i, _| theta12[i]);
-                    let quad = SVector::<f64, 6>::from_fn(|i, _| theta12[6 + i]);
-                    let cov = SMatrix::<f64, 6, 6>::from_fn(|r, k| cov12[(r, k)]);
-                    let quad_cov = SMatrix::<f64, 6, 6>::from_fn(|r, k| cov12[(6 + r, 6 + k)]);
-                    let cross = SMatrix::<f64, 6, 6>::from_fn(|r, k| cov12[(r, 6 + k)]);
-                    (
-                        theta,
-                        quad,
-                        cov,
-                        quad_cov,
-                        cross,
-                        chi2,
-                        2.0 * remaining.len() as f64 - 12.0,
-                    )
-                }
-            };
-            let scale = if dof > 0.0 {
-                (chi2_final / dof).max(1.0)
-            } else {
-                1.0
-            };
-            let cov_final = cov_final_raw * scale;
-            let quad_cov_final = quad_cov_final_raw * scale;
-            let cross_final = cross_final_raw * scale;
-
-            let mut targets_used: Vec<u32> = remaining.iter().map(|t| t.index).collect();
-            targets_used.sort_unstable();
-
-            let rms_before = rms_deg(remaining.iter().map(|t| (t.desired, t.observed)));
-            let rms_after = rms_deg(remaining.iter().map(|t| {
-                (
-                    t.desired,
-                    t.observed
-                        + design(&t.observed) * theta_final
-                        + design_quad(&t.observed) * quad_final,
-                )
-            }));
-
-            let loo_target_mean =
-                loo_target_mean_deg(eye, &remaining, model, s_off, &prior6, &prior12);
-
-            eyes.insert(
-                eye,
-                AngularCorrection {
-                    theta: theta_to_array(&theta_final),
-                    cov: cov_to_array(&cov_final),
-                    quad: theta_to_array(&quad_final),
-                    quad_cov: cov_to_array(&quad_cov_final),
-                    quad_cross_cov: cov_to_array(&cross_final),
-                    model,
-                    targets_used: targets_used.len() as u32,
-                    rms_after_rad: rms_after.to_radians(),
-                },
-            );
-
-            let chi2_reduced = if dof > 0.0 { chi2_final / dof } else { 0.0 };
-            tracing::info!(
-                eye = eye_label(eye),
-                model = ?model,
-                targets_used = targets_used.len() as u64,
-                targets_rejected = targets_rejected.len() as u64,
-                rms_before_deg = rms_before,
-                rms_after_deg = rms_after,
-                loo_target_mean_deg = loo_target_mean,
-                chi2_reduced,
-                "eye fitted"
-            );
-
-            reports.push(EyeFitReport {
-                key: eye,
-                model: Some(model),
-                targets_used,
-                targets_rejected,
-                rms_before_deg: rms_before,
-                rms_after_deg: rms_after,
-                loo_target_mean_deg: loo_target_mean,
-                samples_without_head_pose: without_pose.len(),
-                diagnostics,
-            });
-        }
-
-        if eyes.is_empty() {
-            let (_, reason, got) = omitted
-                .iter()
-                .min_by_key(|(_, _, got)| *got)
-                .copied()
-                .unwrap_or((EyeKey::Right, "too_few_targets", max_usable));
+        if by_source.is_empty() {
             return Err(CalibrationError::InsufficientData {
-                what: if reason == "too_few_targets_after_rejection" {
-                    "targets after robust rejection"
-                } else {
-                    "targets"
-                },
+                what: "targets",
                 need: cfg.min_targets_offset,
-                got,
+                got: 0,
             });
+        }
+
+        let mut corrections = BTreeMap::new();
+        let mut reports = Vec::new();
+        let mut primary_err: Option<CalibrationError> = None;
+
+        for (source, source_samples) in &by_source {
+            let source = *source;
+            match fit_source(source, source_samples, &target_index_of, &target_mm_of, cfg) {
+                Ok(source_fit) => {
+                    if source_fit.eyes.is_empty() {
+                        if Some(source) == primary {
+                            let (_, reason, got) = source_fit
+                                .omitted
+                                .iter()
+                                .min_by_key(|(_, _, got)| *got)
+                                .copied()
+                                .unwrap_or((
+                                    EyeKey::Right,
+                                    "too_few_targets",
+                                    source_fit.max_usable,
+                                ));
+                            primary_err = Some(CalibrationError::InsufficientData {
+                                what: if reason == "too_few_targets_after_rejection" {
+                                    "targets after robust rejection"
+                                } else {
+                                    "targets"
+                                },
+                                need: cfg.min_targets_offset,
+                                got,
+                            });
+                        } else {
+                            tracing::debug!(
+                                source = source.as_str(),
+                                { field::REASON } = "no_eye_fitted",
+                                "source omitted"
+                            );
+                            reports.extend(source_fit.reports);
+                        }
+                    } else {
+                        corrections.insert(source, source_fit.eyes);
+                        reports.extend(source_fit.reports);
+                    }
+                }
+                Err(e) => {
+                    if Some(source) == primary {
+                        primary_err = Some(e);
+                    } else {
+                        tracing::debug!(source = source.as_str(), reason = %e, "source omitted");
+                    }
+                }
+            }
+        }
+
+        if let Some(e) = primary_err {
+            return Err(e);
         }
 
         let rig_fingerprint = crate::correction::rig_fingerprint(rig);
         tracing::info!(
-            eyes = eyes.len() as u64,
+            sources = corrections.len() as u64,
+            corrections = corrections.values().map(BTreeMap::len).sum::<usize>() as u64,
             targets = target_mm_of.len() as u64,
             samples = samples.len() as u64,
             rig_fingerprint = %rig_fingerprint,
@@ -651,7 +278,6 @@ impl DotSessionFit {
             "profile fitted"
         );
 
-        let source = legacy_source(&meta.estimator);
         Ok(FitOutcome {
             profile: UserProfile {
                 version: PROFILE_VERSION,
@@ -659,7 +285,7 @@ impl DotSessionFit {
                 created_unix_s: meta.created_unix_s,
                 rig_fingerprint,
                 estimator: meta.estimator,
-                corrections: BTreeMap::from([(source, eyes)]),
+                corrections,
                 calibration_pose: Some(calibration_pose),
                 provenance: meta.provenance,
             },
@@ -668,10 +294,495 @@ impl DotSessionFit {
     }
 }
 
+struct SourceFit {
+    eyes: BTreeMap<EyeKey, AngularCorrection>,
+    reports: Vec<EyeFitReport>,
+    max_usable: usize,
+    omitted: Vec<(EyeKey, &'static str, usize)>,
+}
+
+/// Fits every eye present in `samples` (all one `source`) against the shared `target_index_of`
+/// global indexing. `Err` only for the `HeadFrame` precondition (no sample of this source carries
+/// a head pose); an eye (or every eye) fitting too few targets is reported in `SourceFit::eyes`
+/// being partial or empty, not as an `Err` (the caller decides whether that is fatal, based on
+/// whether `source` is the primary one).
+fn fit_source(
+    source: RaySource,
+    samples: &[&FitSample],
+    target_index_of: &HashMap<(u64, u64), u32>,
+    target_mm_of: &[Point2<f64>],
+    cfg: &FitConfig,
+) -> Result<SourceFit, CalibrationError> {
+    let model_override = cfg.model_override.or_else(|| {
+        samples
+            .iter()
+            .any(|s| s.ray.head_rotation.is_some())
+            .then_some(CorrectionModel::HeadFrame)
+    });
+    let use_head_frame = model_override == Some(CorrectionModel::HeadFrame);
+    let (samples, without_pose): (Vec<&FitSample>, Vec<&FitSample>) = samples
+        .iter()
+        .copied()
+        .partition(|s| !use_head_frame || s.ray.head_rotation.is_some());
+    if use_head_frame && samples.is_empty() {
+        return Err(CalibrationError::NoHeadPose {
+            samples: without_pose.len(),
+        });
+    }
+    if !without_pose.is_empty() {
+        tracing::debug!(
+            source = source.as_str(),
+            { field::REASON } = "no_head_pose",
+            dropped = without_pose.len() as u64,
+            "samples skipped"
+        );
+    }
+
+    let mut by_eye_target: HashMap<(EyeKey, u32), Vec<&FitSample>> = HashMap::new();
+    for s in samples.iter().copied() {
+        let key = (s.target_mm.x.to_bits(), s.target_mm.y.to_bits());
+        let idx = target_index_of[&key];
+        let eye = EyeKey::from(s.ray.side);
+        by_eye_target.entry((eye, idx)).or_default().push(s);
+    }
+
+    let mut eyes_present: Vec<EyeKey> = by_eye_target.keys().map(|(e, _)| *e).collect();
+    eyes_present.sort();
+    eyes_present.dedup();
+
+    let jitter_rad = cfg.fixation_jitter_deg.to_radians();
+    let s_off = cfg.offset_prior_sigma_deg.to_radians();
+    let s_slope = if source == RaySource::RgbOnly {
+        cfg.slope_prior_sigma
+    } else {
+        cfg.ir_slope_prior_sigma
+    };
+    let prior6 = SMatrix::<f64, 6, 6>::from_diagonal(&SVector::<f64, 6>::from([
+        1.0 / (s_off * s_off),
+        1.0 / (s_slope * s_slope),
+        1.0 / (s_slope * s_slope),
+        1.0 / (s_off * s_off),
+        1.0 / (s_slope * s_slope),
+        1.0 / (s_slope * s_slope),
+    ]));
+    let s_quad = cfg.quad_prior_sigma;
+    let prior12 = {
+        let mut p = SMatrix::<f64, 12, 12>::zeros();
+        p.fixed_view_mut::<6, 6>(0, 0).copy_from(&prior6);
+        p.fixed_view_mut::<6, 6>(6, 6)
+            .copy_from(&SMatrix::<f64, 6, 6>::from_diagonal_element(
+                1.0 / (s_quad * s_quad),
+            ));
+        p
+    };
+
+    let mut eyes = BTreeMap::new();
+    let mut reports = Vec::new();
+    let mut max_usable = 0usize;
+    let mut omitted: Vec<(EyeKey, &'static str, usize)> = Vec::new();
+
+    for eye in eyes_present {
+        let mut sample_rejected: Vec<u32> = Vec::new();
+        let mut usable: Vec<TargetAgg> = Vec::new();
+        let mut diagnostics: Vec<TargetVerdict> = Vec::new();
+
+        let mut target_indices: Vec<u32> = (0..target_mm_of.len() as u32)
+            .filter(|i| by_eye_target.contains_key(&(eye, *i)))
+            .collect();
+        target_indices.sort_unstable();
+
+        for idx in target_indices {
+            let group = &by_eye_target[&(eye, idx)];
+            let target_mm = target_mm_of[idx as usize];
+            let target_point = Point3::new(target_mm.x, target_mm.y, 0.0);
+
+            let mut os = Vec::with_capacity(group.len());
+            let mut ds = Vec::with_capacity(group.len());
+            let mut es = Vec::with_capacity(group.len());
+            for s in group.iter() {
+                let desired_dir = Unit::new_normalize(target_point - s.ray.origin);
+                let (o, d) = if use_head_frame {
+                    let inv = s.ray.head_rotation.expect("partitioned above").inverse();
+                    (
+                        yaw_pitch_from_direction(&(inv * s.ray.direction)),
+                        yaw_pitch_from_direction(&(inv * desired_dir)),
+                    )
+                } else {
+                    (
+                        yaw_pitch_from_direction(&s.ray.direction),
+                        yaw_pitch_from_direction(&desired_dir),
+                    )
+                };
+                os.push(o);
+                ds.push(d);
+                es.push(o - d);
+            }
+
+            let keep = reject_sample_outliers(&es, cfg);
+            let n_keep = keep.iter().filter(|&&k| k).count();
+            if n_keep < cfg.min_samples_per_target {
+                tracing::debug!(
+                    source = source.as_str(),
+                    eye = eye_label(eye),
+                    target = idx as u64,
+                    { field::REASON } = "too_few_samples",
+                    samples = group.len() as u64,
+                    kept = n_keep as u64,
+                    min_samples_per_target = cfg.min_samples_per_target as u64,
+                    "target rejected"
+                );
+                sample_rejected.push(idx);
+                let spread_deg = sample_spread_deg(&es);
+                diagnostics.push(TargetVerdict {
+                    index: idx,
+                    samples: n_keep,
+                    residual_deg: spread_deg,
+                    rejected: true,
+                    reason: Some(TargetReject::TooFewSamples {
+                        have: n_keep,
+                        need: cfg.min_samples_per_target,
+                    }),
+                });
+                continue;
+            }
+
+            let kept_o: Vec<Vector2<f64>> = os
+                .iter()
+                .zip(&keep)
+                .filter(|(_, k)| **k)
+                .map(|(o, _)| *o)
+                .collect();
+            let kept_d: Vec<Vector2<f64>> = ds
+                .iter()
+                .zip(&keep)
+                .filter(|(_, k)| **k)
+                .map(|(d, _)| *d)
+                .collect();
+            let kept_e: Vec<Vector2<f64>> = es
+                .iter()
+                .zip(&keep)
+                .filter(|(_, k)| **k)
+                .map(|(e, _)| *e)
+                .collect();
+
+            let n = kept_o.len() as f64;
+            let o_k = kept_o.iter().fold(Vector2::zeros(), |a, b| a + b) / n;
+            let d_k = kept_d.iter().fold(Vector2::zeros(), |a, b| a + b) / n;
+            let mean_e = kept_e.iter().fold(Vector2::zeros(), |a, b| a + b) / n;
+            let mut s_k = Matrix2::zeros();
+            for e in &kept_e {
+                let diff = e - mean_e;
+                s_k += diff * diff.transpose();
+            }
+            if kept_e.len() > 1 {
+                s_k /= (kept_e.len() - 1) as f64;
+            }
+            let c_k = s_k / n + Matrix2::identity() * (jitter_rad * jitter_rad);
+            let cov_inv = c_k
+                .try_inverse()
+                .unwrap_or_else(|| Matrix2::identity() / (jitter_rad * jitter_rad));
+
+            tracing::trace!(
+                source = source.as_str(),
+                eye = eye_label(eye),
+                target = idx as u64,
+                samples = kept_o.len() as u64,
+                err_yaw_deg = mean_e.x.to_degrees(),
+                err_pitch_deg = mean_e.y.to_degrees(),
+                "target aggregated"
+            );
+
+            usable.push(TargetAgg {
+                index: idx,
+                samples: n_keep,
+                observed: o_k,
+                desired: d_k,
+                cov_inv,
+            });
+        }
+
+        max_usable = max_usable.max(usable.len());
+
+        if usable.len() < cfg.min_targets_offset {
+            tracing::debug!(
+                source = source.as_str(),
+                eye = eye_label(eye),
+                { field::REASON } = "too_few_targets",
+                usable = usable.len() as u64,
+                min_targets_offset = cfg.min_targets_offset as u64,
+                "eye omitted"
+            );
+            omitted.push((eye, "too_few_targets", usable.len()));
+            reports.push(EyeFitReport {
+                source,
+                key: eye,
+                model: None,
+                targets_used: Vec::new(),
+                targets_rejected: sample_rejected,
+                rms_before_deg: 0.0,
+                rms_after_deg: 0.0,
+                loo_target_mean_deg: 0.0,
+                samples_without_head_pose: without_pose.len(),
+                diagnostics,
+            });
+            continue;
+        }
+
+        let mut weights = vec![1.0; usable.len()];
+        let mut theta_prev: Option<SVector<f64, 6>> = None;
+        let mut rho = vec![0.0; usable.len()];
+        for iteration in 0..10u32 {
+            let (theta, _cov, _chi2) = solve_weighted(&usable, &weights, &prior6)
+                .expect("ridge prior keeps the normal matrix positive definite");
+            rho = usable
+                .iter()
+                .map(|t| {
+                    let r = t.desired - (t.observed + design(&t.observed) * theta);
+                    (r.dot(&(t.cov_inv * r))).sqrt()
+                })
+                .collect();
+            let step = theta_prev.map(|p| (theta - p).norm());
+            let converged = step.map(|s| s < 1e-9).unwrap_or(false);
+            tracing::trace!(
+                source = source.as_str(),
+                eye = eye_label(eye),
+                iteration = u64::from(iteration),
+                step = step.unwrap_or(0.0),
+                converged,
+                "irls iteration"
+            );
+            theta_prev = Some(theta);
+            if converged {
+                break;
+            }
+            weights = rho
+                .iter()
+                .map(|&r| {
+                    if r > 0.0 {
+                        (cfg.huber_k / r).min(1.0)
+                    } else {
+                        1.0
+                    }
+                })
+                .collect();
+        }
+
+        let mut rho_sorted = rho.clone();
+        let median_rho = median(&mut rho_sorted);
+        let residual_limit = (cfg.target_outlier_factor * median_rho).max(3.0);
+        let mut huber_rejected = Vec::new();
+        let mut remaining = Vec::new();
+        for (t, &r) in usable.iter().zip(&rho) {
+            let rejected = r > residual_limit;
+            if rejected {
+                tracing::debug!(
+                    source = source.as_str(),
+                    eye = eye_label(eye),
+                    target = t.index as u64,
+                    { field::REASON } = "huber_outlier",
+                    rho = r,
+                    median_rho,
+                    target_outlier_factor = cfg.target_outlier_factor,
+                    "target rejected"
+                );
+                huber_rejected.push(t.index);
+            } else {
+                tracing::debug!(
+                    source = source.as_str(),
+                    eye = eye_label(eye),
+                    target = t.index as u64,
+                    rho = r,
+                    median_rho,
+                    "target residual"
+                );
+                remaining.push(t.clone());
+            }
+            diagnostics.push(TargetVerdict {
+                index: t.index,
+                samples: t.samples,
+                residual_deg: r,
+                rejected,
+                reason: rejected.then_some(TargetReject::Residual {
+                    deg: r,
+                    limit: residual_limit,
+                }),
+            });
+        }
+
+        let mut targets_rejected = sample_rejected.clone();
+        targets_rejected.extend(huber_rejected);
+        targets_rejected.sort_unstable();
+
+        if remaining.len() < cfg.min_targets_offset {
+            tracing::debug!(
+                source = source.as_str(),
+                eye = eye_label(eye),
+                { field::REASON } = "too_few_targets_after_rejection",
+                remaining = remaining.len() as u64,
+                min_targets_offset = cfg.min_targets_offset as u64,
+                "eye omitted"
+            );
+            omitted.push((eye, "too_few_targets_after_rejection", remaining.len()));
+            reports.push(EyeFitReport {
+                source,
+                key: eye,
+                model: None,
+                targets_used: Vec::new(),
+                targets_rejected,
+                rms_before_deg: 0.0,
+                rms_after_deg: 0.0,
+                loo_target_mean_deg: 0.0,
+                samples_without_head_pose: without_pose.len(),
+                diagnostics,
+            });
+            continue;
+        }
+
+        let model = match model_override {
+            Some(m) => m,
+            None if remaining.len() >= cfg.min_targets_quadratic => CorrectionModel::Quadratic,
+            None if remaining.len() >= cfg.min_targets_affine => CorrectionModel::Affine,
+            None => CorrectionModel::OffsetOnly,
+        };
+
+        let ones = vec![1.0; remaining.len()];
+        let (
+            theta_final,
+            quad_final,
+            cov_final_raw,
+            quad_cov_final_raw,
+            cross_final_raw,
+            chi2_final,
+            dof,
+        ) = match model {
+            CorrectionModel::Affine | CorrectionModel::HeadFrame => {
+                let (theta, cov, chi2) = solve_weighted(&remaining, &ones, &prior6)
+                    .expect("ridge prior keeps the normal matrix positive definite");
+                (
+                    theta,
+                    SVector::<f64, 6>::zeros(),
+                    cov,
+                    SMatrix::<f64, 6, 6>::zeros(),
+                    SMatrix::<f64, 6, 6>::zeros(),
+                    chi2,
+                    2.0 * remaining.len() as f64 - 6.0,
+                )
+            }
+            CorrectionModel::OffsetOnly => {
+                let (theta2, cov2, chi2) = fit_offset_only(&remaining, s_off);
+                let theta = SVector::<f64, 6>::from([theta2.x, 0.0, 0.0, theta2.y, 0.0, 0.0]);
+                let mut cov = SMatrix::<f64, 6, 6>::zeros();
+                cov[(0, 0)] = cov2[(0, 0)];
+                cov[(0, 3)] = cov2[(0, 1)];
+                cov[(3, 0)] = cov2[(1, 0)];
+                cov[(3, 3)] = cov2[(1, 1)];
+                (
+                    theta,
+                    SVector::<f64, 6>::zeros(),
+                    cov,
+                    SMatrix::<f64, 6, 6>::zeros(),
+                    SMatrix::<f64, 6, 6>::zeros(),
+                    chi2,
+                    2.0 * remaining.len() as f64 - 2.0,
+                )
+            }
+            CorrectionModel::Quadratic => {
+                let (theta12, cov12, chi2) = solve_weighted12(&remaining, &ones, &prior12)
+                    .expect("ridge prior keeps the normal matrix positive definite");
+                let theta = SVector::<f64, 6>::from_fn(|i, _| theta12[i]);
+                let quad = SVector::<f64, 6>::from_fn(|i, _| theta12[6 + i]);
+                let cov = SMatrix::<f64, 6, 6>::from_fn(|r, k| cov12[(r, k)]);
+                let quad_cov = SMatrix::<f64, 6, 6>::from_fn(|r, k| cov12[(6 + r, 6 + k)]);
+                let cross = SMatrix::<f64, 6, 6>::from_fn(|r, k| cov12[(r, 6 + k)]);
+                (
+                    theta,
+                    quad,
+                    cov,
+                    quad_cov,
+                    cross,
+                    chi2,
+                    2.0 * remaining.len() as f64 - 12.0,
+                )
+            }
+        };
+        let scale = if dof > 0.0 {
+            (chi2_final / dof).max(1.0)
+        } else {
+            1.0
+        };
+        let cov_final = cov_final_raw * scale;
+        let quad_cov_final = quad_cov_final_raw * scale;
+        let cross_final = cross_final_raw * scale;
+
+        let mut targets_used: Vec<u32> = remaining.iter().map(|t| t.index).collect();
+        targets_used.sort_unstable();
+
+        let rms_before = rms_deg(remaining.iter().map(|t| (t.desired, t.observed)));
+        let rms_after = rms_deg(remaining.iter().map(|t| {
+            (
+                t.desired,
+                t.observed
+                    + design(&t.observed) * theta_final
+                    + design_quad(&t.observed) * quad_final,
+            )
+        }));
+
+        let loo_target_mean = loo_target_mean_deg(eye, &remaining, model, s_off, &prior6, &prior12);
+
+        eyes.insert(
+            eye,
+            AngularCorrection {
+                theta: theta_to_array(&theta_final),
+                cov: cov_to_array(&cov_final),
+                quad: theta_to_array(&quad_final),
+                quad_cov: cov_to_array(&quad_cov_final),
+                quad_cross_cov: cov_to_array(&cross_final),
+                model,
+                targets_used: targets_used.len() as u32,
+                rms_after_rad: rms_after.to_radians(),
+            },
+        );
+
+        let chi2_reduced = if dof > 0.0 { chi2_final / dof } else { 0.0 };
+        tracing::info!(
+            source = source.as_str(),
+            eye = eye_label(eye),
+            model = ?model,
+            targets_used = targets_used.len() as u64,
+            targets_rejected = targets_rejected.len() as u64,
+            rms_before_deg = rms_before,
+            rms_after_deg = rms_after,
+            loo_target_mean_deg = loo_target_mean,
+            chi2_reduced,
+            "eye fitted"
+        );
+
+        reports.push(EyeFitReport {
+            source,
+            key: eye,
+            model: Some(model),
+            targets_used,
+            targets_rejected,
+            rms_before_deg: rms_before,
+            rms_after_deg: rms_after,
+            loo_target_mean_deg: loo_target_mean,
+            samples_without_head_pose: without_pose.len(),
+            diagnostics,
+        });
+    }
+
+    Ok(SourceFit {
+        eyes,
+        reports,
+        max_usable,
+        omitted,
+    })
+}
+
 /// Mean origin per eye over ALL input samples; quaternion mean over the samples that carry a
 /// pose, with each quaternion sign-aligned to the first so antipodal representations do not
 /// cancel.
-fn calibration_pose(samples: &[FitSample]) -> CalibrationPose {
+fn calibration_pose(samples: &[&FitSample]) -> CalibrationPose {
     let mut origin_sum: BTreeMap<EyeKey, ([f64; 3], u32)> = BTreeMap::new();
     for s in samples {
         let e = origin_sum
@@ -929,6 +1040,7 @@ mod tests {
         offset_p_deg: 0.0,
     };
 
+    #[derive(Clone, Copy)]
     struct SessionConfig {
         grid: [u32; 2],
         samples_per_target: usize,
@@ -937,6 +1049,8 @@ mod tests {
         sway_mm: f64,
         bias: Bias,
         seed: u64,
+        noise_deg: f64,
+        source: RaySource,
     }
 
     impl Default for SessionConfig {
@@ -949,6 +1063,8 @@ mod tests {
                 sway_mm: 10.0,
                 bias: BIASED,
                 seed: 31,
+                noise_deg: 1.0,
+                source: RaySource::RgbOnly,
             }
         }
     }
@@ -1003,10 +1119,10 @@ mod tests {
                 let true_angles = yaw_pitch_from_direction(&true_dir);
                 let obs_yaw = cfg.bias.gain_y * true_angles.x
                     + cfg.bias.offset_y_deg.to_radians()
-                    + 1.0_f64.to_radians() * rng.gaussian();
+                    + cfg.noise_deg.to_radians() * rng.gaussian();
                 let obs_pitch = cfg.bias.gain_p * true_angles.y
                     + cfg.bias.offset_p_deg.to_radians()
-                    + 1.0_f64.to_radians() * rng.gaussian();
+                    + cfg.noise_deg.to_radians() * rng.gaussian();
                 let direction = direction_from_yaw_pitch(&Vector2::new(obs_yaw, obs_pitch));
                 let ray = GazeRay {
                     side: cfg.side,
@@ -1017,7 +1133,11 @@ mod tests {
                     origin_cov: Matrix3::identity(),
                     head_rotation: None,
                 };
-                out.push(FitSample { ray, target_mm });
+                out.push(FitSample {
+                    ray,
+                    target_mm,
+                    source: cfg.source,
+                });
                 n += 1;
             }
         }
@@ -1065,19 +1185,23 @@ mod tests {
     }
 
     #[test]
-    fn test_fit_files_corrections_under_legacy_source_of_estimator() {
-        let samples = generate_session(&SessionConfig::default());
-        let pccr = DotSessionFit::fit_with(
-            &samples,
-            &fixture_rig(),
-            &FitConfig::default(),
-            ProfileMeta {
-                estimator: "pccr".into(),
-                ..ProfileMeta::default()
+    fn test_fit_groups_by_source_and_eye() {
+        let rgb_cfg = SessionConfig::default();
+        let ir_cfg = SessionConfig {
+            bias: Bias {
+                gain_y: 0.5,
+                offset_y_deg: 0.0,
+                gain_p: 0.5,
+                offset_p_deg: 0.0,
             },
-        )
-        .unwrap();
-        let default = DotSessionFit::fit_with(
+            source: RaySource::IrOnly,
+            seed: 97,
+            ..SessionConfig::default()
+        };
+        let mut samples = generate_session(&rgb_cfg);
+        samples.extend(generate_session(&ir_cfg));
+
+        let outcome = DotSessionFit::fit_with(
             &samples,
             &fixture_rig(),
             &FitConfig::default(),
@@ -1085,22 +1209,178 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(pccr.profile.version, PROFILE_VERSION);
-        assert_eq!(default.profile.version, PROFILE_VERSION);
+        assert_eq!(outcome.profile.version, PROFILE_VERSION);
         assert_eq!(
-            pccr.profile.corrections.keys().collect::<Vec<_>>(),
-            vec![&RaySource::IrOnly]
+            outcome.profile.corrections.keys().collect::<Vec<_>>(),
+            vec![&RaySource::RgbOnly, &RaySource::IrOnly]
         );
-        assert_eq!(
-            default.profile.corrections.keys().collect::<Vec<_>>(),
-            vec![&RaySource::RgbOnly]
+        let rgb = outcome
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap();
+        assert_abs_diff_eq!(rgb.theta[1], -0.04762, epsilon = 0.025);
+        let ir = outcome
+            .profile
+            .correction(RaySource::IrOnly, EyeKey::Right)
+            .unwrap();
+        assert_abs_diff_eq!(ir.theta[1], 1.0, epsilon = 0.1);
+    }
+
+    #[test]
+    fn test_ir_source_fit_recovers_low_gain_without_prior_shrinkage() {
+        let base_cfg = SessionConfig {
+            bias: Bias {
+                gain_y: 0.4,
+                offset_y_deg: 0.0,
+                gain_p: 0.4,
+                offset_p_deg: 0.0,
+            },
+            noise_deg: 5.0,
+            seed: 83,
+            ..SessionConfig::default()
+        };
+        let mut samples = generate_session(&SessionConfig {
+            source: RaySource::IrOnly,
+            ..base_cfg
+        });
+        samples.extend(generate_session(&SessionConfig {
+            source: RaySource::RgbOnly,
+            ..base_cfg
+        }));
+
+        let outcome = DotSessionFit::fit_with(
+            &samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap();
+
+        let ir_theta1 = outcome
+            .profile
+            .correction(RaySource::IrOnly, EyeKey::Right)
+            .unwrap()
+            .theta[1];
+        assert_abs_diff_eq!(ir_theta1, 1.5, epsilon = 0.2);
+
+        let rgb_theta1 = outcome
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap()
+            .theta[1];
+        assert!(
+            rgb_theta1 < ir_theta1 - 0.1,
+            "rgb={rgb_theta1} ir={ir_theta1}"
         );
-        assert_eq!(
-            pccr.profile.correction(RaySource::IrOnly, EyeKey::Right),
-            default
+    }
+
+    #[test]
+    fn test_source_without_enough_targets_is_omitted_other_source_fitted() {
+        let rgb_samples = generate_session(&SessionConfig::default());
+        let ir_cfg = SessionConfig {
+            source: RaySource::IrOnly,
+            seed: 53,
+            ..SessionConfig::default()
+        };
+        let per_target = ir_cfg.samples_per_target;
+        let ir_samples: Vec<FitSample> = generate_session(&ir_cfg)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| i / per_target < 2)
+            .map(|(_, s)| s)
+            .collect();
+
+        let mut samples = rgb_samples;
+        samples.extend(ir_samples);
+
+        let outcome = DotSessionFit::fit_with(
+            &samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap();
+
+        assert!(
+            outcome
+                .profile
+                .correction(RaySource::IrOnly, EyeKey::Right)
+                .is_none()
+        );
+        assert!(
+            outcome
                 .profile
                 .correction(RaySource::RgbOnly, EyeKey::Right)
+                .is_some()
         );
+        let ir_report = outcome
+            .reports
+            .iter()
+            .find(|r| r.source == RaySource::IrOnly)
+            .expect("the omitted source still reports");
+        assert_eq!(ir_report.model, None);
+    }
+
+    #[test]
+    fn test_calibration_pose_uses_primary_source_samples() {
+        let rgb_cfg = SessionConfig::default();
+        let ir_cfg = SessionConfig {
+            base_xy: (250.0, 60.0),
+            source: RaySource::IrOnly,
+            seed: 61,
+            ..SessionConfig::default()
+        };
+        let mut samples = generate_session(&rgb_cfg);
+        samples.extend(generate_session(&ir_cfg));
+
+        let outcome = DotSessionFit::fit_with(
+            &samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap();
+        let pose = outcome.profile.calibration_pose.expect("pose recorded");
+        let x = pose.eye_origin_mm[&EyeKey::Right][0];
+        assert_abs_diff_eq!(x, 185.0, epsilon = 15.0);
+    }
+
+    #[test]
+    fn test_verdicts_come_from_primary_source_only() {
+        let rgb_samples = generate_session(&SessionConfig::default());
+        let ir_cfg = SessionConfig {
+            source: RaySource::IrOnly,
+            seed: 71,
+            ..SessionConfig::default()
+        };
+        let per_target = ir_cfg.samples_per_target;
+        let mut ir_samples = generate_session(&ir_cfg);
+        for i in 0..per_target {
+            let idx = 4 * per_target + i;
+            add_yaw_bias_deg(&mut ir_samples[idx], 10.0);
+        }
+
+        let mut samples = rgb_samples;
+        samples.extend(ir_samples);
+
+        let outcome = DotSessionFit::fit_with(
+            &samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap();
+        let verdicts = outcome.verdicts();
+        let v = verdicts.iter().find(|v| v.index == 4).unwrap();
+        assert!(!v.rejected, "{v:?}");
+    }
+
+    #[test]
+    fn test_fit_config_without_ir_slope_prior_parses_with_default() {
+        let toml = "slope_prior_sigma = 0.2\n";
+        let cfg: FitConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.slope_prior_sigma, 0.2);
+        assert_eq!(cfg.ir_slope_prior_sigma, 0.5);
     }
 
     #[test]
@@ -1518,6 +1798,8 @@ mod tests {
             sway_mm: 0.0,
             bias: UNBIASED,
             seed: 97,
+            noise_deg: 1.0,
+            source: RaySource::RgbOnly,
         };
         let per_target = left_cfg.samples_per_target;
         let left_samples: Vec<FitSample> = generate_session(&left_cfg)
@@ -1657,7 +1939,11 @@ mod tests {
                     origin_cov: Matrix3::identity(),
                     head_rotation: None,
                 };
-                out.push(FitSample { ray, target_mm });
+                out.push(FitSample {
+                    ray,
+                    target_mm,
+                    source: RaySource::RgbOnly,
+                });
             }
         }
         out
@@ -1801,7 +2087,11 @@ mod tests {
                     origin_cov: Matrix3::identity(),
                     head_rotation: Some(rot),
                 };
-                samples.push(FitSample { ray, target_mm });
+                samples.push(FitSample {
+                    ray,
+                    target_mm,
+                    source: RaySource::RgbOnly,
+                });
             }
         }
 
@@ -1900,7 +2190,11 @@ mod tests {
                     origin_cov: Matrix3::identity(),
                     head_rotation: Some(rot),
                 };
-                samples.push(FitSample { ray, target_mm });
+                samples.push(FitSample {
+                    ray,
+                    target_mm,
+                    source: RaySource::RgbOnly,
+                });
             }
         }
         (samples, target_mms, origin)
@@ -1992,6 +2286,7 @@ mod tests {
                 samples_b.push(FitSample {
                     ray,
                     target_mm: *target_mm,
+                    source: RaySource::RgbOnly,
                 });
             }
         }
@@ -2060,6 +2355,10 @@ mod tests {
         let rec = eye_fitted[0];
         assert_eq!(rec.level, eye_log::Level::Info);
         assert_eq!(
+            rec.fields.get("source"),
+            Some(&eye_log::Value::Str("rgb-only".to_string()))
+        );
+        assert_eq!(
             rec.fields.get("eye"),
             Some(&eye_log::Value::Str("right".to_string()))
         );
@@ -2094,7 +2393,11 @@ mod tests {
         assert_eq!(profile_fitted.len(), 1);
         let prec = profile_fitted[0];
         assert_eq!(prec.level, eye_log::Level::Info);
-        assert_eq!(prec.fields.get("eyes"), Some(&eye_log::Value::U64(1)));
+        assert_eq!(prec.fields.get("sources"), Some(&eye_log::Value::U64(1)));
+        assert_eq!(
+            prec.fields.get("corrections"),
+            Some(&eye_log::Value::U64(1))
+        );
         assert_eq!(prec.fields.get("targets"), Some(&eye_log::Value::U64(9)));
         assert_eq!(prec.fields.get("samples"), Some(&eye_log::Value::U64(216)));
         assert!(matches!(
@@ -2208,6 +2511,8 @@ mod tests {
             sway_mm: 0.0,
             bias: UNBIASED,
             seed: 97,
+            noise_deg: 1.0,
+            source: RaySource::RgbOnly,
         };
         let per_target = left_cfg.samples_per_target;
         let left_samples: Vec<FitSample> = generate_session(&left_cfg)
@@ -2328,14 +2633,16 @@ mod tests {
             samples.push(FitSample {
                 ray: pose_ray(Some(Side::Right), origin, Some(rot)),
                 target_mm,
+                source: RaySource::RgbOnly,
             });
             samples.push(FitSample {
                 ray: pose_ray(Some(Side::Right), origin, None),
                 target_mm,
+                source: RaySource::RgbOnly,
             });
         }
 
-        let pose = calibration_pose(&samples);
+        let pose = calibration_pose(&samples.iter().collect::<Vec<_>>());
         assert_eq!(pose.samples_total, 4);
         assert_eq!(pose.samples_with_head_pose, 2);
         let origin_mm = pose.eye_origin_mm[&EyeKey::Right];
@@ -2353,18 +2660,20 @@ mod tests {
     fn test_calibration_pose_without_head_pose_records_none_rotation() {
         let target_mm = Point2::new(150.0, 80.0);
         let origin = Point3::new(150.0, 80.0, -500.0);
-        let samples = vec![
+        let samples = [
             FitSample {
                 ray: pose_ray(Some(Side::Right), origin, None),
                 target_mm,
+                source: RaySource::RgbOnly,
             },
             FitSample {
                 ray: pose_ray(Some(Side::Right), origin, None),
                 target_mm,
+                source: RaySource::RgbOnly,
             },
         ];
 
-        let pose = calibration_pose(&samples);
+        let pose = calibration_pose(&samples.iter().collect::<Vec<_>>());
         assert_eq!(pose.head_rotation, None);
         assert_eq!(pose.samples_with_head_pose, 0);
         assert_eq!(pose.samples_total, 2);
@@ -2383,7 +2692,7 @@ mod tests {
             .iter()
             .filter(|s| s.ray.head_rotation.is_some())
             .count();
-        let expected_pose = calibration_pose(&samples);
+        let expected_pose = calibration_pose(&samples.iter().collect::<Vec<_>>());
 
         let meta = ProfileMeta {
             provenance: Provenance {
