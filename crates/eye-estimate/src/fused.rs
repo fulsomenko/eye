@@ -12,7 +12,9 @@ use eye_core::{
     Side, Timestamp,
 };
 use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
-use eye_geometry::eyeball::{EyeParams, Kappa, gaze_ray, gaze_ray_pccr, optical_axis, visual_axis};
+use eye_geometry::eyeball::{
+    EyeCentre, EyeParams, Kappa, gaze_ray, gaze_ray_pccr, optical_axis, visual_axis,
+};
 use eye_geometry::triangulation::{Triangulated, View, triangulate};
 use eye_geometry::uncertainty::{block_diag, propagate_fn};
 use nalgebra::{Matrix3, Point3, Unit, UnitQuaternion, Vector2, Vector3, Vector6};
@@ -54,6 +56,8 @@ pub struct FusedOptions {
     pub bias_warmup: u32,
     /// An IR glint within this many pixels of the cross-chain pupil selects `gaze_ray_pccr` over the pupil-sphere ray.
     pub max_glint_offset_px: f64,
+    /// Extrapolate the landmark pose to the IR timestamp at most this far, ms (R30: 68 ms nominal).
+    pub max_pose_extrapolation_ms: f64,
 }
 
 impl Default for FusedOptions {
@@ -69,6 +73,7 @@ impl Default for FusedOptions {
             bias_alpha: 0.05,
             bias_warmup: 10,
             max_glint_offset_px: 3.0,
+            max_pose_extrapolation_ms: 100.0,
         }
     }
 }
@@ -189,6 +194,14 @@ fn debias(ray: &GazeRay, state: &BiasState) -> GazeRay {
     }
 }
 
+/// The pose extrapolated to the IR timestamp, and the raw IR observation measured there, that
+/// `cross_chain` falls back to when stereo is disabled or fails.
+struct CrossChainIrTime<'a> {
+    eye: &'a LandmarkEye,
+    frame: &'a LandmarkFrame,
+    measured: &'a Observations,
+}
+
 /// `fuse_inverse_covariance` with the singular case logged.
 fn fuse_or_log(side: Side, rgb: &GazeRay, ir: &GazeRay) -> Option<GazeRay> {
     let fused = fuse_inverse_covariance(rgb, ir);
@@ -213,6 +226,8 @@ pub struct FusedEstimator {
     /// Most recent landmark head pose and its frame time, lent to IR-only batches within
     /// `max_bracket_ms`.
     last_viewer: Option<(Timestamp, UnitQuaternion<f64>)>,
+    /// Most recent landmark frame, extrapolated to the IR timestamp for the cross chain.
+    prev_frame: Option<LandmarkFrame>,
     bias: HashMap<(FusedSource, Side), BiasState>,
     decisions: Vec<GateDecision>,
 }
@@ -237,6 +252,7 @@ impl FusedEstimator {
             ir,
             prev_ir: None,
             last_viewer: None,
+            prev_frame: None,
             bias: HashMap::new(),
             decisions: Vec::new(),
             options,
@@ -337,6 +353,20 @@ impl FusedEstimator {
             self.last_viewer = Some((f.timestamp, f.viewer));
         }
 
+        let newest_ir = ir_pairs.last();
+        let frame_ir = match (&frame, newest_ir) {
+            (Some(f), Some(newest)) => extrapolate_frame(
+                self.prev_frame.as_ref(),
+                f,
+                newest.timestamp,
+                self.options.max_pose_extrapolation_ms,
+            ),
+            _ => None,
+        };
+        if let Some(f) = &frame {
+            self.prev_frame = Some(f.clone());
+        }
+
         if let (IrChain::Pupil(e), Some(f)) = (&mut self.ir, &frame) {
             let right = f.eyes.iter().find(|eye| eye.side == Side::Right);
             let left = f.eyes.iter().find(|eye| eye.side == Side::Left);
@@ -369,17 +399,34 @@ impl FusedEstimator {
                 let side = eye.side;
                 out.push((side, FusedSource::RgbOnly, eye.ray.clone()));
 
-                let Some(aligned_obs) = &aligned else {
-                    continue;
+                let at_ir = match (&frame_ir, newest_ir) {
+                    (Some(frame_ir), Some(newest_ir)) => {
+                        frame_ir.eyes.iter().find(|e| e.side == side).map(|eye_ir| {
+                            CrossChainIrTime {
+                                eye: eye_ir,
+                                frame: frame_ir,
+                                measured: newest_ir,
+                            }
+                        })
+                    }
+                    _ => None,
                 };
-                let Some(i_ray) = i_rays.iter().find(|r| r.side == Some(side)) else {
-                    continue;
+                let cross = if aligned.is_some() || at_ir.is_some() {
+                    self.cross_chain(eye, frame, aligned.as_ref(), at_ir, rig)?
+                } else {
+                    None
                 };
-
-                if let Some((x_ray, source)) = self.cross_chain(eye, frame, aligned_obs, rig)? {
+                if let Some((x_ray, source)) = cross {
                     trace_ray(source.as_str(), &x_ray);
                     out.push((side, source, x_ray));
                 }
+
+                if aligned.is_none() {
+                    continue;
+                }
+                let Some(i_ray) = i_rays.iter().find(|r| r.side == Some(side)) else {
+                    continue;
+                };
                 if let Some(fused) = fuse_or_log(side, &eye.ray, i_ray) {
                     trace_ray(FusedSource::InverseCovariance.as_str(), &fused);
                     out.push((side, FusedSource::InverseCovariance, fused));
@@ -468,16 +515,90 @@ impl FusedEstimator {
         }
     }
 
-    /// Stereo triangulation when it succeeds, else the IR pupil placed on the RGB eyeball.
+    /// Stereo triangulation (at the RGB time, from `eye`/`frame`/`aligned`) when it succeeds,
+    /// else the IR pupil placed on the RGB eyeball (at the IR time, from `at_ir`, the pose
+    /// extrapolated to when the pupil was actually observed).
     fn cross_chain(
         &self,
         eye: &LandmarkEye,
         frame: &LandmarkFrame,
-        aligned: &Observations,
+        aligned: Option<&Observations>,
+        at_ir: Option<CrossChainIrTime<'_>>,
         rig: &Rig,
     ) -> Result<Option<(GazeRay, FusedSource)>, EstimateError> {
         let side = eye.side;
-        let Some(pupil_px) = aligned
+        let params = self.eye_params();
+
+        if self.options.stereo {
+            let stereo_pupil_px = aligned.and_then(|aligned| {
+                aligned
+                    .face
+                    .as_ref()
+                    .and_then(|f| f.eye(side))
+                    .and_then(|e| e.pupil)
+                    .map(|m| m.map(|ellipse| ellipse.center()))
+            });
+            if let (Some(pupil_px), Some(aligned)) = (stereo_pupil_px, aligned) {
+                let ir_cam = rig
+                    .camera(aligned.camera.as_str())
+                    .ok_or_else(|| EstimateError::UnknownCamera(aligned.camera.to_string()))?;
+                let rgb_cam = rig
+                    .camera(frame.camera.as_str())
+                    .ok_or_else(|| EstimateError::UnknownCamera(frame.camera.to_string()))?;
+                let views = (
+                    View {
+                        camera: rgb_cam,
+                        pixel: eye.iris_px,
+                    },
+                    View {
+                        camera: ir_cam,
+                        pixel: pupil_px,
+                    },
+                );
+                match triangulate(&views.0, &views.1) {
+                    Err(e) => tracing::debug!(
+                        { field::REASON } = "triangulate_failed",
+                        side = side_str(side),
+                        error = %e,
+                        "stereo failed"
+                    ),
+                    Ok(t) => match stereo_ray(
+                        side,
+                        &t,
+                        eye,
+                        &params,
+                        &frame.viewer,
+                        rgb_cam,
+                        frame.timestamp,
+                    ) {
+                        Some(ray) => return Ok(Some((ray, FusedSource::Stereo))),
+                        None => tracing::debug!(
+                            { field::REASON } = "stereo_no_root",
+                            side = side_str(side),
+                            rms_px = t.rms_px,
+                            parallax_rad = t.parallax_rad,
+                            "stereo failed"
+                        ),
+                    },
+                }
+            }
+        }
+
+        let Some(CrossChainIrTime {
+            eye: eye_ir,
+            frame: frame_ir,
+            measured: ir_measured,
+        }) = at_ir
+        else {
+            tracing::debug!(
+                { field::REASON } = "no_ir_time",
+                side = side_str(side),
+                "cross chain skipped"
+            );
+            return Ok(None);
+        };
+
+        let Some(pupil_px) = ir_measured
             .face
             .as_ref()
             .and_then(|f| f.eye(side))
@@ -492,53 +613,10 @@ impl FusedEstimator {
             return Ok(None);
         };
         let ir_cam = rig
-            .camera(aligned.camera.as_str())
-            .ok_or_else(|| EstimateError::UnknownCamera(aligned.camera.to_string()))?;
-        let rgb_cam = rig
-            .camera(frame.camera.as_str())
-            .ok_or_else(|| EstimateError::UnknownCamera(frame.camera.to_string()))?;
-        let params = self.eye_params();
+            .camera(ir_measured.camera.as_str())
+            .ok_or_else(|| EstimateError::UnknownCamera(ir_measured.camera.to_string()))?;
 
-        if self.options.stereo {
-            let views = (
-                View {
-                    camera: rgb_cam,
-                    pixel: eye.iris_px,
-                },
-                View {
-                    camera: ir_cam,
-                    pixel: pupil_px,
-                },
-            );
-            match triangulate(&views.0, &views.1) {
-                Err(e) => tracing::debug!(
-                    { field::REASON } = "triangulate_failed",
-                    side = side_str(side),
-                    error = %e,
-                    "stereo failed"
-                ),
-                Ok(t) => match stereo_ray(
-                    side,
-                    &t,
-                    eye,
-                    &params,
-                    &frame.viewer,
-                    rgb_cam,
-                    frame.timestamp,
-                ) {
-                    Some(ray) => return Ok(Some((ray, FusedSource::Stereo))),
-                    None => tracing::debug!(
-                        { field::REASON } = "stereo_no_root",
-                        side = side_str(side),
-                        rms_px = t.rms_px,
-                        parallax_rad = t.parallax_rad,
-                        "stereo failed"
-                    ),
-                },
-            }
-        }
-
-        let glint = aligned
+        let glint = ir_measured
             .face
             .as_ref()
             .and_then(|f| f.eye(side))
@@ -547,25 +625,25 @@ impl FusedEstimator {
             Some(glint_px) => (
                 gaze_ray_pccr(
                     side,
-                    &eye.centre,
+                    &eye_ir.centre,
                     ir_cam,
                     &pupil_px,
                     &glint_px,
                     &params,
-                    Some(&frame.viewer),
-                    frame.timestamp,
+                    Some(&frame_ir.viewer),
+                    frame_ir.timestamp,
                 )?,
                 FusedSource::IrGlintOnRgbEyeball,
             ),
             None => (
                 gaze_ray(
                     side,
-                    &eye.centre,
+                    &eye_ir.centre,
                     ir_cam,
                     &pupil_px,
                     &params,
-                    Some(&frame.viewer),
-                    frame.timestamp,
+                    Some(&frame_ir.viewer),
+                    frame_ir.timestamp,
                 )?,
                 FusedSource::IrOnRgbEyeball,
             ),
@@ -909,6 +987,80 @@ pub fn interpolate_ir(
     })
 }
 
+/// `cur` extrapolated to `t` by constant velocity (per-eye centre, viewer angular velocity)
+/// derived from `prev` to `cur`. Holds the pose (keeps `cur`'s centres, inflates each eye's
+/// covariance by `(dt * 0.1 mm/ms)^2` per axis, leaves the viewer unchanged) when `prev` is
+/// `None`, when `cur.timestamp <= prev.timestamp`, when `dt = t - cur.timestamp` exceeds
+/// `max_ms`, or, per eye, when `prev` lacks that side. `None` when `cur` has no eyes or `t` is
+/// before `cur.timestamp`.
+pub fn extrapolate_frame(
+    prev: Option<&LandmarkFrame>,
+    cur: &LandmarkFrame,
+    t: Timestamp,
+    max_ms: f64,
+) -> Option<LandmarkFrame> {
+    if cur.eyes.is_empty() || t < cur.timestamp {
+        return None;
+    }
+    let dt_ms = t.nanos_since(cur.timestamp) as f64 / 1e6;
+
+    let velocity_source = prev.filter(|p| cur.timestamp > p.timestamp);
+    let dt_rgb_ms = velocity_source.map(|p| cur.timestamp.nanos_since(p.timestamp) as f64 / 1e6);
+    let held = dt_rgb_ms.is_none_or(|_| dt_ms > max_ms);
+
+    let (viewer, rate_deg_s) = match (velocity_source, dt_rgb_ms) {
+        (Some(p), Some(dt_rgb_ms)) if !held => {
+            let w = (cur.viewer * p.viewer.inverse()).scaled_axis() / dt_rgb_ms;
+            let extra = UnitQuaternion::from_scaled_axis(w * dt_ms);
+            (extra * cur.viewer, w.norm().to_degrees() * 1000.0)
+        }
+        _ => (cur.viewer, 0.0),
+    };
+
+    let held_inflation = Matrix3::identity() * (dt_ms * 0.1).powi(2);
+    let mut speed_mm_s = 0.0;
+    let eyes = cur
+        .eyes
+        .iter()
+        .map(|eye| {
+            let prev_eye = velocity_source
+                .filter(|_| !held)
+                .and_then(|p| p.eyes.iter().find(|e| e.side == eye.side));
+            match prev_eye {
+                Some(prev_eye) => {
+                    let dt_rgb_ms = dt_rgb_ms.expect("prev_eye implies a velocity source");
+                    let v = (eye.centre.position - prev_eye.centre.position) / dt_rgb_ms;
+                    speed_mm_s = v.norm() * 1000.0;
+                    let position = eye.centre.position + v * dt_ms;
+                    let ratio = dt_ms / dt_rgb_ms;
+                    let cov =
+                        eye.centre.cov + (ratio * ratio) * (eye.centre.cov + prev_eye.centre.cov);
+                    LandmarkEye {
+                        centre: EyeCentre { position, cov },
+                        ..eye.clone()
+                    }
+                }
+                None => LandmarkEye {
+                    centre: EyeCentre {
+                        position: eye.centre.position,
+                        cov: eye.centre.cov + held_inflation,
+                    },
+                    ..eye.clone()
+                },
+            }
+        })
+        .collect();
+
+    tracing::debug!(dt_ms, speed_mm_s, rate_deg_s, held, "pose extrapolated");
+
+    Some(LandmarkFrame {
+        timestamp: t,
+        eyes,
+        viewer,
+        ..cur.clone()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::f64::consts::PI;
@@ -918,7 +1070,7 @@ mod tests {
     use eye_geometry::eyeball::EyeParams;
     use eye_log::testing::capture_logs;
     use eye_log::{Level, Value};
-    use nalgebra::{Isometry3, Matrix2, Point2, Translation3, Vector2, Vector3};
+    use nalgebra::{Isometry3, Matrix2, Matrix6, Point2, Translation3, Vector2, Vector3};
     use proptest::prelude::*;
 
     use super::*;
@@ -926,8 +1078,10 @@ mod tests {
     use crate::landmark::LandmarkOptions;
     use crate::testutil::{
         EYE_CENTRES, synthetic_eye_centres, synthetic_ir_observation_at,
-        synthetic_pccr_observation, synthetic_rgb_observation, test_rig,
+        synthetic_pccr_observation, synthetic_pccr_observation_posed, synthetic_rgb_observation,
+        test_rig,
     };
+    use eye_geometry::pnp::Pose;
 
     fn frontal_screen_from_head() -> Isometry3<f64> {
         Isometry3::from_parts(
@@ -953,6 +1107,36 @@ mod tests {
 
     fn angle_deg(a: &Unit<Vector3<f64>>, b: &Unit<Vector3<f64>>) -> f64 {
         a.dot(b).clamp(-1.0, 1.0).acos().to_degrees()
+    }
+
+    fn landmark_frame(
+        timestamp_ms: f64,
+        right_x_mm: f64,
+        left_x_mm: f64,
+        cov: Matrix3<f64>,
+        yaw_deg: f64,
+    ) -> LandmarkFrame {
+        let iris_px = Measured::new(Point2::new(0.0, 0.0), 1.0).expect("valid sigma");
+        let eye = |side: Side, x_mm: f64| LandmarkEye {
+            side,
+            centre: EyeCentre {
+                position: Point3::new(x_mm, 40.0, -500.0),
+                cov,
+            },
+            iris_px,
+            ray: yaw_pitch_ray(0.0, 0.0, Matrix2::identity()),
+        };
+        LandmarkFrame {
+            camera: CameraId::new("rgb"),
+            timestamp: Timestamp::from_nanos((timestamp_ms * 1e6) as u64),
+            pose: Pose {
+                camera_from_object: Isometry3::identity(),
+                cov: Matrix6::zeros(),
+                rms_px: 0.0,
+            },
+            viewer: UnitQuaternion::from_axis_angle(&Vector3::y_axis(), yaw_deg.to_radians()),
+            eyes: vec![eye(Side::Right, right_x_mm), eye(Side::Left, left_x_mm)],
+        }
     }
 
     fn yaw_pitch_ray(yaw_deg: f64, pitch_deg: f64, cov: Matrix2<f64>) -> GazeRay {
@@ -1182,6 +1366,50 @@ mod tests {
     }
 
     #[test]
+    fn test_stereo_fires_when_ir_precedes_rgb_within_skew() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let scale = 1.06;
+        let target = Point2::new(310.0, 170.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, scale, &params);
+
+        let mut rgb =
+            synthetic_rgb_observation(&rig, &screen_from_head, scale, target, 0.0, 0.0, 1);
+        rgb.timestamp = Timestamp::from_nanos(10_000_000);
+        for eye in rgb.face.as_mut().expect("face present").eyes.iter_mut() {
+            eye.iris = eye
+                .iris
+                .map(|m| Measured::new(m.into_value(), 1.0).expect("valid sigma"));
+        }
+        let mut ir = synthetic_ir_observation_at(&rig, centres, target, 0.0, 1);
+        for eye in ir.face.as_mut().expect("face present").eyes.iter_mut() {
+            eye.pupil = eye
+                .pupil
+                .map(|m| Measured::new(m.into_value(), 0.2).expect("valid sigma"));
+        }
+        ir.timestamp = Timestamp::from_nanos(0);
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        let candidates = estimator
+            .candidates(&[rgb, ir], &rig)
+            .expect("estimate succeeds");
+
+        let truth = Unit::new_normalize(Point3::new(target.x, target.y, 0.0) - centres[0]);
+        let stereo = candidates
+            .iter()
+            .find(|(side, source, _)| *side == Side::Right && *source == FusedSource::Stereo)
+            .expect(
+                "stereo candidate present even though the IR observation is 10ms older \
+                     than the RGB frame",
+            )
+            .2
+            .clone();
+        let stereo_error = angle_deg(&stereo.direction, &truth);
+        assert!(stereo_error < 0.3, "stereo error {stereo_error} deg");
+    }
+
+    #[test]
     fn test_ir_on_rgb_eyeball_used_without_stereo() {
         let rig = test_rig();
         let screen_from_head = frontal_screen_from_head();
@@ -1327,14 +1555,34 @@ mod tests {
         let truth = Unit::new_normalize(Point3::new(target.x, target.y, 0.0) - centres[0]);
 
         let (glint_ray, glint_source) = estimator
-            .cross_chain(&shifted_eye, &frame, &ir_with_glint, &rig)
+            .cross_chain(
+                &shifted_eye,
+                &frame,
+                Some(&ir_with_glint),
+                Some(CrossChainIrTime {
+                    eye: &shifted_eye,
+                    frame: &frame,
+                    measured: &ir_with_glint,
+                }),
+                &rig,
+            )
             .expect("cross chain succeeds")
             .expect("glint candidate present");
         assert_eq!(glint_source, FusedSource::IrGlintOnRgbEyeball);
         let glint_error = angle_deg(&glint_ray.direction, &truth);
 
         let (pupil_ray, pupil_source) = estimator
-            .cross_chain(&shifted_eye, &frame, &ir_without_glint, &rig)
+            .cross_chain(
+                &shifted_eye,
+                &frame,
+                Some(&ir_without_glint),
+                Some(CrossChainIrTime {
+                    eye: &shifted_eye,
+                    frame: &frame,
+                    measured: &ir_without_glint,
+                }),
+                &rig,
+            )
             .expect("cross chain succeeds")
             .expect("pupil-sphere candidate present");
         assert_eq!(pupil_source, FusedSource::IrOnRgbEyeball);
@@ -1786,7 +2034,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bracket_wider_than_limit_disables_cross_chain() {
+    fn test_bracket_wider_than_limit_disables_stereo_and_fusion_but_holds_fallback() {
         let rig = test_rig();
         let screen_from_head = frontal_screen_from_head();
         let target = Point2::new(100.0, 50.0);
@@ -1797,6 +2045,7 @@ mod tests {
         ir_prev.timestamp = Timestamp::from_nanos(1_000_000_000 - 68_000_000);
         let mut ir_next = synthetic_ir_observation_at(&rig, centres, target, 0.0, 2);
         ir_next.timestamp = Timestamp::from_nanos(1_000_000_000 + 200_000_000);
+        let ir_next_timestamp = ir_next.timestamp;
         let mut rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.0, 1);
         rgb.timestamp = Timestamp::from_nanos(1_000_000_000);
 
@@ -1810,13 +2059,18 @@ mod tests {
 
         assert!(!candidates2.iter().any(|(_, src, _)| matches!(
             src,
-            FusedSource::Stereo | FusedSource::IrOnRgbEyeball | FusedSource::InverseCovariance
+            FusedSource::Stereo | FusedSource::InverseCovariance
         )));
         assert!(
             candidates2
                 .iter()
                 .any(|(_, src, _)| *src == FusedSource::IrOnly)
         );
+        let fallback = candidates2
+            .iter()
+            .find(|(_, src, _)| *src == FusedSource::IrOnRgbEyeball)
+            .expect("the pose-extrapolation fallback still fires on a held pose");
+        assert_eq!(fallback.2.timestamp, ir_next_timestamp);
     }
 
     #[test]
@@ -2840,5 +3094,294 @@ mod tests {
             assert!(matches!(rec.fields["accepted"], Value::Bool(_)));
             assert!(matches!(rec.fields["mahalanobis2"], Value::F64(_)));
         }
+    }
+
+    #[test]
+    fn test_extrapolate_frame_constant_velocity() {
+        let cov = Matrix3::identity() * 1e-6;
+        let prev = landmark_frame(0.0, 150.0, 90.0, cov, 0.0);
+        let cur = landmark_frame(66.0, 153.3, 93.3, cov, 0.0);
+
+        let extrapolated =
+            extrapolate_frame(Some(&prev), &cur, Timestamp::from_nanos(131_000_000), 100.0)
+                .expect("prev present and within the limit");
+
+        assert_eq!(extrapolated.timestamp, Timestamp::from_nanos(131_000_000));
+        let right = extrapolated
+            .eyes
+            .iter()
+            .find(|e| e.side == Side::Right)
+            .expect("right eye present");
+        assert_abs_diff_eq!(right.centre.position.x, 156.55, epsilon = 1e-9);
+        assert!(
+            right.centre.cov[(0, 0)] > cov[(0, 0)],
+            "extrapolated covariance {} should exceed cur's {}",
+            right.centre.cov[(0, 0)],
+            cov[(0, 0)]
+        );
+    }
+
+    #[test]
+    fn test_extrapolate_frame_rotation_uses_scaled_axis() {
+        let cov = Matrix3::identity() * 1e-6;
+        let prev = landmark_frame(0.0, 150.0, 90.0, cov, 0.0);
+        let cur = landmark_frame(66.0, 150.0, 90.0, cov, 2.0);
+
+        let extrapolated =
+            extrapolate_frame(Some(&prev), &cur, Timestamp::from_nanos(99_000_000), 100.0)
+                .expect("prev present and within the limit");
+
+        let yaw = extrapolated.viewer.euler_angles().1.to_degrees();
+        assert_abs_diff_eq!(yaw, 3.0, epsilon = 0.01);
+    }
+
+    #[test]
+    fn test_extrapolation_beyond_limit_holds_pose() {
+        let cov = Matrix3::identity() * 1e-6;
+        let prev = landmark_frame(0.0, 150.0, 90.0, cov, 0.0);
+        let cur = landmark_frame(66.0, 153.3, 93.3, cov, 2.0);
+
+        let extrapolated =
+            extrapolate_frame(Some(&prev), &cur, Timestamp::from_nanos(216_000_000), 100.0)
+                .expect("held pose is still Some");
+
+        assert_eq!(extrapolated.timestamp, Timestamp::from_nanos(216_000_000));
+        for (extrapolated_eye, cur_eye) in extrapolated.eyes.iter().zip(&cur.eyes) {
+            assert_abs_diff_eq!(
+                extrapolated_eye.centre.position,
+                cur_eye.centre.position,
+                epsilon = 1e-12
+            );
+            assert_abs_diff_eq!(
+                extrapolated_eye.centre.cov,
+                cur_eye.centre.cov + Matrix3::identity() * 225.0,
+                epsilon = 1e-9
+            );
+        }
+    }
+
+    #[test]
+    fn test_logs_pose_extrapolated_at_debug() {
+        let cov = Matrix3::identity() * 1e-6;
+        let prev = landmark_frame(0.0, 150.0, 90.0, cov, 0.0);
+        let cur = landmark_frame(66.0, 153.3, 93.3, cov, 0.0);
+
+        let (_, logs) = capture_logs(tracing::Level::DEBUG, || {
+            extrapolate_frame(Some(&prev), &cur, Timestamp::from_nanos(131_000_000), 100.0)
+        });
+
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "pose extrapolated")
+            .expect("pose extrapolated record present");
+        assert_eq!(rec.level, Level::Debug);
+        match rec.fields["dt_ms"] {
+            Value::F64(dt_ms) => assert_abs_diff_eq!(dt_ms, 65.0, epsilon = 1e-6),
+            ref other => panic!("expected F64, got {other:?}"),
+        }
+        assert!(matches!(rec.fields["speed_mm_s"], Value::F64(_)));
+        assert!(matches!(rec.fields["rate_deg_s"], Value::F64(_)));
+        assert_eq!(rec.fields["held"], Value::Bool(false));
+    }
+
+    fn moving_head_pose(t_ms: f64) -> Isometry3<f64> {
+        let t_sec = t_ms / 1000.0;
+        Isometry3::from_parts(
+            Translation3::new(155.0 + 50.0 * t_sec, 40.0, -500.0),
+            UnitQuaternion::from_axis_angle(&Vector3::y_axis(), PI + 30f64.to_radians() * t_sec),
+        )
+    }
+
+    #[test]
+    fn test_cross_chain_at_ir_time_beats_interpolation_during_motion() {
+        let rig = test_rig();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+
+        let rgb_prev = {
+            let mut obs =
+                synthetic_rgb_observation(&rig, &moving_head_pose(0.0), 1.0, target, 0.0, 0.0, 1);
+            obs.timestamp = Timestamp::from_nanos(0);
+            obs
+        };
+        let rgb_cur = {
+            let mut obs =
+                synthetic_rgb_observation(&rig, &moving_head_pose(66.0), 1.0, target, 0.0, 0.0, 1);
+            for eye in obs.face.as_mut().expect("face present").eyes.iter_mut() {
+                eye.iris = eye
+                    .iris
+                    .map(|m| Measured::new(m.into_value(), 1.0).expect("valid sigma"));
+            }
+            obs.timestamp = Timestamp::from_nanos(66_000_000);
+            obs
+        };
+        let true_centres_at_ir = synthetic_eye_centres(&moving_head_pose(131.0), 1.0, &params);
+        let ir_at_t_ir = {
+            let mut obs = synthetic_ir_observation_at(&rig, true_centres_at_ir, target, 0.0, 2);
+            for eye in obs.face.as_mut().expect("face present").eyes.iter_mut() {
+                eye.pupil = eye
+                    .pupil
+                    .map(|m| Measured::new(m.into_value(), 0.2).expect("valid sigma"));
+            }
+            obs.timestamp = Timestamp::from_nanos(131_000_000);
+            obs
+        };
+
+        let truth_right =
+            Unit::new_normalize(Point3::new(target.x, target.y, 0.0) - true_centres_at_ir[0]);
+
+        let run = |max_pose_extrapolation_ms: f64| -> GazeRay {
+            let mut options = fused_options_no_kappa();
+            options.stereo = false;
+            options.max_pose_extrapolation_ms = max_pose_extrapolation_ms;
+            let mut estimator = FusedEstimator::new(options);
+            estimator
+                .candidates(std::slice::from_ref(&rgb_prev), &rig)
+                .expect("call 1 succeeds");
+            let candidates = estimator
+                .candidates(&[rgb_cur.clone(), ir_at_t_ir.clone()], &rig)
+                .expect("call 2 succeeds");
+            candidates
+                .into_iter()
+                .find(|(side, source, _)| {
+                    *side == Side::Right && *source == FusedSource::IrOnRgbEyeball
+                })
+                .expect("ir-on-rgb-eyeball candidate present")
+                .2
+        };
+
+        let extrapolated = run(100.0);
+        let extrapolated_error = angle_deg(&extrapolated.direction, &truth_right);
+        assert!(
+            extrapolated_error < 0.3,
+            "extrapolated error {extrapolated_error} deg"
+        );
+
+        let held = run(0.0);
+        let held_error = angle_deg(&held.direction, &truth_right);
+        assert!(held_error > 10.0, "held error {held_error} deg");
+    }
+
+    #[test]
+    fn test_cross_chain_at_ir_time_with_glint_beats_interpolation_during_motion() {
+        let rig = test_rig();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+
+        let rgb_prev = {
+            let mut obs =
+                synthetic_rgb_observation(&rig, &moving_head_pose(0.0), 1.0, target, 0.0, 0.0, 1);
+            obs.timestamp = Timestamp::from_nanos(0);
+            obs
+        };
+        let rgb_cur = {
+            let mut obs =
+                synthetic_rgb_observation(&rig, &moving_head_pose(66.0), 1.0, target, 0.0, 0.0, 1);
+            for eye in obs.face.as_mut().expect("face present").eyes.iter_mut() {
+                eye.iris = eye
+                    .iris
+                    .map(|m| Measured::new(m.into_value(), 1.0).expect("valid sigma"));
+            }
+            obs.timestamp = Timestamp::from_nanos(66_000_000);
+            obs
+        };
+        let ir_at_t_ir = {
+            let mut obs = synthetic_pccr_observation_posed(
+                &rig,
+                target,
+                &moving_head_pose(131.0),
+                0.0,
+                0.0,
+                2,
+            );
+            obs.timestamp = Timestamp::from_nanos(131_000_000);
+            obs
+        };
+        let true_centres_at_ir = synthetic_eye_centres(&moving_head_pose(131.0), 1.0, &params);
+        let truth_right =
+            Unit::new_normalize(Point3::new(target.x, target.y, 0.0) - true_centres_at_ir[0]);
+
+        let mut options = fused_options_no_kappa();
+        options.stereo = false;
+        let mut estimator = FusedEstimator::new(options);
+        estimator
+            .candidates(&[rgb_prev], &rig)
+            .expect("call 1 succeeds");
+        let candidates = estimator
+            .candidates(&[rgb_cur, ir_at_t_ir], &rig)
+            .expect("call 2 succeeds");
+        let glint_ray = candidates
+            .into_iter()
+            .find(|(side, source, _)| {
+                *side == Side::Right && *source == FusedSource::IrGlintOnRgbEyeball
+            })
+            .expect("ir-glint-on-rgb-eyeball candidate present")
+            .2;
+
+        let error = angle_deg(&glint_ray.direction, &truth_right);
+        assert!(error < 0.1, "glint candidate error {error} deg");
+    }
+
+    #[test]
+    fn test_cross_chain_ray_timestamp_is_ir_time() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+
+        let with_pupil_sigma = |mut obs: Observations| -> Observations {
+            for eye in obs.face.as_mut().expect("face present").eyes.iter_mut() {
+                eye.pupil = eye
+                    .pupil
+                    .map(|m| Measured::new(m.into_value(), 0.2).expect("valid sigma"));
+            }
+            obs
+        };
+
+        let mut ir0 = with_pupil_sigma(synthetic_ir_observation_at(&rig, centres, target, 0.0, 1));
+        ir0.timestamp = Timestamp::from_nanos(0);
+        let mut ir136 =
+            with_pupil_sigma(synthetic_ir_observation_at(&rig, centres, target, 0.0, 2));
+        ir136.timestamp = Timestamp::from_nanos(136_000_000);
+        let mut rgb68 =
+            synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.0, 1);
+        for eye in rgb68.face.as_mut().expect("face present").eyes.iter_mut() {
+            eye.iris = eye
+                .iris
+                .map(|m| Measured::new(m.into_value(), 1.0).expect("valid sigma"));
+        }
+        rgb68.timestamp = Timestamp::from_nanos(68_000_000);
+
+        let mut no_stereo = FusedEstimator::new(FusedOptions {
+            stereo: false,
+            ..fused_options_no_kappa()
+        });
+        no_stereo
+            .candidates(&[ir0.clone()], &rig)
+            .expect("call 1 succeeds");
+        let candidates_no_stereo = no_stereo
+            .candidates(&[ir136.clone(), rgb68.clone()], &rig)
+            .expect("call 2 succeeds");
+        let fallback = candidates_no_stereo
+            .iter()
+            .find(|(side, source, _)| {
+                *side == Side::Right && *source == FusedSource::IrOnRgbEyeball
+            })
+            .expect("ir-on-rgb-eyeball candidate present");
+        assert_eq!(fallback.2.timestamp, Timestamp::from_nanos(136_000_000));
+
+        let mut with_stereo = FusedEstimator::new(fused_options_no_kappa());
+        with_stereo
+            .candidates(&[ir0], &rig)
+            .expect("call 1 succeeds");
+        let candidates_with_stereo = with_stereo
+            .candidates(&[ir136, rgb68], &rig)
+            .expect("call 2 succeeds");
+        let stereo = candidates_with_stereo
+            .iter()
+            .find(|(side, source, _)| *side == Side::Right && *source == FusedSource::Stereo)
+            .expect("stereo candidate present");
+        assert_eq!(stereo.2.timestamp, Timestamp::from_nanos(68_000_000));
     }
 }

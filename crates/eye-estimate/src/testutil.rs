@@ -120,15 +120,15 @@ pub(crate) fn synthetic_ir_observation(
     synthetic_ir_observation_at(rig, centres, target_mm, sigma_px, seed)
 }
 
-/// `synthetic_ir_observation_at` geometry (pupils at `C + r_p * g`, `r_p = rotation_to_pupil_mm`)
-/// plus one glint per eye: `K = C + rotation_to_cornea_mm() * g`, `glint = K + cornea_radius_mm *
-/// normalize(o_ir - K)` (the corneal point whose normal points at the camera), projected into
-/// "ir", `N(0, glint_sigma_px)` noise, `Measured` sigma = `glint_sigma_px`. Eye centres
-/// `EYE_CENTRES + head_offset_mm`.
-pub(crate) fn synthetic_pccr_observation(
+/// Renders the ir-pupil-pair observation for `centres` gazing at `target_mm`: pupils at `C + r_p *
+/// g`, `r_p = rotation_to_pupil_mm`, plus one glint per eye: `K = C + rotation_to_cornea_mm() * g`,
+/// `glint = K + cornea_radius_mm * normalize(o_ir - K)` (the corneal point whose normal points at
+/// the camera), projected into "ir", `N(0, glint_sigma_px)` noise, `Measured` sigma =
+/// `glint_sigma_px`.
+fn synthetic_pccr_observation_from_centres(
     rig: &Rig,
     target_mm: Point2<f64>,
-    head_offset_mm: Vector3<f64>,
+    centres: [Point3<f64>; 2],
     pupil_sigma_px: f64,
     glint_sigma_px: f64,
     seed: u64,
@@ -141,11 +141,6 @@ pub(crate) fn synthetic_pccr_observation(
     let target = Point3::new(target_mm.x, target_mm.y, 0.0);
     let o_ir = Point3::from(cam.screen_from_camera.translation.vector);
     let mut rng = SplitMix64::new(seed);
-
-    let centres = [
-        EYE_CENTRES[0] + head_offset_mm,
-        EYE_CENTRES[1] + head_offset_mm,
-    ];
 
     let eyes = [Side::Right, Side::Left]
         .into_iter()
@@ -202,6 +197,51 @@ pub(crate) fn synthetic_pccr_observation(
             eyes,
         }),
     }
+}
+
+/// `synthetic_pccr_observation_from_centres` with eye centres `EYE_CENTRES + head_offset_mm`.
+pub(crate) fn synthetic_pccr_observation(
+    rig: &Rig,
+    target_mm: Point2<f64>,
+    head_offset_mm: Vector3<f64>,
+    pupil_sigma_px: f64,
+    glint_sigma_px: f64,
+    seed: u64,
+) -> Observations {
+    let centres = [
+        EYE_CENTRES[0] + head_offset_mm,
+        EYE_CENTRES[1] + head_offset_mm,
+    ];
+    synthetic_pccr_observation_from_centres(
+        rig,
+        target_mm,
+        centres,
+        pupil_sigma_px,
+        glint_sigma_px,
+        seed,
+    )
+}
+
+/// `synthetic_pccr_observation_from_centres` geometry at an arbitrary (translated and/or rotated)
+/// head pose: eye centres from `synthetic_eye_centres(screen_from_head, 1.0,
+/// &EyeParams::default())` rather than `EYE_CENTRES + head_offset_mm`.
+pub(crate) fn synthetic_pccr_observation_posed(
+    rig: &Rig,
+    target_mm: Point2<f64>,
+    screen_from_head: &Isometry3<f64>,
+    pupil_sigma_px: f64,
+    glint_sigma_px: f64,
+    seed: u64,
+) -> Observations {
+    let centres = synthetic_eye_centres(screen_from_head, 1.0, &EyeParams::default());
+    synthetic_pccr_observation_from_centres(
+        rig,
+        target_mm,
+        centres,
+        pupil_sigma_px,
+        glint_sigma_px,
+        seed,
+    )
 }
 
 /// Rotation centres [right, left] of the synthetic head: `screen_from_head * (scale *
