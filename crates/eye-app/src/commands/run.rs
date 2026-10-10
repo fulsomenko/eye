@@ -314,7 +314,7 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     let mut ticker = StatsTicker::new(args.stats, Duration::from_secs(5), Instant::now());
     let end = run_loop(
         &points,
-        &shutdown,
+        shutdown.receiver(),
         &mut ticker,
         &|| tracker.stats(),
         &|| present.summary(),

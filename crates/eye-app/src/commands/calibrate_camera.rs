@@ -624,7 +624,7 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
                 &report.cameras,
                 EmitterGuard::enable,
             )?;
-            let views = collect_intrinsics(&config, &camera, &shutdown, &a)?;
+            let views = collect_intrinsics(&config, &camera, shutdown.receiver(), &a)?;
             fit_and_save_intrinsics(ctx, &store, current_rig, &camera, &views)?
         }
         Mode::Stereo(a) => {
@@ -639,7 +639,7 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
                 &report.cameras,
                 EmitterGuard::enable,
             )?;
-            let views = collect_stereo(&config, &anchor, &other, &shutdown, &a)?;
+            let views = collect_stereo(&config, &anchor, &other, shutdown.receiver(), &a)?;
             fit_and_save_stereo(ctx, &store, current_rig, &anchor.id, &other.id, &views)?
         }
     };

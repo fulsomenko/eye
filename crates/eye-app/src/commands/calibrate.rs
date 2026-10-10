@@ -699,8 +699,9 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         },
     };
     let mut preview = None;
+    let mut shutdown_guard = None;
     if let Some(location) = recording.location() {
-        let shutdown_rx = shutdown::install()?;
+        let shutdown = shutdown_guard.insert(shutdown::install()?);
         let live_protocol = protocol_for(args.targets, args.dwell_ms);
         let opts = RecordOptions {
             protocol: Some(live_protocol),
@@ -715,7 +716,7 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
                 FitConfig::default(),
                 meta.clone(),
             );
-            let summary = record_session(&config, location, &opts, &shutdown_rx, &mut live)?;
+            let summary = record_session(&config, location, &opts, shutdown.receiver(), &mut live)?;
             preview = live.last_preview().cloned();
             summary
         } else {
@@ -723,7 +724,7 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
                 &config,
                 location,
                 &opts,
-                &shutdown_rx,
+                shutdown.receiver(),
                 &mut crate::commands::record::NoopObserver,
             )?
         };

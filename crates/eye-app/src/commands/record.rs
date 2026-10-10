@@ -460,8 +460,14 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
     let location = SessionLocation::resolve(ctx.output.as_deref())?;
     let opts = RecordOptions::from_args(&args)?;
     let config = Config::load(ctx.config_path.as_deref())?;
-    let shutdown_rx = shutdown::install()?;
-    let summary = record_session(&config, &location, &opts, &shutdown_rx, &mut NoopObserver)?;
+    let shutdown = shutdown::install()?;
+    let summary = record_session(
+        &config,
+        &location,
+        &opts,
+        shutdown.receiver(),
+        &mut NoopObserver,
+    )?;
 
     let frames = summary
         .frames
