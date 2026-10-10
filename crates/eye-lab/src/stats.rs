@@ -12,7 +12,7 @@ pub fn sorted(values: &[f64]) -> Vec<f64> {
     v
 }
 
-/// Nearest-rank percentile shared with eye-bench; NaN when empty.
+/// Hyndman and Fan type 7 percentile shared with eye-bench; NaN when empty.
 pub fn pct(values: &[f64], p: f64) -> f64 {
     eye_bench::metrics::percentile(&sorted(values), p).unwrap_or(f64::NAN)
 }
@@ -156,10 +156,10 @@ mod tests {
     }
 
     #[test]
-    fn test_pct_matches_bench_nearest_rank() {
+    fn test_pct_matches_bench_type7() {
         let values: Vec<f64> = (1..=20).map(f64::from).collect();
-        assert_eq!(pct(&values, 50.0), 10.0);
-        assert_eq!(pct(&values, 95.0), 19.0);
+        assert_eq!(pct(&values, 50.0), 10.5);
+        assert_eq!(pct(&values, 95.0), 19.05);
         assert!(pct(&[], 50.0).is_nan());
     }
 }

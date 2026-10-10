@@ -1000,6 +1000,7 @@ mod tests {
             px_error_logical: None,
             accuracy_deg: None,
             precision_rms_s2s_deg: None,
+            precision_pooled_rms_s2s_deg: None,
             regions: vec![RegionHit {
                 cols: 3,
                 rows: 3,

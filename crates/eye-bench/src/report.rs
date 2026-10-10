@@ -328,6 +328,7 @@ mod tests {
             }),
             accuracy_deg: Some(2.95),
             precision_rms_s2s_deg: Some(0.42),
+            precision_pooled_rms_s2s_deg: Some(0.42),
             regions: vec![
                 RegionHit {
                     cols: 3,

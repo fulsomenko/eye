@@ -132,6 +132,7 @@ pub struct SessionMetrics {
     pub px_error_logical: Option<Summary>,
     pub accuracy_deg: Option<f64>,
     pub precision_rms_s2s_deg: Option<f64>,
+    pub precision_pooled_rms_s2s_deg: Option<f64>,
     /// One entry per valid grid of `MetricParams::grids`, same order.
     pub regions: Vec<RegionHit>,
     pub processing_ms: Option<Summary>,
@@ -151,22 +152,21 @@ pub fn angle_deg(eye: &Point3<f64>, a: &Point2<f64>, b: &Point2<f64>) -> f64 {
     vector_angle_deg(&(lift(a) - eye), &(lift(b) - eye))
 }
 
+/// Hyndman and Fan type 7: `h = (n - 1) p/100`, linear interpolation between `sorted[floor(h)]` and `sorted[ceil(h)]`.
 pub fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
-    if sorted.is_empty() {
+    let n = sorted.len();
+    if n == 0 {
         return None;
     }
-    let rank = (p / 100.0 * sorted.len() as f64).ceil() as usize;
-    Some(sorted[rank.clamp(1, sorted.len()) - 1])
+    let h = (n as f64 - 1.0) * (p / 100.0).clamp(0.0, 1.0);
+    let lo = h.floor() as usize;
+    let hi = h.ceil() as usize;
+    Some(sorted[lo] + (h - lo as f64) * (sorted[hi] - sorted[lo]))
 }
 
 pub(crate) fn median(values: &mut [f64]) -> Option<f64> {
     values.sort_by(f64::total_cmp);
-    let n = values.len();
-    match n {
-        0 => None,
-        _ if n % 2 == 1 => Some(values[n / 2]),
-        _ => Some((values[n / 2 - 1] + values[n / 2]) / 2.0),
-    }
+    percentile(values, 50.0)
 }
 
 pub fn near_boundary(
@@ -216,7 +216,35 @@ fn accuracy(windows: &[EvalWindow]) -> Option<f64> {
     (!offsets.is_empty()).then(|| offsets.iter().sum::<f64>() / offsets.len() as f64)
 }
 
+/// Per-window RMS of the sample-to-sample angle over pairs whose interval lies within
+/// `[0.5, 1.5]` x the window's median interval; `None` for a window with fewer than two points.
+fn window_rms_s2s(w: &EvalWindow) -> Option<f64> {
+    if w.points.len() < 2 {
+        return None;
+    }
+    let dt = |pair: &[EvalPoint]| (pair[1].timestamp.0 - pair[0].timestamp.0).as_secs_f64();
+    let mut dts: Vec<f64> = w.points.windows(2).map(dt).collect();
+    let mid = median(&mut dts)?;
+    let (lo, hi) = (0.5 * mid, 1.5 * mid);
+    let (sum_sq, n) = w.points.windows(2).fold((0.0, 0usize), |(s, n), pair| {
+        if dt(pair) < lo || dt(pair) > hi {
+            return (s, n);
+        }
+        let theta = vector_angle_deg(
+            &(lift(&pair[0].gaze_mm) - pair[0].eye_mm),
+            &(lift(&pair[1].gaze_mm) - pair[1].eye_mm),
+        );
+        (s + theta * theta, n + 1)
+    });
+    (n > 0).then(|| (sum_sq / n as f64).sqrt())
+}
+
 fn precision(windows: &[EvalWindow]) -> Option<f64> {
+    let mut per_window: Vec<f64> = windows.iter().filter_map(window_rms_s2s).collect();
+    median(&mut per_window)
+}
+
+fn precision_pooled(windows: &[EvalWindow]) -> Option<f64> {
     let (sum_sq, n) =
         windows
             .iter()
@@ -337,6 +365,7 @@ pub fn compute(input: &EvalInput, params: &MetricParams) -> SessionMetrics {
         px_error_logical: summary(px_errors),
         accuracy_deg: accuracy(windows),
         precision_rms_s2s_deg: precision(windows),
+        precision_pooled_rms_s2s_deg: precision_pooled(windows),
         regions,
         processing_ms: summary(processing_ms),
         dropout_rate: dropout(windows, params.dropout_bin),
@@ -524,6 +553,68 @@ mod tests {
         assert!(metrics.accuracy_deg.is_some());
     }
 
+    fn dn(deg: f64) -> f64 {
+        500.0 * deg.to_radians().tan()
+    }
+
+    #[test]
+    fn test_precision_median_of_windows_ignores_one_jump() {
+        fn alt_points(base_ms: u64) -> Vec<EvalPoint> {
+            (0..10)
+                .map(|i| {
+                    let x = if i % 2 == 0 {
+                        155.0 + d1()
+                    } else {
+                        155.0 - d1()
+                    };
+                    pt(base_ms + i as u64 * 80, Point2::new(x, 85.0))
+                })
+                .collect()
+        }
+        fn alt_window(base_ms: u64) -> EvalWindow {
+            win(
+                base_ms,
+                base_ms + 800,
+                Point2::new(960.0, 540.0),
+                alt_points(base_ms),
+            )
+        }
+        fn jump_window(base_ms: u64) -> EvalWindow {
+            let mut points = alt_points(base_ms);
+            points[5] = pt(base_ms + 5 * 80, Point2::new(155.0 + dn(10.0), 85.0));
+            win(base_ms, base_ms + 800, Point2::new(960.0, 540.0), points)
+        }
+        let windows = vec![
+            alt_window(0),
+            alt_window(10_000),
+            alt_window(20_000),
+            jump_window(30_000),
+        ];
+        let input = EvalInput {
+            windows,
+            processing: vec![],
+        };
+        let metrics = compute(&input, &MetricParams::default());
+        assert_relative_eq!(metrics.precision_rms_s2s_deg.unwrap(), 2.0, epsilon = 1e-9);
+        assert!(metrics.precision_pooled_rms_s2s_deg.unwrap() > 2.0);
+    }
+
+    #[test]
+    fn test_precision_skips_pairs_with_irregular_interval() {
+        let dir_a = Point2::new(155.0, 85.0);
+        let dir_b = Point2::new(155.0 + dn(5.0), 85.0);
+        let mut points: Vec<EvalPoint> = (0..5u64).map(|i| pt(i * 33, dir_a)).collect();
+        points.push(pt(134, dir_b));
+        points.extend((0..5u64).map(|i| pt(165 + i * 33, dir_b)));
+        let input = EvalInput {
+            windows: vec![win(0, 400, Point2::new(960.0, 540.0), points)],
+            processing: vec![],
+        };
+        let metrics = compute(&input, &MetricParams::default());
+        assert_abs_diff_eq!(metrics.precision_rms_s2s_deg.unwrap(), 0.0, epsilon = 1e-12);
+        assert!(metrics.precision_pooled_rms_s2s_deg.unwrap() > 1.0);
+    }
+
     #[test]
     fn test_median_even_count_is_mean_of_middle() {
         assert_eq!(median(&mut [100.0, 200.0, 300.0, 1000.0]), Some(250.0));
@@ -560,13 +651,18 @@ mod tests {
     }
 
     #[test]
-    fn test_percentile_nearest_rank_known_values() {
+    fn test_percentile_type7_known_values() {
         let values: Vec<f64> = (1..=20).map(f64::from).collect();
-        assert_eq!(percentile(&values, 50.0), Some(10.0));
-        assert_eq!(percentile(&values, 95.0), Some(19.0));
+        assert_eq!(percentile(&values, 50.0), Some(10.5));
+        assert_eq!(percentile(&values, 95.0), Some(19.05));
         assert_eq!(percentile(&values, 100.0), Some(20.0));
         assert_eq!(percentile(&values, 0.0), Some(1.0));
         assert_eq!(percentile(&[], 50.0), None);
+        assert_relative_eq!(
+            percentile(&[1.0, 2.0, 3.0, 4.0], 95.0).unwrap(),
+            3.85,
+            epsilon = 1e-12
+        );
     }
 
     #[test]
@@ -733,12 +829,12 @@ mod tests {
         let metrics = compute(&input, &MetricParams::default());
         assert_relative_eq!(
             metrics.processing_ms.as_ref().unwrap().p50,
-            10.0,
+            10.5,
             epsilon = 1e-12
         );
         assert_relative_eq!(
             metrics.processing_ms.as_ref().unwrap().p95,
-            19.0,
+            19.05,
             epsilon = 1e-12
         );
     }
@@ -750,6 +846,7 @@ mod tests {
         assert_eq!(metrics.px_error_logical, None);
         assert_eq!(metrics.accuracy_deg, None);
         assert_eq!(metrics.precision_rms_s2s_deg, None);
+        assert_eq!(metrics.precision_pooled_rms_s2s_deg, None);
         assert_eq!(metrics.processing_ms, None);
         assert_eq!(metrics.dropout_rate, None);
         assert_eq!(metrics.output_rate_hz, None);

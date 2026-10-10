@@ -303,6 +303,7 @@ mod tests {
                 px_error_logical: None,
                 accuracy_deg: None,
                 precision_rms_s2s_deg: None,
+                precision_pooled_rms_s2s_deg: None,
                 regions: vec![],
                 processing_ms: None,
                 dropout_rate: None,
