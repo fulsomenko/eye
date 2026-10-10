@@ -47,10 +47,9 @@ pub struct IrClassicOptions {
     pub glint_search_radius: f64,
     /// Lit levels the glint peak must exceed the pupil plateau by (E2: observed 15 to 60).
     pub glint_min_excess: f64,
-    /// 1-sigma glint position noise in px (E2: 0.7 px pupil-glint vector std / sqrt(2)).
+    /// 1-sigma glint position noise in px.
     pub glint_sigma_px: f64,
-    /// Lower bound on the 1-sigma pupil-centre noise from the ellipse fit, px
-    /// (EYE-106 replay: about 0.3 px frame to frame on real IR).
+    /// Lower bound on the 1-sigma pupil-centre noise from the ellipse fit, px.
     pub pupil_sigma_floor_px: f64,
     /// Candidates farther than this from the previous accepted pupil (scaled by the lit-frame
     /// gap over 133 ms) are gated out before contrast ranking.
@@ -82,8 +81,8 @@ impl Default for IrClassicOptions {
             glints: true,
             glint_search_radius: 2.0,
             glint_min_excess: 15.0,
-            glint_sigma_px: 0.5,
-            pupil_sigma_floor_px: 0.3,
+            glint_sigma_px: 0.19,
+            pupil_sigma_floor_px: 0.38,
             track_gate_px: 5.0,
             track_area_ratio: 2.0,
             track_max_gap_ms: 400.0,
@@ -443,7 +442,7 @@ mod tests {
         );
         for eye in &eyes {
             let sigma = eye.pupil.unwrap().sigma();
-            assert!(sigma > 0.0 && sigma <= 0.3, "sigma {sigma} out of range");
+            assert!(sigma > 0.0 && sigma <= 0.38, "sigma {sigma} out of range");
         }
     }
 
@@ -486,8 +485,13 @@ mod tests {
     }
 
     #[test]
-    fn test_ir_classic_options_default_floor_is_0_3() {
-        assert_eq!(IrClassicOptions::default().pupil_sigma_floor_px, 0.3);
+    fn test_ir_classic_options_default_floor_is_0_38() {
+        assert_eq!(IrClassicOptions::default().pupil_sigma_floor_px, 0.38);
+    }
+
+    #[test]
+    fn test_ir_classic_options_default_glint_sigma_is_0_19() {
+        assert_eq!(IrClassicOptions::default().glint_sigma_px, 0.19);
     }
 
     #[test]
@@ -1619,7 +1623,7 @@ mod tests {
                         (x - want_x).abs() <= 0.05,
                         "x {x} not within 0.05 of {want_x}"
                     );
-                    assert!(*sigma > 0.0 && *sigma <= 0.3, "sigma {sigma} out of range");
+                    assert!(*sigma > 0.0 && *sigma <= 0.38, "sigma {sigma} out of range");
                     assert!(!glint);
                 }
                 other => panic!("unexpected field types: {other:?}"),
@@ -1652,7 +1656,7 @@ mod tests {
         for rec in &glints {
             assert_eq!(rec.level, LogLevel::Trace);
             assert_eq!(rec.fields["saturated"], Value::Bool(false));
-            assert_eq!(rec.fields["sigma"], Value::F64(0.5));
+            assert_eq!(rec.fields["sigma"], Value::F64(0.19));
         }
 
         let pupils: Vec<_> = logs.iter().filter(|r| r.message == "pupil").collect();
