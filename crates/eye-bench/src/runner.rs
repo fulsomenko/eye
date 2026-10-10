@@ -140,7 +140,7 @@ fn step(pipeline: &mut Pipeline, set: &FrameSet) -> Result<Step, BenchError> {
 #[allow(clippy::result_large_err)]
 fn session_rig(meta: &SessionMeta) -> Result<Rig, BenchError> {
     let rig_table = meta.rig.as_ref().ok_or_else(|| BenchError::NoRig {
-        session: meta.session_id.clone(),
+        session: meta.session_id.to_string(),
     })?;
     rig_from_table(rig_table).map_err(|e| BenchError::Calibration(Box::new(e)))
 }
@@ -199,13 +199,13 @@ pub fn resolve_rig(
                 .ok_or_else(|| {
                     BenchError::RigSource(format!("no stored rig for output {output}"))
                 })?;
-            check_rig_compatible(&recorded, &stored, &meta.session_id)?;
+            check_rig_compatible(&recorded, &stored, meta.session_id.as_str())?;
             Ok((stored, source.label()))
         }
         RigSource::File(path) => {
             let recorded = session_rig(meta)?;
             let file_rig = read_rig(path).map_err(|e| BenchError::RigSource(e.to_string()))?;
-            check_rig_compatible(&recorded, &file_rig, &meta.session_id)?;
+            check_rig_compatible(&recorded, &file_rig, meta.session_id.as_str())?;
             Ok((file_rig, source.label()))
         }
     }
@@ -250,7 +250,7 @@ pub fn replay_session_with_rig(
     };
     let recording = Recording::open(dir).map_err(capture)?;
     let meta = recording.meta();
-    let session = meta.session_id.clone();
+    let session = meta.session_id.to_string();
     let (rig, rig_source_label) = resolve_rig(meta, rig_source, store)?;
     let rig_fingerprint_value = rig_fingerprint(&rig);
     let cameras = config

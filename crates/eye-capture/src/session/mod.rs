@@ -77,7 +77,7 @@ impl RecordedCamera {
 #[serde(deny_unknown_fields)]
 pub struct SessionMeta {
     pub format_version: u32,
-    pub session_id: String,
+    pub session_id: SessionId,
     pub created_unix_s: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_rev: Option<String>,
@@ -125,7 +125,7 @@ mod tests {
     fn meta() -> SessionMeta {
         SessionMeta {
             format_version: 1,
-            session_id: "20261007T221500Z".to_string(),
+            session_id: SessionId::new("20261007T221500Z").unwrap(),
             created_unix_s: 1_791_411_300,
             git_rev: Some("abc1234".to_string()),
             emitter: Some(EmitterState::On),

@@ -33,23 +33,17 @@ fn io_err(path: &Path) -> impl Fn(io::Error) -> CaptureError + '_ {
 
 impl SessionWriter {
     pub fn create(root: &Path, meta: &SessionMeta) -> Result<Self, CaptureError> {
-        if !valid_component(&meta.session_id) {
-            return Err(CaptureError::RecordingFormat {
-                path: root.join(&meta.session_id),
-                reason: format!("invalid session id {:?}", meta.session_id),
-            });
-        }
         for camera in &meta.cameras {
             if !valid_component(&camera.id) {
                 return Err(CaptureError::RecordingFormat {
-                    path: root.join(&meta.session_id),
+                    path: root.join(meta.session_id.as_str()),
                     reason: format!("invalid camera id {:?}", camera.id),
                 });
             }
         }
 
         fs::create_dir_all(root).map_err(io_err(root))?;
-        let dir = root.join(&meta.session_id);
+        let dir = root.join(meta.session_id.as_str());
         fs::create_dir(&dir).map_err(io_err(&dir))?;
 
         for camera in &meta.cameras {
@@ -213,14 +207,14 @@ mod tests {
 
     use super::*;
     use crate::{
-        session::{EmitterState, SessionMeta},
+        session::{EmitterState, SessionId, SessionMeta},
         testing::{gray_frame, mjpeg_frame},
     };
 
     fn meta() -> SessionMeta {
         SessionMeta {
             format_version: 1,
-            session_id: "20261007T221500Z".to_string(),
+            session_id: SessionId::new("20261007T221500Z").unwrap(),
             created_unix_s: 1_791_411_300,
             git_rev: Some("abc1234".to_string()),
             emitter: Some(EmitterState::On),
@@ -442,13 +436,6 @@ mod tests {
     #[test]
     fn test_writer_rejects_path_tricks_in_ids() {
         let root = tempfile::tempdir().unwrap();
-
-        let mut bad_session = meta();
-        bad_session.session_id = "../escape".to_string();
-        let err = SessionWriter::create(root.path(), &bad_session).unwrap_err();
-        assert!(matches!(err, CaptureError::RecordingFormat { .. }));
-        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
-        assert!(!root.path().join("../escape").exists());
 
         let mut bad_camera = meta();
         bad_camera.cameras[0].id = "a/b".to_string();

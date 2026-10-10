@@ -300,7 +300,7 @@ pub fn session_meta(
     let created_unix_s = now.duration_since(UNIX_EPOCH)?.as_secs();
     Ok(SessionMeta {
         format_version: FORMAT_VERSION,
-        session_id: id.as_str().to_string(),
+        session_id: id.clone(),
         created_unix_s,
         git_rev: Some(GIT_REV.to_string()),
         emitter: emitter_on.then_some(EmitterState::On),

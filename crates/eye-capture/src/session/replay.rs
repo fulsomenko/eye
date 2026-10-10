@@ -140,13 +140,13 @@ mod tests {
     use super::*;
     use crate::{
         format::StoredFormat,
-        session::{EmitterState, SessionMeta, SessionWriter},
+        session::{EmitterState, SessionId, SessionMeta, SessionWriter},
     };
 
     fn meta() -> SessionMeta {
         SessionMeta {
             format_version: 1,
-            session_id: "20261007T221500Z".to_string(),
+            session_id: SessionId::new("20261007T221500Z").unwrap(),
             created_unix_s: 1_791_411_300,
             git_rev: None,
             emitter: Some(EmitterState::On),

@@ -2,8 +2,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::CaptureError;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct SessionId(String);
+
+impl TryFrom<String> for SessionId {
+    type Error = CaptureError;
+
+    fn try_from(id: String) -> Result<Self, CaptureError> {
+        Self::new(id)
+    }
+}
+
+impl From<SessionId> for String {
+    fn from(id: SessionId) -> String {
+        id.0
+    }
+}
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 pub(crate) fn valid_component(s: &str) -> bool {
     !s.is_empty()
@@ -18,10 +39,7 @@ impl SessionId {
         if valid_component(&id) {
             Ok(Self(id))
         } else {
-            Err(CaptureError::Config {
-                camera: "session".to_string(),
-                reason: format!("invalid session id {id:?}"),
-            })
+            Err(CaptureError::InvalidSessionId { id })
         }
     }
 
@@ -87,5 +105,29 @@ mod tests {
         assert!(SessionId::new("a/b").is_err());
         assert!(SessionId::new(".hidden").is_err());
         assert!(SessionId::new("dots-session_1.v2").is_ok());
+    }
+
+    #[test]
+    fn test_session_id_deserialises_with_validation() {
+        let ok: SessionId = serde_json::from_str("\"20261007T221500Z\"").unwrap();
+        assert_eq!(ok.as_str(), "20261007T221500Z");
+
+        let err = serde_json::from_str::<SessionId>("\"../x\"").unwrap_err();
+        assert!(err.to_string().contains("invalid session id \"../x\""));
+
+        assert_eq!(
+            serde_json::to_string(&SessionId::new("a-b").unwrap()).unwrap(),
+            "\"a-b\""
+        );
+    }
+
+    #[test]
+    fn test_session_id_rejects_path_tricks_with_invalid_session_id() {
+        let err = SessionId::new("../escape").unwrap_err();
+        assert!(matches!(
+            &err,
+            CaptureError::InvalidSessionId { id } if id == "../escape"
+        ));
+        assert_eq!(err.to_string(), "invalid session id \"../escape\"");
     }
 }

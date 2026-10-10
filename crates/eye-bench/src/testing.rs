@@ -11,7 +11,7 @@ use eye::error::ConfigError;
 use eye::registry::Registry;
 use eye_calibration::protocol::ProtocolConfig;
 use eye_calibration::store::rig_to_table;
-use eye_capture::session::{FORMAT_VERSION, RecordedCamera, SessionMeta, SessionWriter};
+use eye_capture::session::{FORMAT_VERSION, RecordedCamera, SessionId, SessionMeta, SessionWriter};
 use eye_core::session::{TargetClock, TargetRecord};
 use eye_core::stage::{Detector, GazeEstimator, StageError};
 use eye_core::{
@@ -139,7 +139,7 @@ pub fn write_synthetic_session(
 
     let meta = SessionMeta {
         format_version: FORMAT_VERSION,
-        session_id: id.to_string(),
+        session_id: SessionId::new(id).map_err(capture)?,
         created_unix_s: 1_791_409_623,
         git_rev: None,
         emitter: None,
@@ -581,7 +581,7 @@ mod tests {
         let spec = SyntheticSession::default();
         let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
         let recording = eye_capture::session::Recording::open(&session_dir).unwrap();
-        assert_eq!(recording.meta().session_id, "s1");
+        assert_eq!(recording.meta().session_id.as_str(), "s1");
         assert!(recording.meta().rig.is_some());
         assert_eq!(recording.merged_index().len(), 61);
     }

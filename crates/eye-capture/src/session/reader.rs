@@ -263,7 +263,7 @@ mod tests {
     use super::*;
     use crate::{
         pairing::Pairer,
-        session::{EmitterState, PacingOption, SessionWriter},
+        session::{EmitterState, PacingOption, SessionId, SessionWriter},
         source::FrameSource,
         testing::{gray_frame, mjpeg_frame},
     };
@@ -271,7 +271,7 @@ mod tests {
     fn meta() -> SessionMeta {
         SessionMeta {
             format_version: 1,
-            session_id: "20261007T221500Z".to_string(),
+            session_id: SessionId::new("20261007T221500Z").unwrap(),
             created_unix_s: 1_791_411_300,
             git_rev: Some("abc1234".to_string()),
             emitter: Some(EmitterState::On),

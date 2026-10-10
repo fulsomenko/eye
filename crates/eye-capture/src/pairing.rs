@@ -37,7 +37,7 @@ pub struct Pairer {
 
 impl Pairer {
     /// 1 camera: every frame is emitted at once. 2 cameras: `[primary, secondary]`, the primary must be the
-    /// Gray8 (IR) camera and the ids distinct; else `CaptureError::Config`. `PairingConfig::default()`.
+    /// Gray8 (IR) camera and the ids distinct; else `CaptureError::Pairing`. `PairingConfig::default()`.
     pub fn new(cameras: &[CameraInfo]) -> Result<Self, CaptureError> {
         Self::with_config(cameras, PairingConfig::default())
     }
@@ -46,9 +46,8 @@ impl Pairer {
         let ids = || {
             cameras
                 .iter()
-                .map(|c| c.id.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
+                .map(|c| c.id.clone())
+                .collect::<Vec<CameraId>>()
         };
         match cameras {
             [one] => Ok(Self {
@@ -67,13 +66,13 @@ impl Pairer {
                     last_lit: None,
                 })
             }
-            [_, _] => Err(CaptureError::Config {
-                camera: ids(),
-                reason: "a camera pair needs a Gray8 primary and two distinct ids".into(),
+            [_, _] => Err(CaptureError::Pairing {
+                cameras: ids(),
+                reason: "a camera pair needs a Gray8 primary and two distinct ids",
             }),
-            _ => Err(CaptureError::Config {
-                camera: ids(),
-                reason: "Pairer supports 1 or 2 cameras".into(),
+            _ => Err(CaptureError::Pairing {
+                cameras: ids(),
+                reason: "Pairer supports 1 or 2 cameras",
             }),
         }
     }
@@ -342,14 +341,34 @@ mod tests {
         let ir_info = camera_info("ir", PixelFormat::Gray8, 4, 2);
         assert!(matches!(
             Pairer::new(&[rgb_info, ir_info.clone()]),
-            Err(CaptureError::Config { .. })
+            Err(CaptureError::Pairing { .. })
         ));
-        assert!(matches!(Pairer::new(&[]), Err(CaptureError::Config { .. })));
+        assert!(matches!(
+            Pairer::new(&[]),
+            Err(CaptureError::Pairing { .. })
+        ));
         let dup = camera_info("ir", PixelFormat::Gray8, 4, 2);
         assert!(matches!(
             Pairer::new(&[ir_info, dup]),
-            Err(CaptureError::Config { .. })
+            Err(CaptureError::Pairing { .. })
         ));
+    }
+
+    #[test]
+    fn test_pairing_error_names_both_cameras() {
+        let ir_info = camera_info("ir", PixelFormat::Mjpeg, 1280, 720);
+        let rgb_info = camera_info("rgb", PixelFormat::Mjpeg, 1280, 720);
+        let err = Pairer::new(&[ir_info, rgb_info]).unwrap_err();
+        assert!(matches!(
+            &err,
+            CaptureError::Pairing { cameras, reason }
+                if *cameras == vec![CameraId::from("ir"), CameraId::from("rgb")]
+                    && *reason == "a camera pair needs a Gray8 primary and two distinct ids"
+        ));
+        assert_eq!(
+            err.to_string(),
+            "cameras [ir, rgb]: a camera pair needs a Gray8 primary and two distinct ids"
+        );
     }
 
     #[test]

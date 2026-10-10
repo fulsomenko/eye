@@ -1,5 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
+use eye_core::CameraId;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
     #[error("open {path}: {source}")]
@@ -32,6 +34,13 @@ pub enum CaptureError {
     EndOfStream,
     #[error("camera {camera}: invalid options: {reason}")]
     Config { camera: String, reason: String },
+    #[error("invalid session id {id:?}")]
+    InvalidSessionId { id: String },
+    #[error("cameras [{}]: {reason}", cameras.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", "))]
+    Pairing {
+        cameras: Vec<CameraId>,
+        reason: &'static str,
+    },
     #[error("recording {path}: {source}")]
     RecordingIo {
         path: PathBuf,
