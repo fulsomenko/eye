@@ -3,13 +3,14 @@
 use std::time::Instant;
 
 use eye_core::GazePoint;
-use eye_core::grid::Grid;
+use eye_core::grid::{Cell, Grid};
 use eye_core::log::field;
 use nalgebra::{Point2, Vector2};
 
 use crate::canvas::{Canvas, LogicalRect, Rgba};
 use crate::ellipse::{ConfidenceEllipse, K95, confidence_ellipse, cov_mm_to_logical_px};
 use crate::fade::{FADE_START, fade};
+use crate::point::HideRules;
 use crate::scene::{Scene, Schedule};
 
 /// Fraction of a 64-point area-uniform polar sample of `e` that falls inside `[min, max)`.
@@ -30,12 +31,36 @@ pub fn containment_fraction(e: &ConfidenceEllipse, min: Point2<f64>, max: Point2
     f64::from(inside) / 64.0
 }
 
+/// `current` unless `p` lies at least `margin_px` inside a different cell.
+fn stable_cell(
+    grid: Grid,
+    current: Option<Cell>,
+    p: Point2<f64>,
+    size: (f64, f64),
+    margin_px: f64,
+) -> Option<Cell> {
+    let candidate = grid.cell_of(p, size)?;
+    match current {
+        Some(c) if c != candidate => {
+            let (min, max) = grid.cell_bounds(candidate, size);
+            let inside = p.x >= min.x + margin_px
+                && p.x < max.x - margin_px
+                && p.y >= min.y + margin_px
+                && p.y < max.y - margin_px;
+            Some(if inside { candidate } else { c })
+        }
+        _ => Some(candidate),
+    }
+}
+
 #[derive(Debug)]
 pub struct RegionScene {
     grid: Grid,
     px_per_mm: Vector2<f64>,
     color: [u8; 3],
+    margin_px: f64,
     latest: Option<(GazePoint, Instant)>,
+    current: Option<Cell>,
 }
 
 impl RegionScene {
@@ -44,8 +69,15 @@ impl RegionScene {
             grid,
             px_per_mm,
             color,
+            margin_px: HideRules::default().margin_px,
             latest: None,
+            current: None,
         }
+    }
+
+    pub fn with_margin(mut self, margin_px: f64) -> Self {
+        self.margin_px = margin_px;
+        self
     }
 
     fn rgba(&self, alpha: f64) -> Rgba {
@@ -80,6 +112,7 @@ impl Scene for RegionScene {
                 "stale gaze point hidden"
             );
             self.latest = None;
+            self.current = None;
             return Schedule::Idle;
         }
         let schedule = if age < FADE_START {
@@ -89,7 +122,9 @@ impl Scene for RegionScene {
         };
         let (w, h) = canvas.logical_size();
         let size = (f64::from(w), f64::from(h));
-        let Some(cell) = self.grid.cell_of(p.px_logical, size) else {
+        let Some(cell) = stable_cell(self.grid, self.current, p.px_logical, size, self.margin_px)
+        else {
+            self.current = None;
             tracing::debug!(
                 x = p.px_logical.x,
                 y = p.px_logical.y,
@@ -98,6 +133,8 @@ impl Scene for RegionScene {
             );
             return schedule;
         };
+        let held = self.grid.cell_of(p.px_logical, size) != Some(cell);
+        self.current = Some(cell);
         let (min, max) = self.grid.cell_bounds(cell, size);
         let cov_px = cov_mm_to_logical_px(&p.cov_mm, &self.px_per_mm);
         let containment = confidence_ellipse(p.px_logical, &cov_px, K95, size.0.hypot(size.1))
@@ -117,6 +154,7 @@ impl Scene for RegionScene {
             containment,
             fade = f,
             age_us,
+            held,
             { field::TS_NS } = p.timestamp.as_nanos(),
             "gaze cell drawn"
         );
@@ -282,6 +320,7 @@ mod tests {
         assert_eq!(rec.fields["col"], Value::U64(1));
         assert_eq!(rec.fields["row"], Value::U64(1));
         assert_eq!(rec.fields["containment"], Value::F64(1.0));
+        assert_eq!(rec.fields["held"], Value::Bool(false));
     }
 
     #[test]
@@ -327,5 +366,117 @@ mod tests {
         scene.render(&mut canvas, later);
 
         assert_alpha(&buf, 75, 75, 80.0, 3.0);
+    }
+
+    fn col_of(records: &[eye_log::Record]) -> u64 {
+        let rec = records
+            .iter()
+            .find(|r| r.message == "gaze cell drawn")
+            .expect("gaze cell drawn record");
+        let Value::U64(col) = rec.fields["col"] else {
+            panic!("col field is not U64");
+        };
+        col
+    }
+
+    #[test]
+    fn test_region_cell_holds_across_boundary_jitter() {
+        let mut buf = vec![0u8; 200 * 200 * 4];
+        let now = Instant::now();
+        let grid = Grid::new(4, 4).unwrap();
+        let mut scene = RegionScene::new(grid, Vector2::new(1.0, 1.0), [64, 160, 255]);
+
+        let p1 = point_at(
+            Point2::new(49.0, 25.0),
+            Matrix2::new(0.01, 0.0, 0.0, 0.01),
+            1.0,
+        );
+        scene.on_msg(p1, now);
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            let mut canvas = new_canvas(&mut buf);
+            scene.render(&mut canvas, now);
+        });
+        assert_eq!(col_of(&records), 0);
+
+        let p2 = point_at(
+            Point2::new(51.0, 25.0),
+            Matrix2::new(0.01, 0.0, 0.0, 0.01),
+            1.0,
+        );
+        scene.on_msg(p2, now);
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            let mut canvas = new_canvas(&mut buf);
+            scene.render(&mut canvas, now);
+        });
+        assert_eq!(col_of(&records), 0);
+    }
+
+    #[test]
+    fn test_region_cell_switches_when_margin_inside() {
+        let mut buf = vec![0u8; 200 * 200 * 4];
+        let now = Instant::now();
+        let grid = Grid::new(4, 4).unwrap();
+        let mut scene = RegionScene::new(grid, Vector2::new(1.0, 1.0), [64, 160, 255]);
+
+        let p1 = point_at(
+            Point2::new(49.0, 25.0),
+            Matrix2::new(0.01, 0.0, 0.0, 0.01),
+            1.0,
+        );
+        scene.on_msg(p1, now);
+        let mut canvas = new_canvas(&mut buf);
+        scene.render(&mut canvas, now);
+
+        let p2 = point_at(
+            Point2::new(75.0, 25.0),
+            Matrix2::new(0.01, 0.0, 0.0, 0.01),
+            1.0,
+        );
+        scene.on_msg(p2, now);
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            let mut canvas = new_canvas(&mut buf);
+            scene.render(&mut canvas, now);
+        });
+        assert_eq!(col_of(&records), 1);
+    }
+
+    #[test]
+    fn test_region_cell_resets_after_fade() {
+        let mut buf = vec![0u8; 200 * 200 * 4];
+        let now = Instant::now();
+        let grid = Grid::new(4, 4).unwrap();
+        let mut scene = RegionScene::new(grid, Vector2::new(1.0, 1.0), [64, 160, 255]);
+
+        let p1 = point_at(
+            Point2::new(49.0, 25.0),
+            Matrix2::new(0.01, 0.0, 0.0, 0.01),
+            1.0,
+        );
+        scene.on_msg(p1, now);
+        let mut canvas = new_canvas(&mut buf);
+        scene.render(&mut canvas, now);
+
+        let faded_at = now + std::time::Duration::from_millis(900);
+        scene.render(&mut canvas, faded_at);
+
+        // x = 51 fails col 1's own margin check, so a stale col-0 `current`
+        // would still hold it; only a cleared `current` takes col 1 here.
+        let p2 = point_at(
+            Point2::new(51.0, 25.0),
+            Matrix2::new(0.01, 0.0, 0.0, 0.01),
+            1.0,
+        );
+        scene.on_msg(p2, faded_at);
+        let (_, records) = capture_logs(tracing::Level::TRACE, || {
+            scene.render(&mut canvas, faded_at);
+        });
+        assert_eq!(col_of(&records), 1);
+    }
+
+    #[test]
+    fn test_stable_cell_without_current_takes_candidate() {
+        let grid = Grid::new(4, 4).unwrap();
+        let cell = stable_cell(grid, None, Point2::new(51.0, 25.0), (200.0, 200.0), 24.0);
+        assert_eq!(cell, Some(Cell { col: 1, row: 0 }));
     }
 }

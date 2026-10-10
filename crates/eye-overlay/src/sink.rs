@@ -68,7 +68,8 @@ impl LayerShellOverlay {
                 let grid = Grid::new(cols, rows).ok_or(OverlayError::InvalidGrid { cols, rows })?;
                 spawn(
                     surface,
-                    RegionScene::new(grid, options.px_per_mm, options.color),
+                    RegionScene::new(grid, options.px_per_mm, options.color)
+                        .with_margin(options.hide.margin_px),
                 )?
             }
         };
