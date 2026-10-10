@@ -229,7 +229,8 @@ mod tests {
 
         let err = from_config(&table, &rig).unwrap_err();
         match err {
-            StageError::Config(msg) => {
+            StageError::Config(source) => {
+                let msg = source.to_string();
                 assert!(
                     msg.contains("mediapipe/face_detector.onnx"),
                     "message was: {msg}"

@@ -7,7 +7,7 @@ use crate::FilterError;
 
 impl From<FilterError> for StageError {
     fn from(e: FilterError) -> Self {
-        StageError::Config(e.to_string())
+        StageError::Config(Box::new(e))
     }
 }
 
@@ -40,4 +40,23 @@ pub(crate) fn dt_seconds(prev: Timestamp, now: Timestamp) -> Option<f64> {
 /// `(xx, xy, yy)` entries of a symmetric 2x2 covariance, for logging.
 pub(crate) fn cov_fields(m: &Matrix2<f64>) -> (f64, f64, f64) {
     (m[(0, 0)], m[(0, 1)], m[(1, 1)])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+
+    use eye_core::stage::StageErrorKind;
+
+    use super::*;
+
+    #[test]
+    fn test_filter_error_keeps_source() {
+        let e = StageError::from(FilterError::Param {
+            name: "min_cutoff",
+            reason: "must be positive",
+        });
+        assert_eq!(e.kind(), StageErrorKind::Config);
+        assert!(e.source().unwrap().downcast_ref::<FilterError>().is_some());
+    }
 }

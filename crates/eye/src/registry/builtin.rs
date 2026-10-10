@@ -18,7 +18,7 @@ impl PassThroughFilter {
         let NoOptions {} = table
             .clone()
             .try_into()
-            .map_err(|e: toml::de::Error| StageError::Config(e.to_string()))?;
+            .map_err(|e: toml::de::Error| StageError::Config(Box::new(e)))?;
         Ok(Self)
     }
 }

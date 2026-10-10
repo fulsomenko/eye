@@ -24,16 +24,20 @@ pub enum DetectError {
 
 impl From<DetectError> for StageError {
     fn from(e: DetectError) -> Self {
-        match e {
-            DetectError::Config { .. } | DetectError::Model { .. } => Self::Config(e.to_string()),
-            DetectError::UnsupportedFormat(_) => Self::Unsupported(e.to_string()),
-            _ => Self::Failed(e.to_string()),
+        match &e {
+            DetectError::Config { .. } | DetectError::Model { .. } => Self::Config(Box::new(e)),
+            DetectError::UnsupportedFormat(_) => Self::Unsupported(Box::new(e)),
+            _ => Self::Failed(Box::new(e)),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
+
+    use eye_core::stage::StageErrorKind;
+
     use super::*;
 
     fn toml_error() -> toml::de::Error {
@@ -46,28 +50,42 @@ mod tests {
             detector: "ir-classic",
             source: toml_error(),
         };
+        let e = StageError::from(config);
+        assert_eq!(e.kind(), StageErrorKind::Config);
         assert!(
-            matches!(StageError::from(config), StageError::Config(m) if m.starts_with("invalid options for detector ir-classic"))
+            e.to_string()
+                .starts_with("invalid configuration: invalid options for detector ir-classic")
         );
+        assert!(e.source().unwrap().downcast_ref::<DetectError>().is_some());
+
         let model = DetectError::Model {
             path: PathBuf::from("/m/face.onnx"),
             reason: "missing".into(),
         };
+        let e = StageError::from(model);
+        assert_eq!(e.kind(), StageErrorKind::Config);
         assert_eq!(
-            StageError::from(model),
-            StageError::Config("model /m/face.onnx: missing".into())
+            e.to_string(),
+            "invalid configuration: model /m/face.onnx: missing"
         );
+        assert!(e.source().unwrap().downcast_ref::<DetectError>().is_some());
+
+        let e = StageError::from(DetectError::UnsupportedFormat("Gray8".into()));
+        assert_eq!(e.kind(), StageErrorKind::Unsupported);
         assert_eq!(
-            StageError::from(DetectError::UnsupportedFormat("Gray8".into())),
-            StageError::Unsupported("pixel format Gray8 is not supported here".into())
+            e.to_string(),
+            "unsupported: pixel format Gray8 is not supported here"
         );
-        assert_eq!(
-            StageError::from(DetectError::Decode("truncated".into())),
-            StageError::Failed("MJPG decode failed: truncated".into())
-        );
-        assert_eq!(
-            StageError::from(DetectError::Inference("shape".into())),
-            StageError::Failed("inference failed: shape".into())
-        );
+        assert!(e.source().unwrap().downcast_ref::<DetectError>().is_some());
+
+        let e = StageError::from(DetectError::Decode("truncated".into()));
+        assert_eq!(e.kind(), StageErrorKind::Failed);
+        assert_eq!(e.to_string(), "stage failed: MJPG decode failed: truncated");
+        assert!(e.source().unwrap().downcast_ref::<DetectError>().is_some());
+
+        let e = StageError::from(DetectError::Inference("shape".into()));
+        assert_eq!(e.kind(), StageErrorKind::Failed);
+        assert_eq!(e.to_string(), "stage failed: inference failed: shape");
+        assert!(e.source().unwrap().downcast_ref::<DetectError>().is_some());
     }
 }

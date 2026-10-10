@@ -219,7 +219,7 @@ impl NullDetector {
         let NoOptions {} = options
             .clone()
             .try_into()
-            .map_err(|e: toml::de::Error| StageError::Config(e.to_string()))?;
+            .map_err(|e: toml::de::Error| StageError::Config(Box::new(e)))?;
         Ok(Self)
     }
 }
@@ -268,10 +268,10 @@ impl FixedRayEstimator {
         let FixedRayOptions { origin, toward } = options
             .clone()
             .try_into()
-            .map_err(|e: toml::de::Error| StageError::Config(e.to_string()))?;
+            .map_err(|e: toml::de::Error| StageError::Config(Box::new(e)))?;
         if origin[2] >= 0.0 {
             return Err(StageError::Config(
-                "origin must be in front of the screen (z < 0)".to_string(),
+                "origin must be in front of the screen (z < 0)".into(),
             ));
         }
         Ok(Self {
@@ -311,7 +311,7 @@ impl TargetCodeDetector {
         let NoOptions {} = options
             .clone()
             .try_into()
-            .map_err(|e: toml::de::Error| StageError::Config(e.to_string()))?;
+            .map_err(|e: toml::de::Error| StageError::Config(Box::new(e)))?;
         Ok(Self)
     }
 }
@@ -380,10 +380,10 @@ impl KappaRayEstimator {
         } = options
             .clone()
             .try_into()
-            .map_err(|e: toml::de::Error| StageError::Config(e.to_string()))?;
+            .map_err(|e: toml::de::Error| StageError::Config(Box::new(e)))?;
         if eye[2] >= 0.0 {
             return Err(StageError::Config(
-                "eye must be in front of the screen (z < 0)".to_string(),
+                "eye must be in front of the screen (z < 0)".into(),
             ));
         }
         Ok(Self {
@@ -416,7 +416,7 @@ impl GazeEstimator for KappaRayEstimator {
         let t = *self
             .targets_mm
             .get(idx)
-            .ok_or_else(|| StageError::Failed(format!("target index {idx} out of range")))?;
+            .ok_or_else(|| StageError::Failed(format!("target index {idx} out of range").into()))?;
         let off = match &self.outlier {
             Some(o) if o.index == idx => o.offset_deg,
             _ => self.offset_deg,

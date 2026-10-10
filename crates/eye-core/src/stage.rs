@@ -2,18 +2,52 @@ use crate::{FrameSet, GazePoint, GazeRay, Illumination, Observations, PixelForma
 
 pub use crate::sink::{GazeSink, SinkError};
 
+pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 /// Error shared by every pipeline stage trait. Implementation crates convert
-/// their own error enums into it at the trait boundary.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// their own error enums into it at the trait boundary; the original error
+/// stays reachable through `source()`.
+#[derive(Debug, thiserror::Error)]
 pub enum StageError {
     #[error("invalid configuration: {0}")]
-    Config(String),
+    Config(#[source] BoxError),
     #[error("unsupported: {0}")]
-    Unsupported(String),
+    Unsupported(#[source] BoxError),
     #[error("stage failed: {0}")]
-    Failed(String),
+    Failed(#[source] BoxError),
     #[error("stage closed")]
     Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StageErrorKind {
+    Config,
+    Unsupported,
+    Failed,
+    Closed,
+}
+
+impl StageError {
+    pub fn kind(&self) -> StageErrorKind {
+        match self {
+            Self::Config(_) => StageErrorKind::Config,
+            Self::Unsupported(_) => StageErrorKind::Unsupported,
+            Self::Failed(_) => StageErrorKind::Failed,
+            Self::Closed => StageErrorKind::Closed,
+        }
+    }
+
+    pub fn config(source: impl Into<BoxError>) -> Self {
+        Self::Config(source.into())
+    }
+
+    pub fn unsupported(source: impl Into<BoxError>) -> Self {
+        Self::Unsupported(source.into())
+    }
+
+    pub fn failed(source: impl Into<BoxError>) -> Self {
+        Self::Failed(source.into())
+    }
 }
 
 /// Frames to observations. One call per paired `FrameSet`; returns one `Observations` per frame
@@ -203,7 +237,7 @@ mod tests {
         detector.detect(&frames).unwrap();
         detector.detect(&frames).unwrap();
         let err = detector.detect(&frames).unwrap_err();
-        assert_eq!(err, StageError::Closed);
+        assert_eq!(err.kind(), StageErrorKind::Closed);
         assert_eq!(err.to_string(), "stage closed");
     }
 
@@ -263,16 +297,26 @@ mod tests {
     #[test]
     fn test_stage_error_display() {
         assert_eq!(
-            StageError::Config("x".into()).to_string(),
+            StageError::config("x").to_string(),
             "invalid configuration: x"
         );
-        assert_eq!(
-            StageError::Unsupported("x".into()).to_string(),
-            "unsupported: x"
+        assert_eq!(StageError::unsupported("x").to_string(), "unsupported: x");
+        assert_eq!(StageError::failed("boom").to_string(), "stage failed: boom");
+    }
+
+    #[test]
+    fn test_stage_error_exposes_source_chain() {
+        use std::error::Error as _;
+
+        let e = StageError::config(std::io::Error::other("disk"));
+        assert_eq!(e.kind(), StageErrorKind::Config);
+        assert_eq!(e.to_string(), "invalid configuration: disk");
+        assert!(
+            e.source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .is_some()
         );
-        assert_eq!(
-            StageError::Failed("boom".into()).to_string(),
-            "stage failed: boom"
-        );
+        assert!(StageError::Closed.source().is_none());
     }
 }

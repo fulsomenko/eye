@@ -16,15 +16,19 @@ pub enum EstimateError {
 
 impl From<EstimateError> for StageError {
     fn from(e: EstimateError) -> Self {
-        match e {
-            EstimateError::Config { .. } => Self::Config(e.to_string()),
-            _ => Self::Failed(e.to_string()),
+        match &e {
+            EstimateError::Config { .. } => Self::Config(Box::new(e)),
+            _ => Self::Failed(Box::new(e)),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
+
+    use eye_core::stage::StageErrorKind;
+
     use super::*;
 
     #[test]
@@ -33,18 +37,42 @@ mod tests {
             estimator: "ir-pupil",
             source: toml::from_str::<toml::Table>("x =").expect_err("`x =` is not valid TOML"),
         };
+        let e = StageError::from(config);
+        assert_eq!(e.kind(), StageErrorKind::Config);
         assert!(
-            matches!(StageError::from(config), StageError::Config(m) if m.starts_with("invalid options for estimator ir-pupil"))
+            e.to_string()
+                .starts_with("invalid configuration: invalid options for estimator ir-pupil")
         );
-        assert_eq!(
-            StageError::from(EstimateError::UnknownCamera("depth".into())),
-            StageError::Failed("observation from camera \"depth\" which is not in the rig".into())
+        assert!(
+            e.source()
+                .unwrap()
+                .downcast_ref::<EstimateError>()
+                .is_some()
         );
+
+        let e = StageError::from(EstimateError::UnknownCamera("depth".into()));
+        assert_eq!(e.kind(), StageErrorKind::Failed);
         assert_eq!(
-            StageError::from(EstimateError::Geometry(
-                eye_geometry::GeometryError::BehindCamera
-            )),
-            StageError::Failed("point is behind the camera".into())
+            e.to_string(),
+            "stage failed: observation from camera \"depth\" which is not in the rig"
+        );
+        assert!(
+            e.source()
+                .unwrap()
+                .downcast_ref::<EstimateError>()
+                .is_some()
+        );
+
+        let e = StageError::from(EstimateError::Geometry(
+            eye_geometry::GeometryError::BehindCamera,
+        ));
+        assert_eq!(e.kind(), StageErrorKind::Failed);
+        assert_eq!(e.to_string(), "stage failed: point is behind the camera");
+        assert!(
+            e.source()
+                .unwrap()
+                .downcast_ref::<EstimateError>()
+                .is_some()
         );
     }
 }
