@@ -242,6 +242,7 @@ impl DotSessionFit {
         let mut eyes = BTreeMap::new();
         let mut reports = Vec::new();
         let mut max_usable = 0usize;
+        let mut omitted: Vec<(EyeKey, &'static str, usize)> = Vec::new();
 
         for eye in eyes_present {
             let mut sample_rejected: Vec<u32> = Vec::new();
@@ -371,6 +372,7 @@ impl DotSessionFit {
                     min_targets_offset = cfg.min_targets_offset as u64,
                     "eye omitted"
                 );
+                omitted.push((eye, "too_few_targets", usable.len()));
                 reports.push(EyeFitReport {
                     key: eye,
                     model: None,
@@ -475,6 +477,7 @@ impl DotSessionFit {
                     min_targets_offset = cfg.min_targets_offset as u64,
                     "eye omitted"
                 );
+                omitted.push((eye, "too_few_targets_after_rejection", remaining.len()));
                 reports.push(EyeFitReport {
                     key: eye,
                     model: None,
@@ -622,10 +625,19 @@ impl DotSessionFit {
         }
 
         if eyes.is_empty() {
+            let (_, reason, got) = omitted
+                .iter()
+                .min_by_key(|(_, _, got)| *got)
+                .copied()
+                .unwrap_or((EyeKey::Right, "too_few_targets", max_usable));
             return Err(CalibrationError::InsufficientData {
-                what: "targets",
+                what: if reason == "too_few_targets_after_rejection" {
+                    "targets after robust rejection"
+                } else {
+                    "targets"
+                },
                 need: cfg.min_targets_offset,
-                got: max_usable,
+                got,
             });
         }
 
@@ -1374,6 +1386,67 @@ mod tests {
                 got: 2,
             }
         ));
+    }
+
+    /// Pins the first-gate path, unchanged by the second-gate fix below.
+    #[test]
+    fn test_fit_reports_first_gate_count_when_too_few_usable() {
+        let per_target = SessionConfig::default().samples_per_target;
+        let samples: Vec<FitSample> = generate_session(&SessionConfig::default())
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| i / per_target < 2)
+            .map(|(_, s)| s)
+            .collect();
+        let err = DotSessionFit::fit_with(
+            &samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "need at least 3 targets, got 2");
+    }
+
+    #[test]
+    fn test_fit_reports_post_rejection_count_when_robust_rejection_empties_fit() {
+        // Keep only targets 0-3 of the 3x3 grid, so after target 0 is starved
+        // below min_samples_per_target (TooFewSamples), exactly 3 targets reach
+        // the robust pass; the bias on target 1 then empties it to 2.
+        let cfg = SessionConfig {
+            grid: [3, 3],
+            bias: UNBIASED,
+            ..SessionConfig::default()
+        };
+        let per_target = cfg.samples_per_target;
+        let starved_target = 0usize;
+        let outlier_target = 1usize;
+        let samples: Vec<FitSample> = generate_session(&cfg)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                let target = i / per_target;
+                (target != starved_target || i % per_target < 3) && target < 4
+            })
+            .map(|(i, mut s)| {
+                if i / per_target == outlier_target {
+                    add_yaw_bias_deg(&mut s, 45.0);
+                }
+                s
+            })
+            .collect();
+
+        let err = DotSessionFit::fit_with(
+            &samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "need at least 3 targets after robust rejection, got 2"
+        );
     }
 
     #[test]
