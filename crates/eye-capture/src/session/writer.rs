@@ -9,10 +9,10 @@ use std::{
 use eye_core::{Frame, log::field};
 
 use super::{
-    FRAMES_DIR, INDEX_FILE, IndexRecord, RecordedCamera, RecordedFormat, SESSION_FILE, SessionMeta,
-    TARGETS_FILE, TargetRecord, frame_path, id::valid_component, timestamp_ns,
+    FRAMES_DIR, INDEX_FILE, IndexRecord, RecordedCamera, SESSION_FILE, SessionMeta, TARGETS_FILE,
+    TargetRecord, frame_path, id::valid_component, timestamp_ns,
 };
-use crate::CaptureError;
+use crate::{CaptureError, format::StoredFormat};
 
 #[derive(Debug)]
 pub struct SessionWriter {
@@ -123,7 +123,7 @@ impl SessionWriter {
             .get(h.camera.as_str())
             .ok_or_else(|| self.bad(format!("unknown camera {}", h.camera)))?
             .clone();
-        let format = RecordedFormat::try_from(h.format)
+        let format = StoredFormat::try_from(h.format)
             .map_err(|f| self.bad(format!("pixel format {f:?} cannot be recorded")))?;
         if format != cam.format || h.width != cam.width || h.height != cam.height {
             return Err(self.bad(format!(
@@ -133,8 +133,8 @@ impl SessionWriter {
         }
         let path = frame_path(&self.dir, &cam.id, h.seq, format);
         let bytes: Cow<[u8]> = match format {
-            RecordedFormat::Mjpeg => Cow::Borrowed(frame.data()),
-            RecordedFormat::Gray8 => {
+            StoredFormat::Mjpeg => Cow::Borrowed(frame.data()),
+            StoredFormat::Gray8 => {
                 if frame.data().len() != (h.width * h.height) as usize {
                     return Err(self.bad(format!(
                         "gray frame {} has {} bytes",
@@ -156,7 +156,7 @@ impl SessionWriter {
             seq: h.seq,
             camera: cam.id.clone(),
             timestamp_ns: timestamp_ns(h.timestamp),
-            illumination: h.illumination.into(),
+            illumination: h.illumination,
         };
         serde_json::to_writer(&mut self.index, &record).map_err(|e| self.bad(e.to_string()))?;
         self.index
@@ -228,7 +228,7 @@ mod tests {
                 RecordedCamera {
                     id: "rgb".to_string(),
                     device: Some("/dev/video0".to_string()),
-                    format: RecordedFormat::Mjpeg,
+                    format: StoredFormat::Mjpeg,
                     width: 1280,
                     height: 720,
                     frame_interval_ns: 33_333_333,
@@ -236,7 +236,7 @@ mod tests {
                 RecordedCamera {
                     id: "ir".to_string(),
                     device: Some("/dev/video2".to_string()),
-                    format: RecordedFormat::Gray8,
+                    format: StoredFormat::Gray8,
                     width: 640,
                     height: 360,
                     frame_interval_ns: 33_333_333,

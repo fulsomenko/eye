@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod format;
 pub mod illumination;
 pub mod pairing;
 pub mod session;
@@ -12,8 +13,9 @@ pub mod uvc_meta;
 pub mod v4l2;
 
 pub use error::CaptureError;
+pub use format::StoredFormat;
 pub use source::FrameSource;
-pub use v4l2::{CaptureFormat, V4l2Config, V4l2Options, V4l2Source};
+pub use v4l2::{V4l2Config, V4l2Options, V4l2Source};
 pub use {
     illumination::{IlluminationTagger, TaggedSource, TaggerConfig, TaggerState, mean_brightness},
     uvc_meta::{IlluminationMeta, MetaRecord, UvcMetaStream, frame_illumination},

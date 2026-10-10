@@ -4,13 +4,13 @@ use eye_core::{
     CameraId, CameraInfo, Frame, FrameHeader, Illumination, PixelFormat, Timestamp, log::field,
 };
 use v4l::{
-    Device, Format, FourCC,
+    Device, Format,
     buffer::Flags,
     io::traits::CaptureStream,
     video::{Capture, capture::Parameters},
 };
 
-use crate::{CaptureError, source::FrameSource};
+use crate::{CaptureError, format::StoredFormat, source::FrameSource};
 
 fn default_fps() -> u32 {
     30
@@ -110,10 +110,12 @@ impl V4l2Source {
             timeout,
         } = config;
 
-        let fourcc = fourcc_for(format).ok_or_else(|| CaptureError::UnsupportedFormat {
-            path: device.clone(),
-            format: format!("{format:?}"),
-        })?;
+        let fourcc = StoredFormat::try_from(format)
+            .map_err(|f| CaptureError::UnsupportedFormat {
+                path: device.clone(),
+                format: format!("{f:?}"),
+            })?
+            .fourcc();
 
         let dev = Device::with_path(&device).map_err(|source| CaptureError::Open {
             path: device.clone(),
@@ -200,7 +202,7 @@ impl V4l2Source {
 #[serde(deny_unknown_fields)]
 pub struct V4l2Options {
     pub device: PathBuf,
-    pub format: CaptureFormat,
+    pub format: StoredFormat,
     pub size: [u32; 2],
     #[serde(default = "default_fps")]
     pub fps: u32,
@@ -208,13 +210,6 @@ pub struct V4l2Options {
     pub buffers: u32,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CaptureFormat {
-    Mjpeg,
-    Gray,
 }
 
 impl V4l2Options {
@@ -229,14 +224,10 @@ impl V4l2Options {
     }
 
     pub fn into_config(self, id: CameraId) -> V4l2Config {
-        let format = match self.format {
-            CaptureFormat::Mjpeg => PixelFormat::Mjpeg,
-            CaptureFormat::Gray => PixelFormat::Gray8,
-        };
         V4l2Config {
             id,
             device: self.device,
-            format,
+            format: self.format.pixel(),
             width: self.size[0],
             height: self.size[1],
             fps: self.fps,
@@ -349,14 +340,6 @@ fn timeout_error(camera: String, timeout: Duration) -> CaptureError {
         "no frame within timeout"
     );
     CaptureError::Timeout { camera, timeout }
-}
-
-pub(crate) fn fourcc_for(format: PixelFormat) -> Option<FourCC> {
-    match format {
-        PixelFormat::Gray8 => Some(FourCC::new(b"GREY")),
-        PixelFormat::Mjpeg => Some(FourCC::new(b"MJPG")),
-        PixelFormat::Rgb8 => None,
-    }
 }
 
 pub(crate) fn check_clock(flags: v4l::buffer::Flags) -> Result<(), u32> {
@@ -539,10 +522,15 @@ mod tests {
     }
 
     #[test]
-    fn test_fourcc_mapping() {
-        assert_eq!(fourcc_for(PixelFormat::Gray8), Some(FourCC::new(b"GREY")));
-        assert_eq!(fourcc_for(PixelFormat::Mjpeg), Some(FourCC::new(b"MJPG")));
-        assert_eq!(fourcc_for(PixelFormat::Rgb8), None);
+    fn test_v4l2_options_rejects_unknown_format() {
+        let toml_str = r#"
+            device = "/dev/video0"
+            format = "rgb"
+            size = [1280, 720]
+        "#;
+        let table: toml::Table = toml_str.parse().unwrap();
+        let result: Result<V4l2Options, _> = table.try_into();
+        assert!(result.is_err());
     }
 
     #[test]

@@ -138,7 +138,10 @@ mod tests {
     use eye_core::PixelFormat;
 
     use super::*;
-    use crate::session::{EmitterState, RecordedFormat, SessionMeta, SessionWriter};
+    use crate::{
+        format::StoredFormat,
+        session::{EmitterState, SessionMeta, SessionWriter},
+    };
 
     fn meta() -> SessionMeta {
         SessionMeta {
@@ -151,7 +154,7 @@ mod tests {
                 RecordedCamera {
                     id: "rgb".to_string(),
                     device: None,
-                    format: RecordedFormat::Mjpeg,
+                    format: StoredFormat::Mjpeg,
                     width: 1280,
                     height: 720,
                     frame_interval_ns: 33_333_333,
@@ -159,7 +162,7 @@ mod tests {
                 RecordedCamera {
                     id: "ir".to_string(),
                     device: None,
-                    format: RecordedFormat::Gray8,
+                    format: StoredFormat::Gray8,
                     width: 640,
                     height: 360,
                     frame_interval_ns: 33_333_333,

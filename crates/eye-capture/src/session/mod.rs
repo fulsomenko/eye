@@ -6,7 +6,9 @@ pub mod writer;
 
 use std::path::{Path, PathBuf};
 
-use eye_core::{CameraId, CameraInfo, Illumination, PixelFormat, Timestamp};
+use eye_core::{CameraId, CameraInfo, Illumination, Timestamp};
+
+use crate::format::StoredFormat;
 
 pub use eye_core::session::{ProtocolConfig, TargetClock, TargetRecord};
 pub use id::SessionId;
@@ -22,75 +24,6 @@ pub const FRAMES_DIR: &str = "frames";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum IlluminationTag {
-    Ambient,
-    IrLit,
-    IrDark,
-    Unknown,
-}
-
-impl From<Illumination> for IlluminationTag {
-    fn from(value: Illumination) -> Self {
-        match value {
-            Illumination::Ambient => Self::Ambient,
-            Illumination::IrLit => Self::IrLit,
-            Illumination::IrDark => Self::IrDark,
-            Illumination::Unknown => Self::Unknown,
-        }
-    }
-}
-
-impl From<IlluminationTag> for Illumination {
-    fn from(value: IlluminationTag) -> Self {
-        match value {
-            IlluminationTag::Ambient => Self::Ambient,
-            IlluminationTag::IrLit => Self::IrLit,
-            IlluminationTag::IrDark => Self::IrDark,
-            IlluminationTag::Unknown => Self::Unknown,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecordedFormat {
-    Mjpeg,
-    #[serde(rename = "gray")]
-    Gray8,
-}
-
-impl RecordedFormat {
-    pub fn extension(self) -> &'static str {
-        match self {
-            Self::Mjpeg => "jpg",
-            Self::Gray8 => "pgm",
-        }
-    }
-}
-
-impl TryFrom<PixelFormat> for RecordedFormat {
-    type Error = PixelFormat;
-
-    fn try_from(value: PixelFormat) -> Result<Self, Self::Error> {
-        match value {
-            PixelFormat::Mjpeg => Ok(Self::Mjpeg),
-            PixelFormat::Gray8 => Ok(Self::Gray8),
-            PixelFormat::Rgb8 => Err(value),
-        }
-    }
-}
-
-impl From<RecordedFormat> for PixelFormat {
-    fn from(value: RecordedFormat) -> Self {
-        match value {
-            RecordedFormat::Mjpeg => Self::Mjpeg,
-            RecordedFormat::Gray8 => Self::Gray8,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum EmitterState {
     On,
     Off,
@@ -103,7 +36,7 @@ pub struct RecordedCamera {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
-    pub format: RecordedFormat,
+    pub format: StoredFormat,
     pub width: u32,
     pub height: u32,
     pub frame_interval_ns: u64,
@@ -115,7 +48,7 @@ impl RecordedCamera {
         device: Option<&Path>,
     ) -> Result<Self, crate::CaptureError> {
         let format =
-            RecordedFormat::try_from(info.format).map_err(|f| crate::CaptureError::Config {
+            StoredFormat::try_from(info.format).map_err(|f| crate::CaptureError::Config {
                 camera: info.id.to_string(),
                 reason: format!("pixel format {f:?} cannot be recorded"),
             })?;
@@ -167,10 +100,10 @@ pub struct IndexRecord {
     pub seq: u64,
     pub camera: String,
     pub timestamp_ns: u64,
-    pub illumination: IlluminationTag,
+    pub illumination: Illumination,
 }
 
-pub fn frame_path(session_dir: &Path, camera: &str, seq: u64, format: RecordedFormat) -> PathBuf {
+pub fn frame_path(session_dir: &Path, camera: &str, seq: u64, format: StoredFormat) -> PathBuf {
     session_dir
         .join(FRAMES_DIR)
         .join(camera)
@@ -185,6 +118,8 @@ pub fn timestamp_ns(t: Timestamp) -> u64 {
 mod tests {
     use std::time::Duration;
 
+    use eye_core::PixelFormat;
+
     use super::*;
 
     fn meta() -> SessionMeta {
@@ -198,7 +133,7 @@ mod tests {
                 RecordedCamera {
                     id: "rgb".to_string(),
                     device: Some("/dev/video0".to_string()),
-                    format: RecordedFormat::Mjpeg,
+                    format: StoredFormat::Mjpeg,
                     width: 1280,
                     height: 720,
                     frame_interval_ns: 33_333_333,
@@ -206,7 +141,7 @@ mod tests {
                 RecordedCamera {
                     id: "ir".to_string(),
                     device: Some("/dev/video2".to_string()),
-                    format: RecordedFormat::Gray8,
+                    format: StoredFormat::Gray8,
                     width: 640,
                     height: 360,
                     frame_interval_ns: 33_333_333,
@@ -275,7 +210,7 @@ mod tests {
             seq: 42,
             camera: "ir".to_string(),
             timestamp_ns: 123_456_789,
-            illumination: IlluminationTag::IrLit,
+            illumination: Illumination::IrLit,
         };
         assert_eq!(
             serde_json::to_string(&record).unwrap(),
@@ -311,22 +246,9 @@ mod tests {
     }
 
     #[test]
-    fn test_illumination_tag_roundtrips_all_variants() {
-        for variant in [
-            Illumination::Ambient,
-            Illumination::IrLit,
-            Illumination::IrDark,
-            Illumination::Unknown,
-        ] {
-            let tag: IlluminationTag = variant.into();
-            assert_eq!(Illumination::from(tag), variant);
-        }
-    }
-
-    #[test]
     fn test_rgb8_cannot_be_recorded() {
         assert_eq!(
-            RecordedFormat::try_from(PixelFormat::Rgb8),
+            StoredFormat::try_from(PixelFormat::Rgb8),
             Err(PixelFormat::Rgb8)
         );
     }

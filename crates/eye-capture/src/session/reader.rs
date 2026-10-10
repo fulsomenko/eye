@@ -9,12 +9,12 @@ use std::{
 use eye_core::{CameraId, Frame, FrameHeader, Timestamp, log::field};
 
 use super::{
-    FORMAT_VERSION, INDEX_FILE, IndexRecord, RecordedCamera, RecordedFormat, SESSION_FILE,
-    SessionMeta, TARGETS_FILE, TargetRecord, frame_path,
+    FORMAT_VERSION, INDEX_FILE, IndexRecord, RecordedCamera, SESSION_FILE, SessionMeta,
+    TARGETS_FILE, TargetRecord, frame_path,
     pnm::decode_pgm,
     replay::{Pacing, ReplaySource},
 };
-use crate::CaptureError;
+use crate::{CaptureError, format::StoredFormat};
 
 #[derive(Debug)]
 pub struct Recording {
@@ -69,8 +69,8 @@ pub(crate) fn load_frame(
         source,
     })?;
     let data: Arc<[u8]> = match camera.format {
-        RecordedFormat::Mjpeg => bytes.into(),
-        RecordedFormat::Gray8 => {
+        StoredFormat::Mjpeg => bytes.into(),
+        StoredFormat::Gray8 => {
             let (w, h, raster) =
                 decode_pgm(&bytes).map_err(|reason| CaptureError::RecordingFormat {
                     path: path.clone(),
@@ -95,7 +95,7 @@ pub(crate) fn load_frame(
         width: camera.width,
         height: camera.height,
         format: camera.format.into(),
-        illumination: record.illumination.into(),
+        illumination: record.illumination,
     };
     Frame::new(header, data).map_err(|e| CaptureError::RecordingFormat {
         path,
@@ -279,7 +279,7 @@ mod tests {
                 RecordedCamera {
                     id: "rgb".to_string(),
                     device: Some("/dev/video0".to_string()),
-                    format: RecordedFormat::Mjpeg,
+                    format: StoredFormat::Mjpeg,
                     width: 1280,
                     height: 720,
                     frame_interval_ns: 33_333_333,
@@ -287,7 +287,7 @@ mod tests {
                 RecordedCamera {
                     id: "ir".to_string(),
                     device: Some("/dev/video2".to_string()),
-                    format: RecordedFormat::Gray8,
+                    format: StoredFormat::Gray8,
                     width: 640,
                     height: 360,
                     frame_interval_ns: 33_333_333,
@@ -565,7 +565,7 @@ mod tests {
             RecordedCamera {
                 id: "rgb".to_string(),
                 device: None,
-                format: RecordedFormat::Mjpeg,
+                format: StoredFormat::Mjpeg,
                 width: 1280,
                 height: 720,
                 frame_interval_ns: 68_000_000,
@@ -573,7 +573,7 @@ mod tests {
             RecordedCamera {
                 id: "ir".to_string(),
                 device: None,
-                format: RecordedFormat::Gray8,
+                format: StoredFormat::Gray8,
                 width: 640,
                 height: 360,
                 frame_interval_ns: 68_000_000,
