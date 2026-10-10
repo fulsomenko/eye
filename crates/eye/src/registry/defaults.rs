@@ -2,7 +2,7 @@ use super::{Registry, builtin::PassThroughFilter};
 use crate::error::ConfigError;
 
 pub(super) fn register_defaults(r: &mut Registry) -> Result<(), ConfigError> {
-    r.register_filter("none", |o, rig| {
+    r.register_filter(PassThroughFilter::NAME, |o, rig| {
         Ok(Box::new(PassThroughFilter::from_config(o, rig)?))
     })?;
 
@@ -42,12 +42,12 @@ pub(super) fn register_defaults(r: &mut Registry) -> Result<(), ConfigError> {
         )?))
     })?;
 
-    r.register_filter("one-euro", |o, rig| {
+    r.register_filter(eye_filter::one_euro::OneEuroFilter::NAME, |o, rig| {
         Ok(Box::new(eye_filter::one_euro::OneEuroFilter::from_config(
             o, rig,
         )?))
     })?;
-    r.register_filter("kalman", |o, rig| {
+    r.register_filter(eye_filter::kalman::KalmanFilter::NAME, |o, rig| {
         Ok(Box::new(eye_filter::kalman::KalmanFilter::from_config(
             o, rig,
         )?))

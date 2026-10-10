@@ -253,6 +253,10 @@ mod tests {
     }
 
     impl GazeFilter for FakeFilter {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
         fn apply(&mut self, point: GazePoint) -> GazePoint {
             point
         }
@@ -424,6 +428,25 @@ mod tests {
             panic!("must fail")
         };
         assert!(e.to_string().contains("x"));
+    }
+
+    #[test]
+    fn test_filter_names_equal_registry_keys() {
+        let registry = Registry::with_defaults();
+        let mut expected = vec![
+            eye_filter::kalman::KalmanFilter::NAME,
+            PassThroughFilter::NAME,
+            eye_filter::one_euro::OneEuroFilter::NAME,
+        ];
+        expected.sort_unstable();
+        assert_eq!(registry.names(StageKind::Filter), expected);
+
+        for name in expected {
+            let filter = registry
+                .filter(&section(name, toml::Table::new()), &nominal_rig())
+                .unwrap();
+            assert_eq!(filter.name(), name);
+        }
     }
 
     #[test]

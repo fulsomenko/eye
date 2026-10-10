@@ -233,6 +233,10 @@ pub(crate) struct CountingFilter {
 }
 
 impl GazeFilter for CountingFilter {
+    fn name(&self) -> &'static str {
+        "counting"
+    }
+
     fn apply(&mut self, point: GazePoint) -> GazePoint {
         point
     }

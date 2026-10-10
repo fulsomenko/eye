@@ -60,7 +60,6 @@ pub struct Pipeline {
     detectors: Vec<(CameraId, Box<dyn Detector>)>,
     estimator: Box<dyn GazeEstimator>,
     filter: Box<dyn GazeFilter>,
-    filter_name: String,
     correction: Option<Box<dyn GazeCorrection>>,
     max_consecutive_errors: u32,
     consecutive_errors: u32,
@@ -108,7 +107,8 @@ impl Pipeline {
 
         let detector_count = detectors.len();
         let estimator_name = estimator.name();
-        let mut pipeline = Self::new(
+        let filter_label = filter.name();
+        let pipeline = Self::new(
             rig,
             pairer,
             detectors,
@@ -117,12 +117,11 @@ impl Pipeline {
             correction,
             config.tracker.max_consecutive_stage_errors,
         );
-        pipeline.filter_name = config.filter.kind.clone();
         tracing::info!(
             cameras = cameras.len(),
             detectors = detector_count,
             estimator = estimator_name,
-            filter = pipeline.filter_name.as_str(),
+            filter = filter_label,
             max_consecutive_errors = pipeline.max_consecutive_errors,
             rgb_offset_ns = config.capture.rgb_offset_ns,
             "pipeline built"
@@ -146,7 +145,6 @@ impl Pipeline {
             detectors,
             estimator,
             filter,
-            filter_name: "custom".to_string(),
             correction,
             max_consecutive_errors,
             consecutive_errors: 0,
@@ -336,7 +334,7 @@ impl Pipeline {
             let _stage = tracing::debug_span!(
                 span::STAGE,
                 { field::STAGE_KIND } = StageKind::Filter.span_kind(),
-                { field::STAGE_NAME } = self.filter_name.as_str(),
+                { field::STAGE_NAME } = self.filter.name(),
             )
             .entered();
             let point = self.filter.apply(fused);
@@ -514,11 +512,50 @@ mod tests {
         );
         assert_eq!(
             stage_done[2].context.get(field::STAGE_NAME),
-            Some(&eye_log::Value::Str("custom".to_string()))
+            Some(&eye_log::Value::Str("none".to_string()))
         );
         assert_eq!(
             stage_done[0].fields.get("observations"),
             Some(&eye_log::Value::U64(1))
+        );
+    }
+
+    #[test]
+    fn test_pipeline_new_logs_the_filters_own_name() {
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            let mut pipeline = Pipeline::new(
+                testkit::rig(),
+                Pairer::new(&[testkit::info("ir", PixelFormat::Gray8, 66)])
+                    .expect("single-camera pairer"),
+                vec![(CameraId::from("ir"), Box::new(FakeDetector::new("fake")))],
+                Box::new(FakeEstimator),
+                Box::new(CountingFilter {
+                    resets: Arc::new(AtomicU32::new(0)),
+                }),
+                None,
+                3,
+            );
+            let frame = testkit::frame("ir", 0, 100, Illumination::IrLit);
+            let set = FrameSet::single(frame);
+            let RayStep::Rays(batch) = pipeline.rays(&set).expect("rays succeeds") else {
+                panic!("expected a ray batch")
+            };
+            pipeline.finish(&batch);
+        });
+
+        let stage_done: Vec<_> = records
+            .iter()
+            .filter(|r| r.message == "stage done")
+            .collect();
+        let filter_stage = stage_done
+            .iter()
+            .find(|r| {
+                r.context.get(field::STAGE_KIND) == Some(&eye_log::Value::Str("filter".to_string()))
+            })
+            .expect("filter stage span present");
+        assert_eq!(
+            filter_stage.context.get(field::STAGE_NAME),
+            Some(&eye_log::Value::Str("counting".to_string()))
         );
     }
 

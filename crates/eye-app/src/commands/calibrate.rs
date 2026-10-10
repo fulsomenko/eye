@@ -1308,6 +1308,10 @@ mod tests {
     struct NoOpFilter;
 
     impl eye_core::stage::GazeFilter for NoOpFilter {
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+
         fn apply(&mut self, point: eye_core::GazePoint) -> eye_core::GazePoint {
             point
         }

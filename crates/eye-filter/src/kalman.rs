@@ -46,6 +46,8 @@ struct KfState {
 }
 
 impl KalmanFilter {
+    pub const NAME: &'static str = "kalman";
+
     /// `FilterError::Param` unless `accel_psd > 0`, `gate_chi2 > 0`, `initial_speed_sigma > 0`,
     /// `reset_after_s > 0` (all finite), `measurement_floor_mm >= 0` (finite), `reset_after_outliers >= 1`.
     pub fn new(cfg: KalmanConfig, screen: ScreenModel) -> Result<Self, FilterError> {
@@ -113,6 +115,10 @@ impl KalmanFilter {
 }
 
 impl GazeFilter for KalmanFilter {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
     fn apply(&mut self, point: GazePoint) -> GazePoint {
         let z = point.mm.coords;
         let r = point.cov_mm + Matrix2::identity() * self.cfg.measurement_floor_mm.powi(2);

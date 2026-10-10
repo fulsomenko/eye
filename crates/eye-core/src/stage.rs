@@ -38,6 +38,7 @@ pub trait GazeCorrection: Send {
 
 /// Temporal filter over screen points.
 pub trait GazeFilter: Send {
+    fn name(&self) -> &'static str;
     fn apply(&mut self, point: GazePoint) -> GazePoint;
     fn reset(&mut self);
 }
@@ -124,6 +125,10 @@ mod tests {
     }
 
     impl GazeFilter for CountingFilter {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+
         fn apply(&mut self, point: GazePoint) -> GazePoint {
             self.applied += 1;
             point

@@ -47,6 +47,8 @@ fn alpha(cutoff: f64, dt: f64) -> f64 {
 }
 
 impl OneEuroFilter {
+    pub const NAME: &'static str = "one-euro";
+
     pub fn new(cfg: OneEuroConfig, screen: ScreenModel) -> Result<Self, FilterError> {
         let positive = |v: f64, name: &'static str| {
             if v.is_finite() && v > 0.0 {
@@ -81,6 +83,10 @@ impl OneEuroFilter {
 }
 
 impl GazeFilter for OneEuroFilter {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
     fn apply(&mut self, point: GazePoint) -> GazePoint {
         let x = point.mm.coords;
         let Some(prev) = self.state else {

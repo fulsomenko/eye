@@ -12,6 +12,8 @@ struct NoOptions {}
 pub struct PassThroughFilter;
 
 impl PassThroughFilter {
+    pub const NAME: &'static str = "none";
+
     pub fn from_config(table: &toml::Table, _rig: &Rig) -> Result<Self, StageError> {
         let NoOptions {} = table
             .clone()
@@ -22,6 +24,10 @@ impl PassThroughFilter {
 }
 
 impl GazeFilter for PassThroughFilter {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
     fn apply(&mut self, point: GazePoint) -> GazePoint {
         point
     }
