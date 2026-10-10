@@ -1,11 +1,15 @@
 //! Per-user calibration profile storage: `profiles/<name>.toml` under a
 //! [`ProfileStore`], plus explicit-path read/write for `eye calibrate --output`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::correction::UserProfile;
+use crate::correction::{
+    AngularCorrection, CalibrationPose, EyeKey, PROFILE_VERSION, Provenance, UserProfile,
+    legacy_source,
+};
 use crate::error::{CalibrationError, StoreError};
-use crate::store::{ProfileStore, check_version, read_table, validate_name, write_atomic};
+use crate::store::{ProfileStore, read_table, validate_name, write_atomic};
 
 impl ProfileStore {
     pub fn profile_path(&self, name: &str) -> Result<PathBuf, CalibrationError> {
@@ -62,18 +66,82 @@ impl ProfileStore {
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserProfileV1 {
+    #[serde(rename = "version")]
+    _version: u32,
+    name: String,
+    created_unix_s: u64,
+    rig_fingerprint: String,
+    estimator: String,
+    eyes: BTreeMap<EyeKey, AngularCorrection>,
+    #[serde(default)]
+    calibration_pose: Option<CalibrationPose>,
+    #[serde(default)]
+    provenance: Provenance,
+}
+
+impl From<UserProfileV1> for UserProfile {
+    fn from(v1: UserProfileV1) -> Self {
+        let corrections = if v1.eyes.is_empty() {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([(legacy_source(&v1.estimator), v1.eyes)])
+        };
+        UserProfile {
+            version: PROFILE_VERSION,
+            name: v1.name,
+            created_unix_s: v1.created_unix_s,
+            rig_fingerprint: v1.rig_fingerprint,
+            estimator: v1.estimator,
+            corrections,
+            calibration_pose: v1.calibration_pose,
+            provenance: v1.provenance,
+        }
+    }
+}
+
+fn profile_version(table: &toml::Table) -> Result<u32, StoreError> {
+    match table.get("version").and_then(toml::Value::as_integer) {
+        None | Some(1) => Ok(1),
+        Some(2) => Ok(2),
+        Some(found) => Err(StoreError::UnsupportedVersion {
+            what: "profile",
+            found: u32::try_from(found).unwrap_or(u32::MAX),
+        }),
+    }
+}
+
 fn profile_from_table(table: toml::Table, path: &Path) -> Result<UserProfile, CalibrationError> {
-    check_version(&table, "profile")?;
-    let profile: UserProfile = table.try_into().map_err(|source| StoreError::Parse {
-        path: path.to_owned(),
-        source,
-    })?;
+    let profile = match profile_version(&table)? {
+        1 => {
+            let v1: UserProfileV1 = table.try_into().map_err(|source| StoreError::Parse {
+                path: path.to_owned(),
+                source,
+            })?;
+            let source = legacy_source(&v1.estimator);
+            let profile = UserProfile::from(v1);
+            tracing::info!(
+                path = %path.display(),
+                from_version = 1u64,
+                source = source.as_str(),
+                "profile migrated"
+            );
+            profile
+        }
+        _ => table.try_into().map_err(|source| StoreError::Parse {
+            path: path.to_owned(),
+            source,
+        })?,
+    };
     tracing::info!(
         path = %path.display(),
         name = %profile.name,
         estimator = %profile.estimator,
         rig_fingerprint = %profile.rig_fingerprint,
-        eyes = profile.eyes.len() as u64,
+        sources = profile.corrections.len() as u64,
+        corrections = profile.correction_count() as u64,
         "profile loaded"
     );
     Ok(profile)
@@ -85,7 +153,8 @@ pub fn write_profile(path: &Path, profile: &UserProfile) -> Result<(), Calibrati
     tracing::info!(
         path = %path.display(),
         name = %profile.name,
-        eyes = profile.eyes.len() as u64,
+        sources = profile.corrections.len() as u64,
+        corrections = profile.correction_count() as u64,
         "profile written"
     );
     Ok(())
@@ -103,7 +172,7 @@ pub fn read_profile(path: &Path) -> Result<UserProfile, CalibrationError> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use eye_core::{CameraId, GazeRay, OutputId, ScreenModel, Side};
+    use eye_core::{CameraId, GazeRay, OutputId, RaySource, ScreenModel, Side};
     use eye_geometry::angles::direction_from_yaw_pitch;
     use eye_geometry::synth::SplitMix64;
     use nalgebra::{Matrix2, Matrix3, Point2, Point3, Unit, Vector2, Vector3};
@@ -184,12 +253,12 @@ mod tests {
             },
         );
         UserProfile {
-            version: 1,
+            version: PROFILE_VERSION,
             name: "default".into(),
             created_unix_s: 1_791_400_000,
             rig_fingerprint: "0123456789abcdef".into(),
             estimator: "ir-pupil".into(),
-            eyes,
+            corrections: BTreeMap::from([(legacy_source("ir-pupil"), eyes)]),
             calibration_pose: None,
             provenance: crate::correction::Provenance::default(),
         }
@@ -244,8 +313,8 @@ mod tests {
             Some(&eye_log::Value::Str(profile.name.clone()))
         );
         assert_eq!(
-            written.fields.get("eyes"),
-            Some(&eye_log::Value::U64(profile.eyes.len() as u64))
+            written.fields.get("corrections"),
+            Some(&eye_log::Value::U64(profile.correction_count() as u64))
         );
 
         let loaded = records
@@ -258,8 +327,12 @@ mod tests {
             Some(&eye_log::Value::Str(profile.name.clone()))
         );
         assert_eq!(
-            loaded.fields.get("eyes"),
-            Some(&eye_log::Value::U64(profile.eyes.len() as u64))
+            loaded.fields.get("sources"),
+            Some(&eye_log::Value::U64(profile.corrections.len() as u64))
+        );
+        assert_eq!(
+            loaded.fields.get("corrections"),
+            Some(&eye_log::Value::U64(profile.correction_count() as u64))
         );
         assert!(matches!(
             loaded.fields.get("estimator"),
@@ -344,15 +417,159 @@ estimator = "ir-pupil"
         let dir = test_dir("unsupported-version");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("p.toml");
-        std::fs::write(&path, "version = 2\nfoo = 1\n").unwrap();
+        std::fs::write(&path, "version = 3\nfoo = 1\n").unwrap();
         let err = read_profile(&path).unwrap_err();
         assert!(matches!(
             err,
             CalibrationError::Store(StoreError::UnsupportedVersion {
                 what: "profile",
-                found: 2
+                found: 3
             })
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v1_fused_profile_loads_into_rgb_only() {
+        let dir = test_dir("v1-fused");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.toml");
+        std::fs::write(
+            &path,
+            r#"version = 1
+name = "max"
+created_unix_s = 1700000000
+rig_fingerprint = "deadbeefcafef00d"
+estimator = "fused"
+[eyes.left]
+theta = [0.01, 0.0, 0.0, 0.0, 0.0, 0.0]
+cov = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+model = "affine"
+targets_used = 9
+rms_after_rad = 0.001
+"#,
+        )
+        .unwrap();
+
+        let (profile, records) =
+            eye_log::testing::capture_logs(tracing::Level::INFO, || read_profile(&path).unwrap());
+
+        assert_eq!(profile.version, PROFILE_VERSION);
+        assert_eq!(profile.corrections.len(), 1);
+        let entry = profile
+            .correction(RaySource::RgbOnly, EyeKey::Left)
+            .unwrap();
+        assert_eq!(entry.theta, [0.01, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert!(
+            profile
+                .correction(RaySource::IrOnly, EyeKey::Left)
+                .is_none()
+        );
+
+        let rec = records
+            .iter()
+            .find(|r| r.message == "profile migrated")
+            .expect("no 'profile migrated' record");
+        assert_eq!(rec.level, eye_log::Level::Info);
+        assert_eq!(
+            rec.fields.get("source"),
+            Some(&eye_log::Value::Str("rgb-only".to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v1_pccr_profile_loads_into_ir_only() {
+        let dir = test_dir("v1-pccr");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.toml");
+        std::fs::write(
+            &path,
+            r#"version = 1
+name = "max"
+created_unix_s = 1700000000
+rig_fingerprint = "deadbeefcafef00d"
+estimator = "pccr"
+[eyes.right]
+theta = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+cov = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+model = "affine"
+targets_used = 9
+rms_after_rad = 0.001
+"#,
+        )
+        .unwrap();
+
+        let profile = read_profile(&path).unwrap();
+        assert_eq!(profile.corrections.len(), 1);
+        assert!(
+            profile
+                .correction(RaySource::IrOnly, EyeKey::Right)
+                .is_some()
+        );
+        assert!(
+            profile
+                .correction(RaySource::RgbOnly, EyeKey::Right)
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v1_profile_saves_as_v2() {
+        let dir = test_dir("v1-saves-as-v2");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.toml");
+        std::fs::write(
+            &path,
+            r#"version = 1
+name = "max"
+created_unix_s = 1700000000
+rig_fingerprint = "deadbeefcafef00d"
+estimator = "fused"
+[eyes.left]
+theta = [0.01, 0.0, 0.0, 0.0, 0.0, 0.0]
+cov = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+model = "affine"
+targets_used = 9
+rms_after_rad = 0.001
+"#,
+        )
+        .unwrap();
+        let migrated = read_profile(&path).unwrap();
+
+        write_profile(&path, &migrated).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("version = 2"));
+        assert!(contents.contains("[corrections.rgb-only.left]"));
+
+        let reloaded = read_profile(&path).unwrap();
+        assert_eq!(reloaded, migrated);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v2_profile_with_eyes_table_rejected() {
+        let dir = test_dir("v2-eyes-table");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.toml");
+        std::fs::write(
+            &path,
+            r#"version = 2
+name = "max"
+created_unix_s = 1700000000
+rig_fingerprint = "deadbeefcafef00d"
+estimator = "fused"
+[eyes]
+[corrections]
+"#,
+        )
+        .unwrap();
+        let err = read_profile(&path).unwrap_err();
+        assert!(
+            matches!(err, CalibrationError::Store(StoreError::Parse { .. })),
+            "expected Parse error, got {err:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

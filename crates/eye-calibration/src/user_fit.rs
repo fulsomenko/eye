@@ -8,8 +8,8 @@ use nalgebra::{
 };
 
 use crate::correction::{
-    AngularCorrection, CalibrationPose, CorrectionModel, EyeKey, Provenance, UserProfile, design,
-    design_quad, design12, eye_label,
+    AngularCorrection, CalibrationPose, CorrectionModel, EyeKey, PROFILE_VERSION, Provenance,
+    UserProfile, design, design_quad, design12, eye_label, legacy_source,
 };
 use crate::error::CalibrationError;
 
@@ -651,14 +651,15 @@ impl DotSessionFit {
             "profile fitted"
         );
 
+        let source = legacy_source(&meta.estimator);
         Ok(FitOutcome {
             profile: UserProfile {
-                version: 1,
+                version: PROFILE_VERSION,
                 name: meta.name,
                 created_unix_s: meta.created_unix_s,
                 rig_fingerprint,
                 estimator: meta.estimator,
-                eyes,
+                corrections: BTreeMap::from([(source, eyes)]),
                 calibration_pose: Some(calibration_pose),
                 provenance: meta.provenance,
             },
@@ -897,7 +898,7 @@ fn cov_to_array(m: &SMatrix<f64, 6, 6>) -> [[f64; 6]; 6] {
 mod tests {
     use approx::assert_abs_diff_eq;
     use eye_core::stage::GazeCorrection;
-    use eye_core::{CameraId, CameraModel, OutputId, ScreenModel, Side};
+    use eye_core::{CameraId, CameraModel, OutputId, RaySource, ScreenModel, Side};
     use eye_geometry::angles::direction_from_yaw_pitch;
     use eye_geometry::synth::SplitMix64;
     use nalgebra::{Matrix3, UnitQuaternion, Vector3};
@@ -1043,7 +1044,10 @@ mod tests {
             ProfileMeta::default(),
         )
         .unwrap();
-        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        let right = outcome
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap();
         assert_eq!(right.model, CorrectionModel::Affine);
         let th = right.theta;
         assert_abs_diff_eq!(deg(th[0]), -1.9048, epsilon = 0.25);
@@ -1058,6 +1062,45 @@ mod tests {
             .find(|r| r.key == EyeKey::Right)
             .unwrap();
         assert!(report.rms_after_deg < 0.5, "{}", report.rms_after_deg);
+    }
+
+    #[test]
+    fn test_fit_files_corrections_under_legacy_source_of_estimator() {
+        let samples = generate_session(&SessionConfig::default());
+        let pccr = DotSessionFit::fit_with(
+            &samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta {
+                estimator: "pccr".into(),
+                ..ProfileMeta::default()
+            },
+        )
+        .unwrap();
+        let default = DotSessionFit::fit_with(
+            &samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap();
+
+        assert_eq!(pccr.profile.version, PROFILE_VERSION);
+        assert_eq!(default.profile.version, PROFILE_VERSION);
+        assert_eq!(
+            pccr.profile.corrections.keys().collect::<Vec<_>>(),
+            vec![&RaySource::IrOnly]
+        );
+        assert_eq!(
+            default.profile.corrections.keys().collect::<Vec<_>>(),
+            vec![&RaySource::RgbOnly]
+        );
+        assert_eq!(
+            pccr.profile.correction(RaySource::IrOnly, EyeKey::Right),
+            default
+                .profile
+                .correction(RaySource::RgbOnly, EyeKey::Right)
+        );
     }
 
     #[test]
@@ -1078,7 +1121,10 @@ mod tests {
             ProfileMeta::default(),
         )
         .unwrap();
-        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        let right = outcome
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap();
         let th = right.theta;
         assert_abs_diff_eq!(deg(th[0]), -1.9048, epsilon = 0.15);
         assert_abs_diff_eq!(deg(th[3]), 1.0309, epsilon = 0.15);
@@ -1101,7 +1147,10 @@ mod tests {
             ProfileMeta::default(),
         )
         .unwrap();
-        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        let right = outcome
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap();
         let th = right.theta;
         assert_abs_diff_eq!(deg(th[0]), 0.0, epsilon = 0.2);
         assert_abs_diff_eq!(deg(th[3]), 0.0, epsilon = 0.2);
@@ -1126,7 +1175,10 @@ mod tests {
             ProfileMeta::default(),
         )
         .unwrap();
-        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        let right = outcome
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap();
         let th = right.theta;
         assert_abs_diff_eq!(deg(th[0]), -1.9048, epsilon = 0.25);
         assert_abs_diff_eq!(deg(th[3]), 1.0309, epsilon = 0.25);
@@ -1159,7 +1211,10 @@ mod tests {
             "{:?}",
             report.targets_rejected
         );
-        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        let right = outcome
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap();
         let th = right.theta;
         assert_abs_diff_eq!(deg(th[0]), -1.9048, epsilon = 0.3);
         assert_abs_diff_eq!(deg(th[3]), 1.0309, epsilon = 0.3);
@@ -1354,7 +1409,10 @@ mod tests {
             ProfileMeta::default(),
         )
         .unwrap();
-        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        let right = outcome
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap();
         assert_eq!(right.model, CorrectionModel::OffsetOnly);
         assert_abs_diff_eq!(right.theta[1], 0.0, epsilon = 0.0);
         assert_abs_diff_eq!(right.theta[2], 0.0, epsilon = 0.0);
@@ -1477,8 +1535,18 @@ mod tests {
             ProfileMeta::default(),
         )
         .unwrap();
-        assert!(outcome.profile.eyes.contains_key(&EyeKey::Right));
-        assert!(!outcome.profile.eyes.contains_key(&EyeKey::Left));
+        assert!(
+            outcome
+                .profile
+                .correction(RaySource::RgbOnly, EyeKey::Right)
+                .is_some()
+        );
+        assert!(
+            !outcome
+                .profile
+                .correction(RaySource::RgbOnly, EyeKey::Left)
+                .is_some()
+        );
         let left_report = outcome
             .reports
             .iter()
@@ -1542,7 +1610,12 @@ mod tests {
             ProfileMeta::default(),
         )
         .unwrap();
-        assert!(outcome.profile.eyes.contains_key(&EyeKey::Cyclopean));
+        assert!(
+            outcome
+                .profile
+                .correction(RaySource::RgbOnly, EyeKey::Cyclopean)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1601,7 +1674,10 @@ mod tests {
         let outcome =
             DotSessionFit::fit_with(&samples, &fixture_rig(), &cfg, ProfileMeta::default())
                 .unwrap();
-        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        let right = outcome
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap();
         assert_eq!(right.model, CorrectionModel::Quadratic);
         assert_abs_diff_eq!(right.quad[0], -curvature_yaw, epsilon = 0.2);
         let report = outcome
@@ -1635,7 +1711,10 @@ mod tests {
             ProfileMeta::default(),
         )
         .unwrap();
-        let right11 = outcome11.profile.eyes.get(&EyeKey::Right).unwrap();
+        let right11 = outcome11
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap();
         assert_eq!(right11.model, CorrectionModel::Affine);
         assert_eq!(right11.targets_used, 11);
 
@@ -1652,7 +1731,10 @@ mod tests {
             ProfileMeta::default(),
         )
         .unwrap();
-        let right12 = outcome12.profile.eyes.get(&EyeKey::Right).unwrap();
+        let right12 = outcome12
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap();
         assert_eq!(right12.model, CorrectionModel::Quadratic);
         assert_eq!(right12.targets_used, 12);
     }
@@ -1668,7 +1750,10 @@ mod tests {
         let outcome =
             DotSessionFit::fit_with(&samples, &fixture_rig(), &cfg, ProfileMeta::default())
                 .unwrap();
-        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        let right = outcome
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap();
         let has_nonzero_cross = right
             .quad_cross_cov
             .iter()
@@ -1727,7 +1812,10 @@ mod tests {
         let outcome =
             DotSessionFit::fit_with(&samples, &fixture_rig(), &cfg, ProfileMeta::default())
                 .unwrap();
-        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        let right = outcome
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap();
         assert_eq!(right.model, CorrectionModel::HeadFrame);
         for (fitted, expected) in right.theta.iter().zip(theta_expected.iter()) {
             assert_abs_diff_eq!(fitted, expected, epsilon = 0.03);
@@ -1828,7 +1916,10 @@ mod tests {
             ProfileMeta::default(),
         )
         .unwrap();
-        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        let right = outcome
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap();
         assert_eq!(right.model, CorrectionModel::HeadFrame);
         assert_eq!(right.targets_used, 9);
     }
@@ -1844,7 +1935,10 @@ mod tests {
             ProfileMeta::default(),
         )
         .unwrap();
-        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        let right = outcome
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap();
         assert_ne!(right.model, CorrectionModel::HeadFrame);
     }
 
@@ -1858,7 +1952,10 @@ mod tests {
         let outcome =
             DotSessionFit::fit_with(&samples, &fixture_rig(), &cfg, ProfileMeta::default())
                 .unwrap();
-        let right = outcome.profile.eyes.get(&EyeKey::Right).unwrap();
+        let right = outcome
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap();
         assert_eq!(right.model, CorrectionModel::Affine);
     }
 
@@ -1873,7 +1970,11 @@ mod tests {
         let outcome_a =
             DotSessionFit::fit_with(&samples, &fixture_rig(), &cfg, ProfileMeta::default())
                 .unwrap();
-        let theta_a = outcome_a.profile.eyes.get(&EyeKey::Right).unwrap().theta;
+        let theta_a = outcome_a
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap()
+            .theta;
 
         let mut samples_b = samples.clone();
         let off_direction = Unit::new_normalize(Vector3::new(1.0, 1.0, 1.0));
@@ -1898,7 +1999,11 @@ mod tests {
         let outcome_b =
             DotSessionFit::fit_with(&samples_b, &fixture_rig(), &cfg, ProfileMeta::default())
                 .unwrap();
-        let theta_b = outcome_b.profile.eyes.get(&EyeKey::Right).unwrap().theta;
+        let theta_b = outcome_b
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap()
+            .theta;
 
         for (a, b) in theta_a.iter().zip(theta_b.iter()) {
             assert_abs_diff_eq!(a, b, epsilon = 1e-9);

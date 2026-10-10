@@ -341,6 +341,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use eye_bench::testing::synthetic_rig;
+    use eye_calibration::correction::PROFILE_VERSION;
 
     use super::*;
 
@@ -489,12 +490,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = ProfileStore::at(dir.path());
         let profile = UserProfile {
-            version: 1,
+            version: PROFILE_VERSION,
             name: "default".to_string(),
             created_unix_s: 0,
             rig_fingerprint: "0000".to_string(),
             estimator: "ir-pupil".to_string(),
-            eyes: BTreeMap::new(),
+            corrections: BTreeMap::new(),
             calibration_pose: None,
             provenance: Provenance::default(),
         };
@@ -529,12 +530,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = ProfileStore::at(dir.path());
         let profile = UserProfile {
-            version: 1,
+            version: PROFILE_VERSION,
             name: "default".to_string(),
             created_unix_s: 0,
             rig_fingerprint: eye_calibration::correction::rig_fingerprint(&synthetic_rig()),
             estimator: "fused".to_string(),
-            eyes: BTreeMap::new(),
+            corrections: BTreeMap::new(),
             calibration_pose: None,
             provenance: Provenance {
                 estimator_fingerprint: Some("x".to_string()),

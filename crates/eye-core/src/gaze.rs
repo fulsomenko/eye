@@ -69,6 +69,38 @@ impl GazePoint {
     }
 }
 
+/// The ray model that produced a gaze ray. Keys per-source corrections; the serde names equal
+/// `eye_estimate::fused::FusedSource::as_str`. `RgbOnly` sorts first: it is the primary source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RaySource {
+    RgbOnly,
+    IrOnly,
+    IrOnRgbEyeball,
+    IrGlintOnRgbEyeball,
+    Stereo,
+}
+
+impl RaySource {
+    pub const ALL: [RaySource; 5] = [
+        Self::RgbOnly,
+        Self::IrOnly,
+        Self::IrOnRgbEyeball,
+        Self::IrGlintOnRgbEyeball,
+        Self::Stereo,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RgbOnly => "rgb-only",
+            Self::IrOnly => "ir-only",
+            Self::IrOnRgbEyeball => "ir-on-rgb-eyeball",
+            Self::IrGlintOnRgbEyeball => "ir-glint-on-rgb-eyeball",
+            Self::Stereo => "stereo",
+        }
+    }
+}
+
 /// Finite, symmetric (relative tolerance 1e-9) and positive semi-definite.
 pub fn validate_covariance2(cov: &Matrix2<f64>) -> Result<(), CoreError> {
     let (a, b, c, d) = (cov[(0, 0)], cov[(0, 1)], cov[(1, 0)], cov[(1, 1)]);
@@ -201,5 +233,20 @@ mod tests {
         assert!(json.contains("\"timestamp\":1000000000"));
         let parsed: GazePoint = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, point);
+    }
+
+    #[test]
+    fn test_ray_source_serde_names_match_as_str() {
+        for source in RaySource::ALL {
+            let json = serde_json::to_string(&source).unwrap();
+            assert_eq!(json, format!("\"{}\"", source.as_str()));
+            let back: RaySource = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, source);
+        }
+    }
+
+    #[test]
+    fn test_ray_source_orders_rgb_only_first() {
+        assert_eq!(RaySource::ALL.iter().min(), Some(&RaySource::RgbOnly));
     }
 }

@@ -1033,12 +1033,12 @@ mod tests {
 
     fn fixture_profile() -> UserProfile {
         UserProfile {
-            version: 1,
+            version: eye_calibration::correction::PROFILE_VERSION,
             name: "default".into(),
             created_unix_s: 0,
             rig_fingerprint: String::new(),
             estimator: String::new(),
-            eyes: std::collections::BTreeMap::new(),
+            corrections: std::collections::BTreeMap::new(),
             calibration_pose: None,
             provenance: Provenance::default(),
         }

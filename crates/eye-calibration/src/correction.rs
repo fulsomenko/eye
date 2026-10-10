@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use eye_core::log::field;
 use eye_core::stage::GazeCorrection;
-use eye_core::{GazeRay, Rig, Side};
+use eye_core::{GazeRay, RaySource, Rig, Side};
 use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
 use eye_geometry::uncertainty::{block_diag, numeric_jacobian, propagate};
 use nalgebra::{Matrix2, SMatrix, SVector, Vector2};
@@ -96,6 +96,8 @@ pub struct Provenance {
     pub expected_loto_mean_deg: Option<f64>,
 }
 
+pub const PROFILE_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserProfile {
@@ -104,50 +106,41 @@ pub struct UserProfile {
     pub created_unix_s: u64,
     pub rig_fingerprint: String,
     pub estimator: String,
-    pub eyes: BTreeMap<EyeKey, AngularCorrection>,
+    /// `[corrections.<source>.<eye>]`
+    pub corrections: BTreeMap<RaySource, BTreeMap<EyeKey, AngularCorrection>>,
     #[serde(default)]
     pub calibration_pose: Option<CalibrationPose>,
     #[serde(default)]
     pub provenance: Provenance,
 }
 
-pub(crate) fn design(o: &Vector2<f64>) -> SMatrix<f64, 2, 6> {
-    SMatrix::<f64, 2, 6>::new(1.0, o.x, o.y, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, o.x, o.y)
-}
+impl UserProfile {
+    pub fn correction(&self, source: RaySource, eye: EyeKey) -> Option<&AngularCorrection> {
+        self.corrections.get(&source)?.get(&eye)
+    }
 
-pub(crate) fn design_quad(o: &Vector2<f64>) -> SMatrix<f64, 2, 6> {
-    let (yy, pp, yp) = (o.x * o.x, o.y * o.y, o.x * o.y);
-    SMatrix::<f64, 2, 6>::new(yy, pp, yp, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, yy, pp, yp)
-}
+    /// Number of (source, eye) entries.
+    pub fn correction_count(&self) -> usize {
+        self.corrections.values().map(BTreeMap::len).sum()
+    }
 
-pub(crate) fn design12(o: &Vector2<f64>) -> SMatrix<f64, 2, 12> {
-    let mut d = SMatrix::<f64, 2, 12>::zeros();
-    d.fixed_view_mut::<2, 6>(0, 0).copy_from(&design(o));
-    d.fixed_view_mut::<2, 6>(0, 6).copy_from(&design_quad(o));
-    d
-}
+    /// The lowest-ordered source present (`RaySource::RgbOnly` when present).
+    pub fn primary_source(&self) -> Option<RaySource> {
+        self.corrections.keys().min().copied()
+    }
 
-fn head_frame_correct(
-    rot: &nalgebra::UnitQuaternion<f64>,
-    a: &Vector2<f64>,
-    th: &SVector<f64, 6>,
-) -> Vector2<f64> {
-    let dir_head = rot.inverse() * direction_from_yaw_pitch(a);
-    let a_head = yaw_pitch_from_direction(&dir_head);
-    let corrected_head = a_head + design(&a_head) * th;
-    yaw_pitch_from_direction(&(*rot * direction_from_yaw_pitch(&corrected_head)))
-}
-
-impl GazeCorrection for UserProfile {
-    fn correct(&self, ray: &GazeRay) -> GazeRay {
+    /// The ray corrected by the (source, eye) entry. `None` when there is no entry, or the entry
+    /// is `HeadFrame` and the ray carries no head pose: the ray cannot be put in true-angle units.
+    pub fn correct_source(&self, source: RaySource, ray: &GazeRay) -> Option<GazeRay> {
         let eye = EyeKey::from(ray.side);
-        let Some(c) = self.eyes.get(&eye) else {
+        let Some(c) = self.correction(source, eye) else {
             tracing::trace!(
+                source = source.as_str(),
                 eye = eye_label(eye),
                 { field::REASON } = "no_profile_entry",
                 "ray uncorrected"
             );
-            return ray.clone();
+            return None;
         };
         let a = yaw_pitch_from_direction(&ray.direction);
         let (corrected, angular_cov) = match c.model {
@@ -193,11 +186,12 @@ impl GazeCorrection for UserProfile {
                 let cov_theta = SMatrix::<f64, 6, 6>::from_fn(|r, k| c.cov[r][k]);
                 let Some(rot) = ray.head_rotation else {
                     tracing::trace!(
+                        source = source.as_str(),
                         eye = eye_label(eye),
                         { field::REASON } = "no_head_pose",
                         "ray uncorrected"
                     );
-                    return ray.clone();
+                    return None;
                 };
                 let x = SVector::<f64, 8>::from_fn(|i, _| if i < 2 { a[i] } else { th[i - 2] });
                 let cov8 = block_diag::<2, 6, 8>(&ray.angular_cov, &cov_theta);
@@ -213,6 +207,7 @@ impl GazeCorrection for UserProfile {
         let residual = Matrix2::identity() * (c.rms_after_rad * c.rms_after_rad);
         let angular_cov = angular_cov + residual;
         tracing::trace!(
+            source = source.as_str(),
             eye = eye_label(eye),
             model = ?c.model,
             yaw_in_deg = a.x.to_degrees(),
@@ -221,11 +216,61 @@ impl GazeCorrection for UserProfile {
             pitch_out_deg = corrected.y.to_degrees(),
             "ray corrected"
         );
-        GazeRay {
+        Some(GazeRay {
             direction: direction_from_yaw_pitch(&corrected),
             angular_cov,
             ..ray.clone()
-        }
+        })
+    }
+}
+
+/// The source a v1 profile's `eyes` (fitted on the estimator's output rays) describes.
+pub fn legacy_source(estimator: &str) -> RaySource {
+    match estimator {
+        "pccr" | "ir-pupil" => RaySource::IrOnly,
+        _ => RaySource::RgbOnly,
+    }
+}
+
+pub(crate) fn design(o: &Vector2<f64>) -> SMatrix<f64, 2, 6> {
+    SMatrix::<f64, 2, 6>::new(1.0, o.x, o.y, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, o.x, o.y)
+}
+
+pub(crate) fn design_quad(o: &Vector2<f64>) -> SMatrix<f64, 2, 6> {
+    let (yy, pp, yp) = (o.x * o.x, o.y * o.y, o.x * o.y);
+    SMatrix::<f64, 2, 6>::new(yy, pp, yp, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, yy, pp, yp)
+}
+
+pub(crate) fn design12(o: &Vector2<f64>) -> SMatrix<f64, 2, 12> {
+    let mut d = SMatrix::<f64, 2, 12>::zeros();
+    d.fixed_view_mut::<2, 6>(0, 0).copy_from(&design(o));
+    d.fixed_view_mut::<2, 6>(0, 6).copy_from(&design_quad(o));
+    d
+}
+
+fn head_frame_correct(
+    rot: &nalgebra::UnitQuaternion<f64>,
+    a: &Vector2<f64>,
+    th: &SVector<f64, 6>,
+) -> Vector2<f64> {
+    let dir_head = rot.inverse() * direction_from_yaw_pitch(a);
+    let a_head = yaw_pitch_from_direction(&dir_head);
+    let corrected_head = a_head + design(&a_head) * th;
+    yaw_pitch_from_direction(&(*rot * direction_from_yaw_pitch(&corrected_head)))
+}
+
+impl GazeCorrection for UserProfile {
+    fn correct(&self, ray: &GazeRay) -> GazeRay {
+        let Some(source) = self.primary_source() else {
+            tracing::trace!(
+                eye = eye_label(EyeKey::from(ray.side)),
+                { field::REASON } = "no_profile_entry",
+                "ray uncorrected"
+            );
+            return ray.clone();
+        };
+        self.correct_source(source, ray)
+            .unwrap_or_else(|| ray.clone())
     }
 }
 
@@ -351,12 +396,12 @@ mod tests {
             },
         );
         UserProfile {
-            version: 1,
+            version: PROFILE_VERSION,
             name: "max".into(),
             created_unix_s: 1_700_000_000,
             rig_fingerprint: "deadbeefcafef00d".into(),
             estimator: "ir-pupil".into(),
-            eyes,
+            corrections: BTreeMap::from([(legacy_source("ir-pupil"), eyes)]),
             calibration_pose: None,
             provenance: Provenance::default(),
         }
@@ -466,12 +511,12 @@ mod tests {
             },
         );
         let profile = UserProfile {
-            version: 1,
+            version: PROFILE_VERSION,
             name: "max".into(),
             created_unix_s: 0,
             rig_fingerprint: String::new(),
             estimator: "ir-pupil".into(),
-            eyes,
+            corrections: BTreeMap::from([(legacy_source("ir-pupil"), eyes)]),
             calibration_pose: None,
             provenance: Provenance::default(),
         };
@@ -502,12 +547,12 @@ mod tests {
             },
         );
         let profile = UserProfile {
-            version: 1,
+            version: PROFILE_VERSION,
             name: "max".into(),
             created_unix_s: 0,
             rig_fingerprint: String::new(),
             estimator: "ir-pupil".into(),
-            eyes,
+            corrections: BTreeMap::from([(legacy_source("ir-pupil"), eyes)]),
             calibration_pose: None,
             provenance: Provenance::default(),
         };
@@ -538,6 +583,22 @@ mod tests {
     #[test]
     fn test_profile_toml_round_trip() {
         let mut profile = fixture_profile();
+        profile.corrections.insert(
+            RaySource::RgbOnly,
+            BTreeMap::from([(
+                EyeKey::Left,
+                AngularCorrection {
+                    theta: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    cov: [[0.0; 6]; 6],
+                    quad: [0.0; 6],
+                    quad_cov: [[0.0; 6]; 6],
+                    quad_cross_cov: [[0.0; 6]; 6],
+                    model: CorrectionModel::Affine,
+                    targets_used: 6,
+                    rms_after_rad: 0.002,
+                },
+            )]),
+        );
         profile.calibration_pose = Some(CalibrationPose {
             head_rotation: Some([0.0, 0.0, 0.0, 1.0]),
             samples_with_head_pose: 42,
@@ -584,12 +645,12 @@ mod tests {
             },
         );
         UserProfile {
-            version: 1,
+            version: PROFILE_VERSION,
             name: "x".into(),
             created_unix_s: 0,
             rig_fingerprint: String::new(),
             estimator: "landmark".into(),
-            eyes,
+            corrections: BTreeMap::from([(legacy_source("landmark"), eyes)]),
             calibration_pose: None,
             provenance: Provenance::default(),
         }
@@ -664,12 +725,12 @@ mod tests {
             },
         );
         let profile = UserProfile {
-            version: 1,
+            version: PROFILE_VERSION,
             name: "x".into(),
             created_unix_s: 0,
             rig_fingerprint: String::new(),
             estimator: "landmark".into(),
-            eyes,
+            corrections: BTreeMap::from([(legacy_source("landmark"), eyes)]),
             calibration_pose: None,
             provenance: Provenance::default(),
         };
@@ -700,5 +761,159 @@ mod tests {
             (corrected.angular_cov - block_diag_only).abs().sum() > 1e-9,
             "cross term had no effect"
         );
+    }
+
+    fn affine_entry(theta: [f64; 6]) -> AngularCorrection {
+        AngularCorrection {
+            theta,
+            cov: [[0.0; 6]; 6],
+            quad: [0.0; 6],
+            quad_cov: [[0.0; 6]; 6],
+            quad_cross_cov: [[0.0; 6]; 6],
+            model: CorrectionModel::Affine,
+            targets_used: 9,
+            rms_after_rad: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_correct_source_uses_matching_source_entry() {
+        let rgb_theta = [0.01, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let ir_theta = [-0.02, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let profile = UserProfile {
+            version: PROFILE_VERSION,
+            name: "x".into(),
+            created_unix_s: 0,
+            rig_fingerprint: String::new(),
+            estimator: String::new(),
+            corrections: BTreeMap::from([
+                (
+                    RaySource::RgbOnly,
+                    BTreeMap::from([(EyeKey::Right, affine_entry(rgb_theta))]),
+                ),
+                (
+                    RaySource::IrOnly,
+                    BTreeMap::from([(EyeKey::Right, affine_entry(ir_theta))]),
+                ),
+            ]),
+            calibration_pose: None,
+            provenance: Provenance::default(),
+        };
+        let ray = straight_ray(Some(eye_core::Side::Right));
+        let a = yaw_pitch_from_direction(&ray.direction);
+
+        let rgb_corrected = profile.correct_source(RaySource::RgbOnly, &ray).unwrap();
+        let rgb_yaw = yaw_pitch_from_direction(&rgb_corrected.direction).x;
+        assert_abs_diff_eq!(rgb_yaw, a.x + 0.01, epsilon = 1e-12);
+
+        let ir_corrected = profile.correct_source(RaySource::IrOnly, &ray).unwrap();
+        let ir_yaw = yaw_pitch_from_direction(&ir_corrected.direction).x;
+        assert_abs_diff_eq!(ir_yaw, a.x - 0.02, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_correct_source_returns_none_without_entry() {
+        let profile = fixture_profile();
+        let ray = straight_ray(Some(eye_core::Side::Left));
+
+        let (result, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            profile.correct_source(RaySource::IrOnly, &ray)
+        });
+
+        assert_eq!(result, None);
+        let rec = records
+            .iter()
+            .find(|r| r.message == "ray uncorrected")
+            .expect("no 'ray uncorrected' record");
+        assert_eq!(
+            rec.fields.get("source"),
+            Some(&eye_log::Value::Str("ir-only".to_string()))
+        );
+        assert_eq!(
+            rec.fields.get(field::REASON),
+            Some(&eye_log::Value::Str("no_profile_entry".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_correct_source_returns_none_for_head_frame_without_pose() {
+        let profile = UserProfile {
+            version: PROFILE_VERSION,
+            name: "x".into(),
+            created_unix_s: 0,
+            rig_fingerprint: String::new(),
+            estimator: String::new(),
+            corrections: BTreeMap::from([(
+                RaySource::IrOnly,
+                BTreeMap::from([(
+                    EyeKey::Right,
+                    AngularCorrection {
+                        model: CorrectionModel::HeadFrame,
+                        ..affine_entry([0.1, 0.0, 0.0, 0.0, 0.0, 0.0])
+                    },
+                )]),
+            )]),
+            calibration_pose: None,
+            provenance: Provenance::default(),
+        };
+        let mut ray = straight_ray(Some(eye_core::Side::Right));
+        ray.head_rotation = None;
+
+        assert_eq!(profile.correct_source(RaySource::IrOnly, &ray), None);
+    }
+
+    #[test]
+    fn test_correct_source_scales_cov_by_inverse_gain_squared() {
+        let profile = UserProfile {
+            version: PROFILE_VERSION,
+            name: "x".into(),
+            created_unix_s: 0,
+            rig_fingerprint: String::new(),
+            estimator: String::new(),
+            corrections: BTreeMap::from([(
+                RaySource::IrOnly,
+                BTreeMap::from([(EyeKey::Right, affine_entry([0.0, 1.5, 0.0, 0.0, 0.0, 1.5]))]),
+            )]),
+            calibration_pose: None,
+            provenance: Provenance::default(),
+        };
+        let mut ray = straight_ray(Some(eye_core::Side::Right));
+        ray.angular_cov = Matrix2::new(1e-4, 0.0, 0.0, 2e-4);
+
+        let corrected = profile.correct_source(RaySource::IrOnly, &ray).unwrap();
+        let expected = Matrix2::new(6.25e-4, 0.0, 0.0, 12.5e-4);
+        assert_abs_diff_eq!(corrected.angular_cov, expected, epsilon = 1e-15);
+    }
+
+    #[test]
+    fn test_legacy_source_maps_estimator_names() {
+        assert_eq!(legacy_source("pccr"), RaySource::IrOnly);
+        assert_eq!(legacy_source("ir-pupil"), RaySource::IrOnly);
+        for estimator in ["fused", "landmark", "", "test-kappa-ray"] {
+            assert_eq!(legacy_source(estimator), RaySource::RgbOnly);
+        }
+    }
+
+    #[test]
+    fn test_trait_correct_uses_primary_source() {
+        let profile = UserProfile {
+            version: PROFILE_VERSION,
+            name: "x".into(),
+            created_unix_s: 0,
+            rig_fingerprint: String::new(),
+            estimator: String::new(),
+            corrections: BTreeMap::from([(
+                RaySource::IrOnly,
+                BTreeMap::from([(EyeKey::Right, affine_entry([0.01, 0.0, 0.0, 0.0, 0.0, 0.0]))]),
+            )]),
+            calibration_pose: None,
+            provenance: Provenance::default(),
+        };
+        let ray = straight_ray(Some(eye_core::Side::Right));
+        let a = yaw_pitch_from_direction(&ray.direction);
+
+        let corrected = profile.correct(&ray);
+        let yaw = yaw_pitch_from_direction(&corrected.direction).x;
+        assert_abs_diff_eq!(yaw, a.x + 0.01, epsilon = 1e-12);
     }
 }
