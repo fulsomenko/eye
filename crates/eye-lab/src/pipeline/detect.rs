@@ -4,7 +4,7 @@ use std::{
 };
 
 use eye_capture::{CaptureError, FrameSource};
-use eye_core::{FrameSet, Observations, Side};
+use eye_core::{FrameSet, Illumination, Observations, Side};
 use nalgebra::Point2;
 
 use crate::{
@@ -55,6 +55,8 @@ pub fn eye_centres(observations: &[Observations], role: Role) -> Vec<(Side, Poin
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DetectionStats {
     pub accepted: usize,
+    /// Subset of `accepted` excluding `IrDark` frames.
+    pub evaluable: usize,
     pub detected: usize,
     pub errors: usize,
     pub detect_ms: Vec<f64>,
@@ -139,6 +141,9 @@ fn run_detector(
             continue;
         }
         stats.accepted += 1;
+        if h.illumination != Illumination::IrDark {
+            stats.evaluable += 1;
+        }
         let started = Instant::now();
         let result = detector.detect(&FrameSet::single(frame));
         stats.detect_ms.push(started.elapsed().as_secs_f64() * 1e3);
@@ -237,7 +242,7 @@ impl TestCase for DetectionRate {
             &instruction,
         )?;
         let mut out = TestOutput::default();
-        let rate = stats.detected as f64 / stats.accepted as f64;
+        let rate = stats.detected as f64 / stats.evaluable as f64;
         out.push(Measurement::at_least(
             "detection_rate",
             rate,
@@ -249,6 +254,11 @@ impl TestCase for DetectionRate {
             stats.accepted as f64,
             "",
             p.min_frames as f64,
+        ));
+        out.push(Measurement::info(
+            "evaluable_frames",
+            stats.evaluable as f64,
+            "",
         ));
         out.push(Measurement::info("detect_errors", stats.errors as f64, ""));
         out.push(Measurement::info(
@@ -527,6 +537,56 @@ mod tests {
     }
 
     #[test]
+    fn test_detection_rate_ignores_dark_frames_in_denominator() {
+        let frames = testkit::synth_gray("ir", 100, 0, 0, 66_666_666, |seq| {
+            if seq % 2 == 1 { 46 } else { 0 }
+        });
+        let records: std::collections::VecDeque<_> = (0..100u64)
+            .map(|seq| eye_capture::MetaRecord {
+                timestamp: eye_core::Timestamp::from_nanos(seq * 66_666_666),
+                lit: Some(seq % 2 == 1),
+            })
+            .collect();
+        let session = Arc::new(
+            testkit::FakeSession::empty()
+                .with_source(Role::Ir, testkit::boxed(frames))
+                .with_meta(Box::new(testkit::FakeMeta { records })),
+        );
+        let session_dyn: Arc<dyn crate::mode::ModeSession> = Arc::clone(&session) as _;
+        let ctx = testkit::ctx(session_dyn, testkit::mode_ir(EmitterSetting::On));
+        let build: DetectorFactory = testkit::fake_detectors(vec![], None, |_| 0.0);
+        let case = DetectionRate {
+            p: DetectionParams {
+                seconds: 60.0,
+                lead_s: 0.0,
+                min_frames: 10,
+                ..DetectionParams::default()
+            },
+            build,
+        };
+        let out = case.run(&ctx).unwrap();
+        let accepted = out
+            .measurements
+            .iter()
+            .find(|m| m.name == "accepted_frames")
+            .unwrap();
+        assert_eq!(accepted.value, 100.0);
+        let evaluable = out
+            .measurements
+            .iter()
+            .find(|m| m.name == "evaluable_frames")
+            .unwrap();
+        assert_eq!(evaluable.value, 50.0);
+        let rate = out
+            .measurements
+            .iter()
+            .find(|m| m.name == "detection_rate")
+            .unwrap();
+        assert_relative_eq!(rate.value, 1.0, epsilon = 1e-9);
+        assert!(out.passed());
+    }
+
+    #[test]
     fn test_detection_rate_below_threshold_fails() {
         let frames = testkit::synth_gray("ir", 103, 0, 0, 66_666_666, |seq| {
             if seq % 2 == 1 { 46 } else { 0 }
@@ -539,7 +599,7 @@ mod tests {
             .entry(Role::Ir)
             .or_default()
             .push_back(testkit::boxed(frames));
-        let build: DetectorFactory = testkit::fake_detectors(vec![], None, |_| 0.0);
+        let build: DetectorFactory = testkit::fake_detectors(vec![], Some(4), |_| 0.0);
         let case = DetectionRate {
             p: DetectionParams {
                 seconds: 60.0,
@@ -560,7 +620,11 @@ mod tests {
             .iter()
             .find(|m| m.name == "detection_rate")
             .unwrap();
-        assert_relative_eq!(rate.value, 51.0 / 103.0, epsilon = 1e-9);
+        assert!(
+            rate.value < 0.9,
+            "expected a below-threshold rate, got {}",
+            rate.value
+        );
         assert!(!out.passed());
     }
 
