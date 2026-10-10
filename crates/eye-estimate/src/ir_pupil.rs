@@ -2,9 +2,11 @@ use eye_core::log::field;
 use eye_core::stage::{GazeEstimator, StageError};
 use eye_core::{CameraModel, GazeRay, Measured, Observations, Rig, ScreenModel, Side};
 use eye_geometry::camera::pixel_ray;
-use eye_geometry::eyeball::{EyeCentre, EyeParams, Kappa, gaze_ray, optical_axis, ray_sphere_near};
+use eye_geometry::eyeball::{
+    EyeCentre, EyeParams, Kappa, gaze_ray, gaze_ray_pccr, optical_axis, ray_sphere_near,
+};
 use eye_geometry::screen::intersect_plane;
-use nalgebra::{Matrix3, Point2, Point3, Unit, Vector3};
+use nalgebra::{Matrix3, Point2, Point3, Unit, UnitQuaternion, Vector3};
 use serde::Deserialize;
 
 use crate::EstimateError;
@@ -26,6 +28,8 @@ pub struct IrPupilOptions {
     /// covariance per axis; defaults to the re-anchor distance, the displacement below which no
     /// re-anchor fires.
     pub origin_ambiguity_mm: f64,
+    /// A glint within this distance of the pupil selects the glint ray.
+    pub max_glint_offset_px: f64,
     pub apply_kappa: bool,
 }
 
@@ -37,6 +41,7 @@ impl Default for IrPupilOptions {
             reanchor_distance_mm: 5.0,
             reanchor_margin: 0.2,
             origin_ambiguity_mm: 5.0,
+            max_glint_offset_px: 3.0,
             apply_kappa: true,
         }
     }
@@ -47,6 +52,7 @@ pub(crate) enum Trigger {
     Initial,
     Distance,
     OffScreen,
+    Seeded,
 }
 
 /// IR-only baseline. Assumes a still, frontal head between re-anchors: head translation and eye
@@ -60,6 +66,9 @@ pub struct IrPupilEstimator {
     options: IrPupilOptions,
     params: EyeParams,
     anchor: Option<[Point3<f64>; 2]>,
+    anchor_cov: Option<[Matrix3<f64>; 2]>,
+    seed_viewer: Option<UnitQuaternion<f64>>,
+    seed_pending: bool,
     last_optical: Option<[Unit<Vector3<f64>>; 2]>,
     pub(crate) last_reanchor: Option<Trigger>,
 }
@@ -72,6 +81,9 @@ impl IrPupilEstimator {
             options,
             params: EyeParams::default(),
             anchor: None,
+            anchor_cov: None,
+            seed_viewer: None,
+            seed_pending: false,
             last_optical: None,
             last_reanchor: None,
         }
@@ -81,6 +93,16 @@ impl IrPupilEstimator {
         Ok(Self::new(parse_options(Self::NAME, table)?))
     }
 
+    /// Place the anchor from an external eye-centre measurement (the landmark frame in fused).
+    /// Consumed by the next `estimate_rays`, which reports `Trigger::Seeded` and keeps the seed
+    /// over its distance and off-screen triggers.
+    pub fn seed_anchor(&mut self, centres: [EyeCentre; 2], viewer: UnitQuaternion<f64>) {
+        self.anchor = Some([centres[0].position, centres[1].position]);
+        self.anchor_cov = Some([centres[0].cov, centres[1].cov]);
+        self.seed_viewer = Some(viewer);
+        self.seed_pending = true;
+    }
+
     /// Shared with `FusedEstimator`'s IR chain.
     pub(crate) fn estimate_rays(
         &mut self,
@@ -88,7 +110,7 @@ impl IrPupilEstimator {
         rig: &Rig,
     ) -> Result<Vec<GazeRay>, EstimateError> {
         self.last_reanchor = None;
-        let Some(pair) = PupilPair::from_observations(obs) else {
+        let Some(pair) = PupilPair::from_observations(obs, self.options.max_glint_offset_px) else {
             tracing::debug!(
                 { field::REASON } = "no_pupil_pair",
                 observations = obs.len() as u64,
@@ -103,31 +125,40 @@ impl IrPupilEstimator {
             return Ok(vec![]);
         };
         let r = self.params.rotation_to_pupil_mm;
-        let mut anchor = match self.anchor {
-            None => {
-                tracing::debug!({ field::REASON } = "initial", "re-anchor");
-                self.last_reanchor = Some(Trigger::Initial);
-                self.anchor_from(&x, rig.screen())
-            }
-            Some(c) => {
-                let drift = ((x[0] - c[0]).norm() - r).abs() + ((x[1] - c[1]).norm() - r).abs();
-                let max_drift = 2.0 * self.options.reanchor_distance_mm;
-                if drift > max_drift {
-                    tracing::debug!(
-                        { field::REASON } = "distance",
-                        drift_mm = drift,
-                        max_drift_mm = max_drift,
-                        "re-anchor"
-                    );
-                    self.last_reanchor = Some(Trigger::Distance);
+        let mut anchor = if self.seed_pending {
+            self.seed_pending = false;
+            self.last_reanchor = Some(Trigger::Seeded);
+            self.anchor
+                .expect("seed_anchor sets the anchor before estimate_rays consumes it")
+        } else {
+            match self.anchor {
+                None => {
+                    tracing::debug!({ field::REASON } = "initial", "re-anchor");
+                    self.last_reanchor = Some(Trigger::Initial);
                     self.anchor_from(&x, rig.screen())
-                } else {
-                    c
+                }
+                Some(c) => {
+                    let drift = ((x[0] - c[0]).norm() - r).abs() + ((x[1] - c[1]).norm() - r).abs();
+                    let max_drift = 2.0 * self.options.reanchor_distance_mm;
+                    if drift > max_drift {
+                        tracing::debug!(
+                            { field::REASON } = "distance",
+                            drift_mm = drift,
+                            max_drift_mm = max_drift,
+                            "re-anchor"
+                        );
+                        self.last_reanchor = Some(Trigger::Distance);
+                        self.anchor_from(&x, rig.screen())
+                    } else {
+                        c
+                    }
                 }
             }
         };
 
-        if let Some(g) = self.optical_pair(cam, &pair, &anchor) {
+        if self.last_reanchor != Some(Trigger::Seeded)
+            && let Some(g) = self.optical_pair(cam, &pair, &anchor)
+        {
             let hit = screen_hit(&anchor, &g);
             let margin = self.options.reanchor_margin;
             if !hit.is_some_and(|h| within_grown_screen(&h, margin, rig.screen())) {
@@ -159,13 +190,17 @@ impl IrPupilEstimator {
         Ok(rays)
     }
 
-    fn anchor_from(&self, x: &[Point3<f64>; 2], screen: &ScreenModel) -> [Point3<f64>; 2] {
+    /// Dead-reckoned anchor from the screen-centre assumption (or the last optical axis); clears
+    /// a seeded anchor's measured covariance and viewer, since this anchor is declared again.
+    fn anchor_from(&mut self, x: &[Point3<f64>; 2], screen: &ScreenModel) -> [Point3<f64>; 2] {
         let r = self.params.rotation_to_pupil_mm;
         let t0 = Point3::new(screen.size_mm.x / 2.0, screen.size_mm.y / 2.0, 0.0);
         let dir = |i: usize| match self.last_optical {
             Some(g) => g[i].into_inner(),
             None => (t0 - x[i]).normalize(),
         };
+        self.anchor_cov = None;
+        self.seed_viewer = None;
         [x[0] - dir(0) * r, x[1] - dir(1) * r]
     }
 
@@ -213,34 +248,39 @@ impl IrPupilEstimator {
         };
         let a = self.options.anchor_sigma_mm;
         let d = self.options.origin_ambiguity_mm;
-        let cov = Matrix3::from_diagonal(&Vector3::new(
+        let declared_cov = Matrix3::from_diagonal(&Vector3::new(
             a * a + d * d,
             a * a + d * d,
             9.0 * a * a + d * d,
         ));
-        let ray_for = |side: Side, position: Point3<f64>, px: &Measured<Point2<f64>>| {
-            gaze_ray(
-                side,
-                &EyeCentre { position, cov },
-                cam,
-                px,
-                &params,
-                None,
-                pair.timestamp,
-            )
-            .inspect_err(|e| {
-                tracing::debug!(
-                    { field::REASON } = "gaze_ray_failed",
-                    side = side_str(side),
-                    error = %e,
-                    "gaze ray failed"
-                );
-            })
-            .ok()
+        let viewer = self.seed_viewer.as_ref();
+        let ray_for = |side: Side,
+                       i: usize,
+                       position: Point3<f64>,
+                       px: &Measured<Point2<f64>>,
+                       glint: &Option<Measured<Point2<f64>>>| {
+            let cov = self.anchor_cov.map_or(declared_cov, |c| c[i]);
+            let centre = EyeCentre { position, cov };
+            let result = match glint {
+                Some(g) => {
+                    gaze_ray_pccr(side, &centre, cam, px, g, &params, viewer, pair.timestamp)
+                }
+                None => gaze_ray(side, &centre, cam, px, &params, viewer, pair.timestamp),
+            };
+            result
+                .inspect_err(|e| {
+                    tracing::debug!(
+                        { field::REASON } = "gaze_ray_failed",
+                        side = side_str(side),
+                        error = %e,
+                        "gaze ray failed"
+                    );
+                })
+                .ok()
         };
         [
-            ray_for(Side::Right, anchor[0], &pair.right),
-            ray_for(Side::Left, anchor[1], &pair.left),
+            ray_for(Side::Right, 0, anchor[0], &pair.right, &pair.right_glint),
+            ray_for(Side::Left, 1, anchor[1], &pair.left, &pair.left_glint),
         ]
     }
 }
@@ -281,7 +321,8 @@ mod tests {
 
     use super::*;
     use crate::testutil::{
-        EYE_CENTRES, synthetic_ir_observation, synthetic_ir_observation_at, test_rig,
+        EYE_CENTRES, synthetic_ir_observation, synthetic_ir_observation_at,
+        synthetic_pccr_observation, test_rig,
     };
 
     fn angle_deg(a: &Unit<Vector3<f64>>, b: &Unit<Vector3<f64>>) -> f64 {
@@ -465,6 +506,8 @@ mod tests {
             timestamp: Timestamp::from_nanos(0),
             right: Measured::new(right_px, sigma_px).expect("valid sigma"),
             left: Measured::new(left_px, sigma_px).expect("valid sigma"),
+            right_glint: None,
+            left_glint: None,
         };
 
         let a = estimator.options.anchor_sigma_mm;
@@ -489,6 +532,8 @@ mod tests {
                 timestamp: base_pair.timestamp,
                 right: Measured::new(noisy_right, sigma_px).expect("valid sigma"),
                 left: Measured::new(noisy_left, sigma_px).expect("valid sigma"),
+                right_glint: None,
+                left_glint: None,
             };
             let noisy_anchor = [
                 EYE_CENTRES[0]
@@ -549,7 +594,7 @@ mod tests {
         let rig = test_rig();
         let cam = rig.camera("ir").expect("rig has an ir camera");
         let obs = synthetic_ir_observation_at(&rig, EYE_CENTRES, Point2::new(100.0, 50.0), 0.0, 1);
-        let pair = PupilPair::from_observations(&[obs]).expect("a pair is present");
+        let pair = PupilPair::from_observations(&[obs], 3.0).expect("a pair is present");
 
         let angular_cov_at = |anchor_sigma_mm: f64, origin_ambiguity_mm: f64, sigma_px: f64| {
             let estimator = IrPupilEstimator::new(IrPupilOptions {
@@ -563,6 +608,8 @@ mod tests {
                 timestamp: pair.timestamp,
                 right: Measured::new(*pair.right.value(), sigma_px).expect("valid sigma"),
                 left: Measured::new(*pair.left.value(), sigma_px).expect("valid sigma"),
+                right_glint: None,
+                left_glint: None,
             };
             estimator.rays(&pair_with_sigma, cam, &EYE_CENTRES)[0]
                 .clone()
@@ -589,7 +636,7 @@ mod tests {
             ..Default::default()
         });
         let obs = synthetic_ir_observation_at(&rig, EYE_CENTRES, Point2::new(100.0, 50.0), 0.0, 1);
-        let pair = PupilPair::from_observations(&[obs]).expect("a pair is present");
+        let pair = PupilPair::from_observations(&[obs], 3.0).expect("a pair is present");
 
         let rays = estimator.rays(&pair, cam, &EYE_CENTRES);
         let expected = Matrix3::from_diagonal(&Vector3::new(25.25, 25.25, 27.25));
@@ -934,5 +981,116 @@ mod tests {
             assert_eq!(ray.timestamp, obs.timestamp);
             assert_eq!(ray.head_rotation, None);
         }
+    }
+
+    #[test]
+    fn test_ir_pupil_seeded_anchor_replaces_screen_centre_assumption() {
+        let rig = test_rig();
+        let mut estimator = IrPupilEstimator::new(IrPupilOptions {
+            apply_kappa: false,
+            ..Default::default()
+        });
+        let cov = Matrix3::from_diagonal(&Vector3::new(0.25, 0.25, 2.25));
+        estimator.seed_anchor(
+            [
+                EyeCentre {
+                    position: EYE_CENTRES[0],
+                    cov,
+                },
+                EyeCentre {
+                    position: EYE_CENTRES[1],
+                    cov,
+                },
+            ],
+            UnitQuaternion::identity(),
+        );
+        let obs = synthetic_ir_observation(&rig, Point2::new(0.0, 0.0), Vector3::zeros(), 0.0, 1);
+
+        let rays = estimator
+            .estimate_rays(&[obs], &rig)
+            .expect("estimate succeeds");
+
+        assert_eq!(estimator.last_reanchor, Some(Trigger::Seeded));
+        assert_eq!(rays.len(), 2);
+        for ray in &rays {
+            let hit = intersect_plane(&ray.origin, &ray.direction).expect("ray hits the screen");
+            assert!(
+                (hit - Point2::new(0.0, 0.0)).norm() < 1.0,
+                "hit {hit:?} not within 1 mm of the seeded target"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ir_pupil_uses_glint_ray_when_pair_carries_glint() {
+        let rig = test_rig();
+        let target = Point2::new(100.0, 50.0);
+        let obs = synthetic_pccr_observation(&rig, target, Vector3::zeros(), 0.0, 0.0, 1);
+        let pair = PupilPair::from_observations(std::slice::from_ref(&obs), 3.0)
+            .expect("a pair is present");
+        assert!(
+            pair.right_glint.is_some(),
+            "synthetic glint is near the pupil"
+        );
+
+        let displaced = Vector3::new(3.0, 0.0, 0.0);
+        let cov = Matrix3::zeros();
+        let seed = |estimator: &mut IrPupilEstimator| {
+            estimator.seed_anchor(
+                [
+                    EyeCentre {
+                        position: EYE_CENTRES[0] + displaced,
+                        cov,
+                    },
+                    EyeCentre {
+                        position: EYE_CENTRES[1] + displaced,
+                        cov,
+                    },
+                ],
+                UnitQuaternion::identity(),
+            );
+        };
+        let true_direction =
+            Unit::new_normalize(Point3::new(target.x, target.y, 0.0) - EYE_CENTRES[0]);
+
+        let mut with_glint = IrPupilEstimator::new(IrPupilOptions {
+            apply_kappa: false,
+            ..Default::default()
+        });
+        seed(&mut with_glint);
+        let rays_with_glint = with_glint
+            .estimate_rays(std::slice::from_ref(&obs), &rig)
+            .expect("estimate succeeds");
+        let error_with_glint = angle_deg(&rays_with_glint[0].direction, &true_direction);
+
+        let mut stripped = obs;
+        for eye in stripped
+            .face
+            .as_mut()
+            .expect("face present")
+            .eyes
+            .iter_mut()
+        {
+            eye.glints.clear();
+        }
+        let mut without_glint = IrPupilEstimator::new(IrPupilOptions {
+            apply_kappa: false,
+            ..Default::default()
+        });
+        seed(&mut without_glint);
+        let rays_without_glint = without_glint
+            .estimate_rays(&[stripped], &rig)
+            .expect("estimate succeeds");
+        let error_without_glint = angle_deg(&rays_without_glint[0].direction, &true_direction);
+
+        assert!(
+            error_with_glint < 0.2,
+            "glint ray error {error_with_glint} deg too large for a 3 mm anchor offset"
+        );
+        assert!(
+            error_without_glint > 12.0,
+            "pupil-sphere ray error {error_without_glint} deg should be large for a 3 mm anchor \
+             offset, to show the glint ray is what recovers accuracy"
+        );
     }
 }

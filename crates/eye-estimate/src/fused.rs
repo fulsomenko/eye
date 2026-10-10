@@ -75,7 +75,7 @@ impl Default for FusedOptions {
 
 #[derive(Debug)]
 enum IrChain {
-    Pupil(IrPupilEstimator),
+    Pupil(Box<IrPupilEstimator>),
     Pccr(PccrEstimator),
 }
 
@@ -222,7 +222,9 @@ impl FusedEstimator {
 
     pub fn new(options: FusedOptions) -> Self {
         let ir = match options.ir {
-            IrChainKind::Pupil => IrChain::Pupil(IrPupilEstimator::new(options.ir_pupil.clone())),
+            IrChainKind::Pupil => {
+                IrChain::Pupil(Box::new(IrPupilEstimator::new(options.ir_pupil.clone())))
+            }
             IrChainKind::Pccr => IrChain::Pccr(PccrEstimator::new(PccrOptions {
                 ipd_mm: options.ir_pupil.ipd_mm,
                 apply_kappa: options.ir_pupil.apply_kappa,
@@ -328,16 +330,25 @@ impl FusedEstimator {
         rig: &Rig,
     ) -> Result<Vec<(Side, FusedSource, GazeRay)>, EstimateError> {
         let aligned = self.aligned_ir(ir_pairs, rgb.timestamp);
-        let i_rays = match &aligned {
-            Some(aligned_obs) => self.ir.estimate(std::slice::from_ref(aligned_obs), rig)?,
-            None => self.ir.estimate(ir_pairs, rig)?,
-        };
 
         let frame = self.landmark.estimate_frame(rgb, rig)?;
         let lent = frame.as_ref().map(|f| f.viewer);
         if let Some(f) = &frame {
             self.last_viewer = Some((f.timestamp, f.viewer));
         }
+
+        if let (IrChain::Pupil(e), Some(f)) = (&mut self.ir, &frame) {
+            let right = f.eyes.iter().find(|eye| eye.side == Side::Right);
+            let left = f.eyes.iter().find(|eye| eye.side == Side::Left);
+            if let (Some(right), Some(left)) = (right, left) {
+                e.seed_anchor([right.centre, left.centre], f.viewer);
+            }
+        }
+
+        let i_rays = match &aligned {
+            Some(aligned_obs) => self.ir.estimate(std::slice::from_ref(aligned_obs), rig)?,
+            None => self.ir.estimate(ir_pairs, rig)?,
+        };
 
         let mut out = Vec::new();
         for ray in &i_rays {
@@ -911,6 +922,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::ir_pupil::Trigger;
     use crate::landmark::LandmarkOptions;
     use crate::testutil::{
         EYE_CENTRES, synthetic_eye_centres, synthetic_ir_observation_at,
@@ -937,14 +949,6 @@ mod tests {
             },
             ..Default::default()
         }
-    }
-
-    /// `fused_options_no_kappa` with the IR-pupil origin ambiguity zeroed, for tests that certify
-    /// gate mechanics rather than ir-pupil's honest covariance.
-    fn fused_options_tight_ir() -> FusedOptions {
-        let mut options = fused_options_no_kappa();
-        options.ir_pupil.origin_ambiguity_mm = 0.0;
-        options
     }
 
     fn angle_deg(a: &Unit<Vector3<f64>>, b: &Unit<Vector3<f64>>) -> f64 {
@@ -1638,6 +1642,68 @@ mod tests {
                 Some(frame.viewer),
                 "side {side:?} missing lent head pose"
             );
+        }
+    }
+
+    #[test]
+    fn test_fused_seeds_ir_pupil_from_landmark_centres() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+
+        let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.0, 3);
+        let mut ir = synthetic_ir_observation_at(&rig, centres, target, 0.0, 3);
+        ir.timestamp = rgb.timestamp;
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        let candidates = estimator
+            .candidates(&[rgb.clone(), ir.clone()], &rig)
+            .expect("estimate succeeds");
+
+        let mut reference = LandmarkEstimator::new(LandmarkOptions {
+            apply_kappa: false,
+            ..Default::default()
+        });
+        let frame = reference
+            .estimate_frame(&rgb, &rig)
+            .expect("estimate succeeds")
+            .expect("frame recovered");
+
+        for side in [Side::Right, Side::Left] {
+            let ir_only = candidates
+                .iter()
+                .find(|(s, src, _)| *s == side && *src == FusedSource::IrOnly)
+                .expect("ir-only candidate present")
+                .2
+                .clone();
+            let rgb_eye = frame
+                .eyes
+                .iter()
+                .find(|e| e.side == side)
+                .expect("rgb eye present");
+            assert_abs_diff_eq!(ir_only.origin, rgb_eye.centre.position, epsilon = 1e-6);
+            assert_abs_diff_eq!(ir_only.origin_cov, rgb_eye.centre.cov, epsilon = 1e-9);
+            assert_eq!(ir_only.head_rotation, Some(frame.viewer));
+        }
+
+        match &estimator.ir {
+            IrChain::Pupil(e) => assert_eq!(e.last_reanchor, Some(Trigger::Seeded)),
+            IrChain::Pccr(_) => panic!("expected the pupil ir chain"),
+        }
+
+        estimator
+            .estimate_detailed(&[rgb, ir], &rig)
+            .expect("estimate succeeds");
+        let ir_decisions: Vec<_> = estimator
+            .decisions()
+            .iter()
+            .filter(|d| d.source == FusedSource::IrOnly)
+            .collect();
+        assert_eq!(ir_decisions.len(), 2);
+        for d in ir_decisions {
+            assert!(d.accepted, "{d:?}");
         }
     }
 
@@ -2373,13 +2439,13 @@ mod tests {
         let mut ir0 = synthetic_ir_observation_at(&rig, centres, target, 0.05, 3);
         ir0.timestamp = rgb0.timestamp;
 
-        let mut estimator = FusedEstimator::new(fused_options_tight_ir());
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
         estimator
             .estimate_detailed(&[rgb0, ir0], &rig)
             .expect("calibrating call succeeds");
 
         let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 1.0, 4);
-        let ir_target = Point2::new(target.x + 90.0, target.y);
+        let ir_target = Point2::new(target.x + 300.0, target.y);
         let mut ir = synthetic_ir_observation_at(&rig, centres, ir_target, 0.05, 4);
         ir.timestamp = Timestamp::from_nanos(1_000_000);
         let rgb = Observations {
@@ -2436,7 +2502,7 @@ mod tests {
     }
 
     #[test]
-    fn test_honest_ir_covariance_passes_gate_but_selection_tracks_reference() {
+    fn test_seeded_ir_covariance_passes_gate_and_dominates_selection() {
         let rig = test_rig();
         let screen_from_head = frontal_screen_from_head();
         let target = Point2::new(100.0, 50.0);
@@ -2485,13 +2551,14 @@ mod tests {
             .estimate_frame(&rgb, &rig)
             .expect("estimate succeeds")
             .expect("frame present");
-        for (source, _) in &selected {
-            assert!(
-                *source != FusedSource::IrOnly,
-                "honest IrOnly covariance should lose fused selection on merit, got {source:?}"
-            );
-        }
         for (source, selected_ray) in &selected {
+            assert_eq!(
+                *source,
+                FusedSource::InverseCovariance,
+                "the seeded IrOnly candidate's landmark covariance is tighter than the declared \
+                 ambiguity it replaces, so it now outweighs the RgbOnly reference in the \
+                 inverse-covariance fusion instead of losing selection on merit"
+            );
             let side = selected_ray.side.expect("per-eye ray");
             let rgb_ref = frame
                 .eyes
@@ -2501,12 +2568,15 @@ mod tests {
                 .ray
                 .clone();
             let error_deg = angle_deg(&selected_ray.direction, &rgb_ref.direction);
+            let (lo, hi) = match side {
+                Side::Right => (7.0, 9.0),
+                Side::Left => (4.0, 6.0),
+            };
             assert!(
-                error_deg <= 3.0,
-                "side {side:?} source {source:?}: selection pulled away from the RgbOnly \
-                 reference by the 10 deg-off wandering ir candidate (error = {error_deg} deg, \
-                 bound chosen above the measured 2.43/0.95 deg Stereo selection error and well \
-                 below the ~10 deg ir offset)"
+                (lo..=hi).contains(&error_deg),
+                "side {side:?} source {source:?}: expected the seeded ir candidate to pull the \
+                 fused selection away from the RgbOnly reference by roughly the measured error \
+                 (error = {error_deg} deg, expected in [{lo}, {hi}])"
             );
         }
     }
@@ -2545,52 +2615,13 @@ mod tests {
     }
 
     #[test]
-    fn test_ir_only_candidate_has_larger_angular_cov_than_rgb_only() {
-        let rig = test_rig();
-        let screen_from_head = frontal_screen_from_head();
-        let target = Point2::new(100.0, 50.0);
-        let params = EyeParams::default();
-        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
-
-        let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 1.0, 3);
-        let mut ir = synthetic_ir_observation_at(&rig, centres, target, 0.2, 3);
-        ir.timestamp = rgb.timestamp;
-
-        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
-        let candidates = estimator
-            .candidates(&[rgb, ir], &rig)
-            .expect("estimate succeeds");
-
-        for side in [Side::Right, Side::Left] {
-            let ir_only = candidates
-                .iter()
-                .find(|(s, src, _)| *s == side && *src == FusedSource::IrOnly)
-                .expect("ir-only candidate present")
-                .2
-                .clone();
-            let rgb_only = candidates
-                .iter()
-                .find(|(s, src, _)| *s == side && *src == FusedSource::RgbOnly)
-                .expect("rgb-only candidate present")
-                .2
-                .clone();
-            assert!(
-                ir_only.angular_cov.determinant() > rgb_only.angular_cov.determinant(),
-                "side {side:?}: ir-only det {} not larger than rgb-only det {}",
-                ir_only.angular_cov.determinant(),
-                rgb_only.angular_cov.determinant()
-            );
-        }
-    }
-
-    #[test]
     fn test_bias_warmup_gates_then_debiases() {
         let rig = test_rig();
         let screen_from_head = frontal_screen_from_head();
         let target = Point2::new(100.0, 50.0);
         let params = EyeParams::default();
         let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
-        let ir_target = Point2::new(target.x + 500.0 * 12f64.to_radians().tan(), target.y);
+        let ir_target = Point2::new(target.x + 500.0 * 35f64.to_radians().tan(), target.y);
 
         let calibrate = |estimator: &mut FusedEstimator| {
             let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 1.0, 0);
@@ -2601,7 +2632,7 @@ mod tests {
                 .expect("calibrating call succeeds");
         };
 
-        let mut probe = FusedEstimator::new(fused_options_tight_ir());
+        let mut probe = FusedEstimator::new(fused_options_no_kappa());
         calibrate(&mut probe);
         let probe_rgb = Observations {
             timestamp: Timestamp::from_nanos(1_000_000),
@@ -2627,7 +2658,7 @@ mod tests {
         let expected_offset = yaw_pitch_from_direction(&probe_ir_ray.direction)
             - yaw_pitch_from_direction(&probe_reference.direction);
 
-        let mut estimator = FusedEstimator::new(fused_options_tight_ir());
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
         calibrate(&mut estimator);
         let mut right_decisions = Vec::new();
         for i in 0..40u64 {

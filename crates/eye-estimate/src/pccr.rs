@@ -56,7 +56,7 @@ impl PccrEstimator {
         obs: &[Observations],
         rig: &Rig,
     ) -> Result<Vec<GazeRay>, EstimateError> {
-        let Some(pair) = PupilPair::from_observations(obs) else {
+        let Some(pair) = PupilPair::from_observations(obs, self.options.max_glint_offset_px) else {
             tracing::debug!(
                 { field::REASON } = "no_pupil_pair",
                 observations = obs.len() as u64,

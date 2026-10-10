@@ -15,11 +15,14 @@ pub struct PupilPair {
     pub timestamp: Timestamp,
     pub right: Measured<Point2<f64>>,
     pub left: Measured<Point2<f64>>,
+    /// The glint within `max_glint_offset_px` of `right`/`left`, if any.
+    pub right_glint: Option<Measured<Point2<f64>>>,
+    pub left_glint: Option<Measured<Point2<f64>>>,
 }
 
 impl PupilPair {
     /// Every `ir-pupil-pair` observation with both pupils, sorted by timestamp.
-    pub fn all_from_observations(obs: &[Observations]) -> Vec<PupilPair> {
+    pub fn all_from_observations(obs: &[Observations], max_glint_offset_px: f64) -> Vec<PupilPair> {
         let mut pairs: Vec<PupilPair> = obs
             .iter()
             .filter_map(|o| {
@@ -40,11 +43,19 @@ impl PupilPair {
                     );
                     return None;
                 };
+                let right_glint = face
+                    .eye(Side::Right)
+                    .and_then(|e| glint_near(e, Side::Right, right.value(), max_glint_offset_px));
+                let left_glint = face
+                    .eye(Side::Left)
+                    .and_then(|e| glint_near(e, Side::Left, left.value(), max_glint_offset_px));
                 Some(PupilPair {
                     camera: o.camera.clone(),
                     timestamp: o.timestamp,
                     right,
                     left,
+                    right_glint,
+                    left_glint,
                 })
             })
             .collect();
@@ -53,8 +64,8 @@ impl PupilPair {
     }
 
     /// The latest of those (dual mode delivers the bracketing previous and next lit frames, R30).
-    pub fn from_observations(obs: &[Observations]) -> Option<PupilPair> {
-        let mut pairs = Self::all_from_observations(obs);
+    pub fn from_observations(obs: &[Observations], max_glint_offset_px: f64) -> Option<PupilPair> {
+        let mut pairs = Self::all_from_observations(obs, max_glint_offset_px);
         pairs.pop()
     }
 }
@@ -146,7 +157,8 @@ mod tests {
         let cam = rig.camera("ir").expect("rig has an ir camera");
         let target = Point2::new(155.0, 85.0);
         let obs = synthetic_ir_observation(&rig, target, Vector3::zeros(), 0.0, 1);
-        let pair = PupilPair::from_observations(&[obs]).expect("synthetic observation is a pair");
+        let pair =
+            PupilPair::from_observations(&[obs], 3.0).expect("synthetic observation is a pair");
         let x = binocular_pupils(cam, &pair, 63.0).expect("pupils are separated");
 
         let r = EyeParams::default().rotation_to_pupil_mm;
@@ -174,6 +186,8 @@ mod tests {
             timestamp: Timestamp::from_nanos(0),
             right: pixel,
             left: pixel,
+            right_glint: None,
+            left_glint: None,
         };
         assert!(binocular_pupils(cam, &pair, 63.0).is_none());
     }
@@ -188,6 +202,8 @@ mod tests {
             timestamp: Timestamp::from_nanos(0),
             right: pixel,
             left: pixel,
+            right_glint: None,
+            left_glint: None,
         };
 
         let (result, logs) =
@@ -227,7 +243,7 @@ mod tests {
         };
 
         let (pairs, logs) = capture_logs(tracing::Level::DEBUG, || {
-            PupilPair::all_from_observations(&[obs])
+            PupilPair::all_from_observations(&[obs], 3.0)
         });
 
         assert!(pairs.is_empty());
@@ -263,12 +279,12 @@ mod tests {
         };
         let obs = [second.clone(), rgb, first.clone()];
 
-        let all = PupilPair::all_from_observations(&obs);
+        let all = PupilPair::all_from_observations(&obs, 3.0);
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].timestamp, first.timestamp);
         assert_eq!(all[1].timestamp, second.timestamp);
 
-        let latest = PupilPair::from_observations(&obs).expect("a pair is present");
+        let latest = PupilPair::from_observations(&obs, 3.0).expect("a pair is present");
         assert_eq!(latest.timestamp, second.timestamp);
     }
 }
