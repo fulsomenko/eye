@@ -114,15 +114,15 @@ pub fn visual_axis(
     screen_from_viewer: &UnitQuaternion<f64>,
 ) -> Unit<Vector3<f64>> {
     let local = Unit::new_normalize(screen_from_viewer.inverse_transform_vector(optical));
-    let a = yaw_pitch_from_direction(&local);
     let s = match side {
         Side::Right => -1.0,
         Side::Left => 1.0,
     };
-    let shifted = direction_from_yaw_pitch(&Vector2::new(
-        a.x + s * kappa.alpha_rad,
-        a.y + kappa.beta_rad,
-    ));
+    let primary = Vector3::z();
+    let listing =
+        UnitQuaternion::rotation_between(&primary, &local).unwrap_or_else(UnitQuaternion::identity);
+    let kappa_dir = direction_from_yaw_pitch(&Vector2::new(s * kappa.alpha_rad, kappa.beta_rad));
+    let shifted = listing * kappa_dir.into_inner();
     Unit::new_normalize(screen_from_viewer.transform_vector(&shifted))
 }
 
@@ -355,6 +355,87 @@ mod tests {
         let angles = yaw_pitch_from_direction(&axis);
         assert_abs_diff_eq!(angles.x, 1.5f64.to_radians(), epsilon = 1e-3);
         assert_abs_diff_eq!(angles.y, 5f64.to_radians(), epsilon = 1e-3);
+    }
+
+    fn additive_visual_axis(
+        optical: &Unit<Vector3<f64>>,
+        kappa: &Kappa,
+        side: Side,
+        screen_from_viewer: &UnitQuaternion<f64>,
+    ) -> Unit<Vector3<f64>> {
+        let local = Unit::new_normalize(screen_from_viewer.inverse_transform_vector(optical));
+        let a = yaw_pitch_from_direction(&local);
+        let s = match side {
+            Side::Right => -1.0,
+            Side::Left => 1.0,
+        };
+        let shifted = direction_from_yaw_pitch(&Vector2::new(
+            a.x + s * kappa.alpha_rad,
+            a.y + kappa.beta_rad,
+        ));
+        Unit::new_normalize(screen_from_viewer.transform_vector(&shifted))
+    }
+
+    #[test]
+    fn test_visual_axis_listing_matches_additive_on_yaw_axis() {
+        let params = EyeParams::default();
+        let r_v = UnitQuaternion::identity();
+        let optical = direction_from_yaw_pitch(&Vector2::new(20f64.to_radians(), 0.0));
+
+        let listing = visual_axis(&optical, &params.kappa, Side::Right, &r_v);
+        let additive = additive_visual_axis(&optical, &params.kappa, Side::Right, &r_v);
+
+        let angle_diff = listing.dot(&additive).clamp(-1.0, 1.0).acos();
+        assert_abs_diff_eq!(angle_diff, 0.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_visual_axis_listing_differs_from_additive_on_pitch_axis() {
+        let params = EyeParams::default();
+        let r_v = UnitQuaternion::identity();
+        let optical = direction_from_yaw_pitch(&Vector2::new(0.0, 20f64.to_radians()));
+
+        let listing = visual_axis(&optical, &params.kappa, Side::Right, &r_v);
+        let additive = additive_visual_axis(&optical, &params.kappa, Side::Right, &r_v);
+
+        let angle_diff = listing.dot(&additive).clamp(-1.0, 1.0).acos();
+        assert_abs_diff_eq!(
+            angle_diff,
+            0.354f64.to_radians(),
+            epsilon = 0.02f64.to_radians()
+        );
+    }
+
+    #[test]
+    fn test_visual_axis_listing_differs_from_additive_off_axes() {
+        let params = EyeParams::default();
+        let r_v = UnitQuaternion::identity();
+
+        let optical =
+            direction_from_yaw_pitch(&Vector2::new(25f64.to_radians(), 25f64.to_radians()));
+        let listing = visual_axis(&optical, &params.kappa, Side::Right, &r_v);
+        let additive = additive_visual_axis(&optical, &params.kappa, Side::Right, &r_v);
+        let angle_diff = listing.dot(&additive).clamp(-1.0, 1.0).acos();
+        assert_abs_diff_eq!(
+            angle_diff,
+            0.534f64.to_radians(),
+            epsilon = 0.05f64.to_radians()
+        );
+
+        let optical_swapped =
+            direction_from_yaw_pitch(&Vector2::new(-25f64.to_radians(), 25f64.to_radians()));
+        let listing_swapped = visual_axis(&optical_swapped, &params.kappa, Side::Right, &r_v);
+        let additive_swapped =
+            additive_visual_axis(&optical_swapped, &params.kappa, Side::Right, &r_v);
+        let angle_diff_swapped = listing_swapped
+            .dot(&additive_swapped)
+            .clamp(-1.0, 1.0)
+            .acos();
+        assert_abs_diff_eq!(
+            angle_diff_swapped,
+            0.869f64.to_radians(),
+            epsilon = 0.05f64.to_radians()
+        );
     }
 
     #[test]

@@ -712,22 +712,22 @@ mod tests {
         assert_abs_diff_eq!(
             angles_kappa[0].x - angles_plain[0].x,
             -5f64.to_radians(),
-            epsilon = 1e-9
+            epsilon = 1e-3
         );
         assert_abs_diff_eq!(
             angles_kappa[1].x - angles_plain[1].x,
             5f64.to_radians(),
-            epsilon = 1e-9
+            epsilon = 1e-3
         );
         assert_abs_diff_eq!(
             angles_kappa[0].y - angles_plain[0].y,
             1.5f64.to_radians(),
-            epsilon = 1e-9
+            epsilon = 1e-3
         );
         assert_abs_diff_eq!(
             angles_kappa[1].y - angles_plain[1].y,
             1.5f64.to_radians(),
-            epsilon = 1e-9
+            epsilon = 1e-3
         );
     }
 
