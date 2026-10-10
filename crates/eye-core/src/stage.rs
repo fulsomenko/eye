@@ -1,4 +1,7 @@
-use crate::{FrameSet, GazePoint, GazeRay, Illumination, Observations, PixelFormat, Rig};
+use crate::{
+    FrameSet, GazePoint, GazeRay, Illumination, Observations, PixelFormat, RaySource, Rig,
+    SourcedRay,
+};
 
 pub use crate::sink::{GazeSink, SinkError};
 
@@ -61,13 +64,34 @@ pub trait Detector: Send {
 /// Observations to gaze rays in the screen frame (R1).
 pub trait GazeEstimator: Send {
     fn name(&self) -> &'static str;
-    fn estimate(&mut self, obs: &[Observations], rig: &Rig) -> Result<Vec<GazeRay>, StageError>;
+    /// Uncorrected candidate rays, each tagged with the model that produced it. Independent of
+    /// any user correction, so the pipeline can cache a batch and select from it again.
+    fn estimate(&mut self, obs: &[Observations], rig: &Rig) -> Result<Vec<SourcedRay>, StageError>;
+    /// The rays to intersect with the screen, chosen from one batch's candidates after applying
+    /// `correction`. Default: every candidate, corrected where the correction has an entry and
+    /// unchanged otherwise (an estimator with one source emits at most one candidate per side).
+    fn select(
+        &mut self,
+        candidates: &[SourcedRay],
+        correction: Option<&dyn GazeCorrection>,
+    ) -> Vec<GazeRay> {
+        candidates
+            .iter()
+            .map(|c| {
+                correction
+                    .and_then(|k| k.correct(c.source, &c.ray))
+                    .unwrap_or_else(|| c.ray.clone())
+            })
+            .collect()
+    }
+    /// Drops selection state that depends on the correction; `Pipeline::set_correction` calls it.
+    fn reset_selection(&mut self) {}
 }
 
-/// Per-user correction of a ray. Infallible: an implementation that cannot correct a ray
-/// returns it unchanged.
+/// Per-user correction of a ray from one source.
 pub trait GazeCorrection: Send {
-    fn correct(&self, ray: &GazeRay) -> GazeRay;
+    /// `None` when there is no correction for `(ray.side, source)` or the ray cannot be corrected.
+    fn correct(&self, source: RaySource, ray: &GazeRay) -> Option<GazeRay>;
 }
 
 /// Temporal filter over screen points.
@@ -126,19 +150,22 @@ mod tests {
             &mut self,
             obs: &[Observations],
             _rig: &Rig,
-        ) -> Result<Vec<GazeRay>, StageError> {
+        ) -> Result<Vec<SourcedRay>, StageError> {
             if obs.is_empty() {
                 return Ok(vec![]);
             }
-            Ok(vec![GazeRay {
-                side: None,
-                timestamp: obs[0].timestamp,
-                origin: Point3::new(155.0, 85.0, -500.0),
-                direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
-                angular_cov: Matrix2::zeros(),
-                origin_cov: Matrix3::zeros(),
-                head_rotation: None,
-            }])
+            Ok(SourcedRay::tag(
+                RaySource::RgbOnly,
+                vec![GazeRay {
+                    side: None,
+                    timestamp: obs[0].timestamp,
+                    origin: Point3::new(155.0, 85.0, -500.0),
+                    direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
+                    angular_cov: Matrix2::zeros(),
+                    origin_cov: Matrix3::zeros(),
+                    head_rotation: None,
+                }],
+            ))
         }
     }
 
@@ -146,10 +173,24 @@ mod tests {
     struct ShiftCorrection(f64);
 
     impl GazeCorrection for ShiftCorrection {
-        fn correct(&self, ray: &GazeRay) -> GazeRay {
+        fn correct(&self, _source: RaySource, ray: &GazeRay) -> Option<GazeRay> {
             let mut shifted = ray.clone();
             shifted.origin.x += self.0;
-            shifted
+            Some(shifted)
+        }
+    }
+
+    #[derive(Debug)]
+    struct RgbOnlyShift(f64);
+
+    impl GazeCorrection for RgbOnlyShift {
+        fn correct(&self, source: RaySource, ray: &GazeRay) -> Option<GazeRay> {
+            if source != RaySource::RgbOnly {
+                return None;
+            }
+            let mut shifted = ray.clone();
+            shifted.origin.x += self.0;
+            Some(shifted)
         }
     }
 
@@ -274,7 +315,9 @@ mod tests {
         assert_eq!(rays.len(), 1);
 
         let correction = ShiftCorrection(2.0);
-        let shifted = correction.correct(&rays[0]);
+        let shifted = correction
+            .correct(RaySource::RgbOnly, &rays[0].ray)
+            .unwrap();
         approx::assert_abs_diff_eq!(shifted.origin.x, 157.0, epsilon = 1e-12);
 
         let mut filter = CountingFilter { applied: 0 };
@@ -318,5 +361,52 @@ mod tests {
                 .is_some()
         );
         assert!(StageError::Closed.source().is_none());
+    }
+
+    fn fixed_ray(x: f64) -> GazeRay {
+        GazeRay {
+            side: None,
+            timestamp: Timestamp::from_nanos(0),
+            origin: Point3::new(x, 85.0, -500.0),
+            direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
+            angular_cov: Matrix2::zeros(),
+            origin_cov: Matrix3::zeros(),
+            head_rotation: None,
+        }
+    }
+
+    #[test]
+    fn test_sourced_ray_tag_keeps_order() {
+        let tagged = SourcedRay::tag(RaySource::IrOnly, vec![fixed_ray(1.0), fixed_ray(2.0)]);
+        assert_eq!(tagged.len(), 2);
+        assert_eq!(tagged[0].source, RaySource::IrOnly);
+        assert_eq!(tagged[0].ray.origin.x, 1.0);
+        assert_eq!(tagged[1].source, RaySource::IrOnly);
+        assert_eq!(tagged[1].ray.origin.x, 2.0);
+    }
+
+    #[test]
+    fn test_default_select_corrects_each_candidate_by_source() {
+        let mut estimator = FixedEstimator;
+        let candidates = vec![
+            SourcedRay {
+                source: RaySource::RgbOnly,
+                ray: fixed_ray(155.0),
+            },
+            SourcedRay {
+                source: RaySource::IrOnly,
+                ray: fixed_ray(200.0),
+            },
+        ];
+
+        let correction = RgbOnlyShift(2.0);
+        let selected = estimator.select(&candidates, Some(&correction));
+        assert_eq!(selected.len(), 2);
+        approx::assert_abs_diff_eq!(selected[0].origin.x, 157.0, epsilon = 1e-12);
+        approx::assert_abs_diff_eq!(selected[1].origin.x, 200.0, epsilon = 1e-12);
+
+        let unselected = estimator.select(&candidates, None);
+        approx::assert_abs_diff_eq!(unselected[0].origin.x, 155.0, epsilon = 1e-12);
+        approx::assert_abs_diff_eq!(unselected[1].origin.x, 200.0, epsilon = 1e-12);
     }
 }

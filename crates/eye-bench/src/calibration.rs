@@ -3,11 +3,10 @@
 
 use eye::pipeline::RayBatch;
 use eye_calibration::correction::UserProfile;
-use eye_calibration::correction::legacy_source;
 use eye_calibration::protocol::FixationWindow;
 use eye_calibration::user_fit::{DotSessionFit, FitConfig, FitSample, ProfileMeta};
 use eye_core::log::{field, span};
-use eye_core::{GazePoint, RaySource, Rig};
+use eye_core::{GazePoint, GazeRay, Rig, SourcedRay};
 
 use crate::metrics::EvalInput;
 use crate::runner::{Replayed, SessionRun, eval_input, window_at};
@@ -43,27 +42,27 @@ pub fn latest_presentation(
     }
 }
 
-/// Every uncorrected ray whose own `timestamp` lies in a window selected by `include`, with
-/// that window's `target_mm`; the rays of one batch may land in different windows.
+/// Every uncorrected candidate whose own `timestamp` lies in a window selected by `include`,
+/// with that window's `target_mm` and its own source; the candidates of one batch may land in
+/// different windows.
 pub fn fit_samples<'a>(
     windows: &[FixationWindow],
     batches: impl IntoIterator<Item = &'a RayBatch>,
     include: impl Fn(&FixationWindow) -> bool,
-    source: RaySource,
 ) -> Vec<FitSample> {
     let mut out = Vec::new();
     for batch in batches {
-        for ray in &batch.rays {
-            let Some(w) = window_at(windows, ray.timestamp)
+        for c in &batch.candidates {
+            let Some(w) = window_at(windows, c.ray.timestamp)
                 .map(|i| &windows[i])
                 .filter(|w| include(w))
             else {
                 continue;
             };
             out.push(FitSample {
-                ray: ray.clone(),
+                ray: c.ray.clone(),
                 target_mm: w.target_mm,
-                source,
+                source: c.source,
             });
         }
     }
@@ -100,19 +99,21 @@ pub fn evaluate_with(
         .pipeline
         .set_correction(Some(Box::new(profile.clone())));
 
-    let mut kept: Vec<(&RayBatch, GazePoint)> = Vec::new();
+    let mut kept: Vec<(Vec<GazeRay>, Vec<SourcedRay>, GazePoint)> = Vec::new();
     for step in &replayed.run.steps {
         let Some(batch) = &step.batch else { continue };
-        let Some(point) = replayed.pipeline.finish(batch) else {
+        let finished = replayed.pipeline.finish_detailed(batch);
+        let Some(point) = finished.point else {
             continue;
         };
-        kept.push((batch, point));
+        kept.push((finished.rays, batch.candidates.clone(), point));
     }
 
     let input = eval_input(
         &replayed.run.rig,
         windows,
-        kept.iter().map(|(batch, point)| (*batch, point)),
+        kept.iter()
+            .map(|(rays, candidates, point)| (rays.as_slice(), candidates.as_slice(), point)),
         replayed.run.processing(),
     );
 
@@ -131,7 +132,6 @@ pub fn cross(
         return Err("cross needs at least two recordings".to_string());
     }
 
-    let source = legacy_source(held_out.pipeline.estimator_name());
     let mut train = Vec::new();
     for other in others {
         let base_len = other.protocol.grid[0] * other.protocol.grid[1];
@@ -139,7 +139,6 @@ pub fn cross(
             &other.windows,
             other.steps.iter().filter_map(|s| s.batch.as_ref()),
             latest_presentation(&other.windows, base_len),
-            source,
         ));
     }
 
@@ -171,7 +170,6 @@ pub fn loto_with(
     .entered();
 
     let excluded_windows = replayed.run.windows.iter().filter(|w| !include(w)).count();
-    let source = legacy_source(replayed.pipeline.estimator_name());
 
     let mut warnings = Vec::new();
     let mut eval_windows = Vec::new();
@@ -183,7 +181,6 @@ pub fn loto_with(
             &replayed.run.windows,
             replayed.run.steps.iter().filter_map(|s| s.batch.as_ref()),
             |w| include(w) && position_key(w) != key,
-            source,
         );
         let profile = match fitter(&train, &replayed.run.rig) {
             Ok(profile) => profile,
@@ -276,6 +273,7 @@ mod tests {
     use approx::assert_relative_eq;
     use eye_calibration::protocol::ProtocolConfig;
     use eye_core::log::field;
+    use eye_core::{RaySource, SourcedRay};
     use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
     use eye_log::testing::capture_logs;
     use nalgebra::{Point2, Point3, Unit, Vector2};
@@ -311,12 +309,7 @@ mod tests {
         .unwrap();
         let held_out_mm = replayed.run.windows[2].target_mm;
         let batches = replayed.run.steps.iter().filter_map(|s| s.batch.as_ref());
-        let samples = fit_samples(
-            &replayed.run.windows,
-            batches,
-            |w| w.index != 2,
-            RaySource::RgbOnly,
-        );
+        let samples = fit_samples(&replayed.run.windows, batches, |w| w.index != 2);
         assert!(samples.iter().all(|s| s.target_mm != held_out_mm));
         let expected: usize = replayed
             .run
@@ -328,7 +321,7 @@ mod tests {
                     .map(|i| i != 2)
                     .unwrap_or(false)
             })
-            .map(|b| b.rays.len())
+            .map(|b| b.candidates.len())
             .sum();
         assert_eq!(samples.len(), expected);
     }
@@ -351,14 +344,14 @@ mod tests {
         )
         .unwrap();
         let batches = replayed.run.steps.iter().filter_map(|s| s.batch.as_ref());
-        let samples = fit_samples(&replayed.run.windows, batches, |_| true, RaySource::RgbOnly);
+        let samples = fit_samples(&replayed.run.windows, batches, |_| true);
         let in_window: usize = replayed
             .run
             .steps
             .iter()
             .filter_map(|s| s.batch.as_ref())
             .filter(|b| window_at(&replayed.run.windows, b.timestamp).is_some())
-            .map(|b| b.rays.len())
+            .map(|b| b.candidates.len())
             .sum();
         assert_eq!(samples.len(), in_window);
         assert!(in_window < replayed.run.steps.len());
@@ -386,15 +379,52 @@ mod tests {
         };
         let batch = RayBatch {
             timestamp: eye_core::Timestamp::from_nanos(500_000_000),
-            rays: vec![ray.clone(), ray],
+            candidates: SourcedRay::tag(RaySource::RgbOnly, vec![ray.clone(), ray]),
         };
-        let samples = fit_samples(
-            std::slice::from_ref(&window),
-            [&batch],
-            |_| true,
-            RaySource::RgbOnly,
-        );
+        let samples = fit_samples(std::slice::from_ref(&window), [&batch], |_| true);
         assert_eq!(samples.len(), 2);
+        assert!(samples.iter().all(|s| s.target_mm == window.target_mm));
+    }
+
+    #[test]
+    fn test_fit_samples_carry_candidate_sources() {
+        let window = FixationWindow {
+            index: 0,
+            cell: (0, 0),
+            onset: eye_core::Timestamp::from_nanos(0),
+            start: eye_core::Timestamp::from_nanos(0),
+            end: eye_core::Timestamp::from_nanos(1_000_000_000),
+            target_mm: Point2::new(155.0, 85.0),
+            target_px_logical: Point2::new(960.0, 540.0),
+        };
+        let ray = eye_core::GazeRay {
+            side: None,
+            timestamp: eye_core::Timestamp::from_nanos(500_000_000),
+            origin: eye(),
+            direction: Unit::new_normalize(nalgebra::Vector3::new(0.0, 0.0, 1.0)),
+            origin_cov: nalgebra::Matrix3::zeros(),
+            angular_cov: nalgebra::Matrix2::identity() * 1e-6,
+            head_rotation: None,
+        };
+        let batch = RayBatch {
+            timestamp: eye_core::Timestamp::from_nanos(500_000_000),
+            candidates: vec![
+                SourcedRay {
+                    source: RaySource::RgbOnly,
+                    ray: ray.clone(),
+                },
+                SourcedRay {
+                    source: RaySource::IrOnly,
+                    ray,
+                },
+            ],
+        };
+        let samples = fit_samples(std::slice::from_ref(&window), [&batch], |_| true);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(
+            samples.iter().map(|s| s.source).collect::<Vec<_>>(),
+            vec![RaySource::RgbOnly, RaySource::IrOnly]
+        );
         assert!(samples.iter().all(|s| s.target_mm == window.target_mm));
     }
 
@@ -429,14 +459,12 @@ mod tests {
         };
         let batch = RayBatch {
             timestamp: eye_core::Timestamp::from_nanos(1_600_000_000),
-            rays: vec![ray(700_000_000), ray(1_600_000_000)],
+            candidates: SourcedRay::tag(
+                RaySource::RgbOnly,
+                vec![ray(700_000_000), ray(1_600_000_000)],
+            ),
         };
-        let samples = fit_samples(
-            &[window_a.clone(), window_b.clone()],
-            [&batch],
-            |_| true,
-            RaySource::RgbOnly,
-        );
+        let samples = fit_samples(&[window_a.clone(), window_b.clone()], [&batch], |_| true);
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].target_mm, window_a.target_mm);
         assert_eq!(samples[1].target_mm, window_b.target_mm);
@@ -860,7 +888,6 @@ mod tests {
             &replayed.run.windows,
             replayed.run.steps.iter().filter_map(|s| s.batch.as_ref()),
             |_| true,
-            RaySource::RgbOnly,
         );
         let profile = dot_session_fitter(&train, &replayed.run.rig).unwrap();
         let windows = replayed.run.windows.clone();
@@ -868,6 +895,69 @@ mod tests {
 
         let after = replayed.pipeline.finish(&first_batch);
         assert_eq!(after, first_point);
+    }
+
+    #[test]
+    fn test_evaluate_with_eval_point_rays_use_uncorrected_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let config = kappa_ray_config(&FOUR_BY_FOUR_CENTRES, [3.0, -1.0], None);
+        let mut replayed = replay_session(
+            &session_dir,
+            &config,
+            &fake_registry(),
+            &ProtocolConfig::default(),
+        )
+        .unwrap();
+        let windows = replayed.run.windows.clone();
+        let first_batch = replayed
+            .run
+            .steps
+            .iter()
+            .filter_map(|s| s.batch.clone())
+            .find(|b| window_at(&windows, b.timestamp).is_some())
+            .unwrap();
+
+        let train = fit_samples(
+            &replayed.run.windows,
+            replayed.run.steps.iter().filter_map(|s| s.batch.as_ref()),
+            |_| true,
+        );
+        let profile = dot_session_fitter(&train, &replayed.run.rig).unwrap();
+
+        let w = windows[window_at(&windows, first_batch.timestamp).unwrap()].clone();
+        let target_mm3 = Point3::new(w.target_mm.x, w.target_mm.y, 0.0);
+        let expected: Vec<_> = first_batch
+            .candidates
+            .iter()
+            .filter_map(|c| {
+                c.ray.angular_cov.try_inverse()?;
+                let to_target = Unit::new_normalize(target_mm3 - c.ray.origin);
+                let residual_rad = yaw_pitch_from_direction(&c.ray.direction)
+                    - yaw_pitch_from_direction(&to_target);
+                Some((c.ray.side, residual_rad, c.ray.angular_cov))
+            })
+            .collect();
+
+        let input = evaluate_with(&mut replayed, &profile, &windows);
+
+        let point = input
+            .windows
+            .iter()
+            .flat_map(|w| &w.points)
+            .find(|p| p.timestamp == first_batch.timestamp)
+            .expect("first batch's point was scored");
+        let actual: Vec<_> = point
+            .rays
+            .iter()
+            .map(|r| (r.side, r.residual_rad, r.angular_cov))
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]

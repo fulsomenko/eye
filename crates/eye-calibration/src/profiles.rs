@@ -721,7 +721,10 @@ foo = 1
             origin_cov: Matrix3::zeros(),
             head_rotation: None,
         };
-        assert_eq!(profile.correct(&probe), reloaded.correct(&probe));
+        assert_eq!(
+            profile.correct(RaySource::RgbOnly, &probe),
+            reloaded.correct(RaySource::RgbOnly, &probe)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

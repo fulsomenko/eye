@@ -9,7 +9,8 @@ use crossbeam_channel::Receiver;
 use eye_capture::{CaptureError, FrameSource};
 use eye_core::{
     CameraId, CameraInfo, CameraModel, Frame, FrameHeader, FrameSet, GazePoint, GazeRay, GazeSink,
-    Illumination, Observations, OutputId, PixelFormat, Rig, ScreenModel, SinkError, Timestamp,
+    Illumination, Observations, OutputId, PixelFormat, RaySource, Rig, ScreenModel, SinkError,
+    SourcedRay, Timestamp,
     stage::{Detector, GazeCorrection, GazeEstimator, GazeFilter, StageError},
 };
 use nalgebra::{Matrix2, Matrix3, Point2, Rotation3, Vector2, Vector3};
@@ -185,18 +186,25 @@ impl GazeEstimator for FakeEstimator {
         "fake"
     }
 
-    fn estimate(&mut self, obs: &[Observations], _rig: &Rig) -> Result<Vec<GazeRay>, StageError> {
-        Ok(vec![GazeRay {
-            side: None,
-            timestamp: obs
-                .first()
-                .map_or(Timestamp::from_nanos(0), |o| o.timestamp),
-            origin: nalgebra::Point3::new(155.0, 85.0, -500.0),
-            direction: Vector3::z_axis(),
-            angular_cov: Matrix2::identity() * 1e-6,
-            origin_cov: Matrix3::zeros(),
-            head_rotation: None,
-        }])
+    fn estimate(
+        &mut self,
+        obs: &[Observations],
+        _rig: &Rig,
+    ) -> Result<Vec<SourcedRay>, StageError> {
+        Ok(SourcedRay::tag(
+            RaySource::RgbOnly,
+            vec![GazeRay {
+                side: None,
+                timestamp: obs
+                    .first()
+                    .map_or(Timestamp::from_nanos(0), |o| o.timestamp),
+                origin: nalgebra::Point3::new(155.0, 85.0, -500.0),
+                direction: Vector3::z_axis(),
+                angular_cov: Matrix2::identity() * 1e-6,
+                origin_cov: Matrix3::zeros(),
+                head_rotation: None,
+            }],
+        ))
     }
 }
 
@@ -209,7 +217,11 @@ impl GazeEstimator for FailingEstimator {
         "failing"
     }
 
-    fn estimate(&mut self, _obs: &[Observations], _rig: &Rig) -> Result<Vec<GazeRay>, StageError> {
+    fn estimate(
+        &mut self,
+        _obs: &[Observations],
+        _rig: &Rig,
+    ) -> Result<Vec<SourcedRay>, StageError> {
         Err(StageError::Failed("fake estimator failure".into()))
     }
 }
@@ -219,11 +231,31 @@ impl GazeEstimator for FailingEstimator {
 pub(crate) struct YawOffset(pub f64);
 
 impl GazeCorrection for YawOffset {
-    fn correct(&self, ray: &GazeRay) -> GazeRay {
-        GazeRay {
+    fn correct(&self, _source: RaySource, ray: &GazeRay) -> Option<GazeRay> {
+        Some(GazeRay {
             direction: Rotation3::from_axis_angle(&Vector3::y_axis(), self.0) * ray.direction,
             ..ray.clone()
-        }
+        })
+    }
+}
+
+/// Behaves as [`FakeEstimator`], and counts `reset_selection` calls into `resets`.
+#[derive(Debug, Default)]
+pub(crate) struct ResetCountingEstimator {
+    pub(crate) resets: Arc<AtomicU32>,
+}
+
+impl GazeEstimator for ResetCountingEstimator {
+    fn name(&self) -> &'static str {
+        "reset-counting"
+    }
+
+    fn estimate(&mut self, obs: &[Observations], rig: &Rig) -> Result<Vec<SourcedRay>, StageError> {
+        FakeEstimator.estimate(obs, rig)
+    }
+
+    fn reset_selection(&mut self) {
+        self.resets.fetch_add(1, Ordering::SeqCst);
     }
 }
 

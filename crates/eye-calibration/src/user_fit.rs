@@ -1849,7 +1849,7 @@ mod tests {
         let mut sum_signed = Vector2::zeros();
         let mut n_total = 0usize;
         for s in &samples {
-            let corrected = boxed.correct(&s.ray);
+            let corrected = boxed.correct(s.source, &s.ray).unwrap();
             let corrected_angles = yaw_pitch_from_direction(&corrected.direction);
             let target_point = Point3::new(s.target_mm.x, s.target_mm.y, 0.0);
             let desired_dir = Unit::new_normalize(target_point - s.ray.origin);
@@ -2128,7 +2128,7 @@ mod tests {
             origin_cov: Matrix3::identity(),
             head_rotation: Some(probe_rot),
         };
-        let corrected = profile.correct(&probe_ray);
+        let corrected = profile.correct(RaySource::RgbOnly, &probe_ray).unwrap();
         let corrected_angles = yaw_pitch_from_direction(&corrected.direction);
         let desired_angles = yaw_pitch_from_direction(&true_dir);
         let err_deg = (corrected_angles - desired_angles).norm().to_degrees();

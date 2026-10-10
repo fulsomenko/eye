@@ -101,6 +101,21 @@ impl RaySource {
     }
 }
 
+/// A candidate ray tagged with the model that produced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourcedRay {
+    pub source: RaySource,
+    pub ray: GazeRay,
+}
+
+impl SourcedRay {
+    pub fn tag(source: RaySource, rays: Vec<GazeRay>) -> Vec<SourcedRay> {
+        rays.into_iter()
+            .map(|ray| SourcedRay { source, ray })
+            .collect()
+    }
+}
+
 /// Finite, symmetric (relative tolerance 1e-9) and positive semi-definite.
 pub fn validate_covariance2(cov: &Matrix2<f64>) -> Result<(), CoreError> {
     let (a, b, c, d) = (cov[(0, 0)], cov[(0, 1)], cov[(1, 0)], cov[(1, 1)]);

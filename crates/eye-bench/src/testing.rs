@@ -16,7 +16,8 @@ use eye_core::session::{TargetClock, TargetRecord};
 use eye_core::stage::{Detector, GazeEstimator, StageError};
 use eye_core::{
     CameraId, CameraInfo, CameraModel, FaceObservation, Frame, FrameHeader, FrameSet, GazeRay,
-    Illumination, Observations, OutputId, PixelFormat, Rig, ScreenModel, Timestamp,
+    Illumination, Observations, OutputId, PixelFormat, RaySource, Rig, ScreenModel, SourcedRay,
+    Timestamp,
 };
 use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
 use eye_geometry::screen::px_logical_to_mm;
@@ -286,20 +287,27 @@ impl GazeEstimator for FixedRayEstimator {
         "test-fixed-ray"
     }
 
-    fn estimate(&mut self, obs: &[Observations], _rig: &Rig) -> Result<Vec<GazeRay>, StageError> {
+    fn estimate(
+        &mut self,
+        obs: &[Observations],
+        _rig: &Rig,
+    ) -> Result<Vec<SourcedRay>, StageError> {
         let direction =
             Unit::new_normalize(Point3::new(self.toward.x, self.toward.y, 0.0) - self.origin);
-        Ok(vec![GazeRay {
-            side: None,
-            timestamp: obs
-                .first()
-                .map_or(Timestamp::from_nanos(0), |o| o.timestamp),
-            origin: self.origin,
-            direction,
-            origin_cov: Matrix3::zeros(),
-            angular_cov: Matrix2::identity() * 1e-6,
-            head_rotation: None,
-        }])
+        Ok(SourcedRay::tag(
+            RaySource::RgbOnly,
+            vec![GazeRay {
+                side: None,
+                timestamp: obs
+                    .first()
+                    .map_or(Timestamp::from_nanos(0), |o| o.timestamp),
+                origin: self.origin,
+                direction,
+                origin_cov: Matrix3::zeros(),
+                angular_cov: Matrix2::identity() * 1e-6,
+                head_rotation: None,
+            }],
+        ))
     }
 }
 
@@ -400,7 +408,11 @@ impl GazeEstimator for KappaRayEstimator {
         "test-kappa-ray"
     }
 
-    fn estimate(&mut self, obs: &[Observations], _rig: &Rig) -> Result<Vec<GazeRay>, StageError> {
+    fn estimate(
+        &mut self,
+        obs: &[Observations],
+        _rig: &Rig,
+    ) -> Result<Vec<SourcedRay>, StageError> {
         let Some(code) = obs
             .iter()
             .find_map(|o| o.face.as_ref())
@@ -427,17 +439,20 @@ impl GazeEstimator for KappaRayEstimator {
         let direction = direction_from_yaw_pitch(
             &(base + Vector2::new(off[0].to_radians(), off[1].to_radians())),
         );
-        Ok(vec![GazeRay {
-            side: None,
-            timestamp: obs
-                .first()
-                .map_or(Timestamp::from_nanos(0), |o| o.timestamp),
-            origin: self.eye,
-            direction,
-            origin_cov: Matrix3::zeros(),
-            angular_cov: Matrix2::identity() * 1e-6,
-            head_rotation: None,
-        }])
+        Ok(SourcedRay::tag(
+            RaySource::RgbOnly,
+            vec![GazeRay {
+                side: None,
+                timestamp: obs
+                    .first()
+                    .map_or(Timestamp::from_nanos(0), |o| o.timestamp),
+                origin: self.eye,
+                direction,
+                origin_cov: Matrix3::zeros(),
+                angular_cov: Matrix2::identity() * 1e-6,
+                head_rotation: None,
+            }],
+        ))
     }
 }
 

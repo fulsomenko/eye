@@ -22,7 +22,7 @@ pub use camera::{CameraId, CameraInfo, Illumination, PixelFormat};
 pub use error::CoreError;
 pub use frame::{Frame, FrameHeader, FrameSet};
 pub use gaze::{
-    GazePoint, GazeRay, OutputId, RaySource, validate_covariance2, validate_covariance3,
+    GazePoint, GazeRay, OutputId, RaySource, SourcedRay, validate_covariance2, validate_covariance3,
 };
 pub use observation::{
     Ellipse2, EyeCorners, EyeObservation, FaceObservation, Measured, Observations, Side,

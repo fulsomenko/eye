@@ -1,6 +1,6 @@
 use eye_core::log::field;
 use eye_core::stage::{GazeEstimator, StageError};
-use eye_core::{GazeRay, Measured, Observations, Rig, Side};
+use eye_core::{GazeRay, Measured, Observations, RaySource, Rig, Side, SourcedRay};
 use eye_geometry::camera::pixel_ray;
 use eye_geometry::eyeball::{EyeParams, visual_axis};
 use eye_geometry::uncertainty::propagate_fn;
@@ -191,8 +191,11 @@ impl GazeEstimator for PccrEstimator {
         Self::NAME
     }
 
-    fn estimate(&mut self, obs: &[Observations], rig: &Rig) -> Result<Vec<GazeRay>, StageError> {
-        Ok(self.estimate_rays(obs, rig)?)
+    fn estimate(&mut self, obs: &[Observations], rig: &Rig) -> Result<Vec<SourcedRay>, StageError> {
+        Ok(SourcedRay::tag(
+            RaySource::IrOnly,
+            self.estimate_rays(obs, rig)?,
+        ))
     }
 }
 

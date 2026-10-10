@@ -1,6 +1,8 @@
 use eye_core::log::field;
 use eye_core::stage::{GazeEstimator, StageError};
-use eye_core::{CameraModel, GazeRay, Measured, Observations, Rig, ScreenModel, Side};
+use eye_core::{
+    CameraModel, GazeRay, Measured, Observations, RaySource, Rig, ScreenModel, Side, SourcedRay,
+};
 use eye_geometry::camera::pixel_ray;
 use eye_geometry::eyeball::{
     EyeCentre, EyeParams, Kappa, gaze_ray, gaze_ray_pccr, optical_axis, ray_sphere_near,
@@ -302,8 +304,11 @@ impl GazeEstimator for IrPupilEstimator {
         Self::NAME
     }
 
-    fn estimate(&mut self, obs: &[Observations], rig: &Rig) -> Result<Vec<GazeRay>, StageError> {
-        Ok(self.estimate_rays(obs, rig)?)
+    fn estimate(&mut self, obs: &[Observations], rig: &Rig) -> Result<Vec<SourcedRay>, StageError> {
+        Ok(SourcedRay::tag(
+            RaySource::IrOnly,
+            self.estimate_rays(obs, rig)?,
+        ))
     }
 }
 
@@ -809,10 +814,11 @@ mod tests {
             .expect("boxed estimator succeeds");
 
         assert_eq!(rays.len(), 2);
-        assert_eq!(rays[0].side, Some(Side::Right));
-        assert_eq!(rays[1].side, Some(Side::Left));
+        assert_eq!(rays[0].source, RaySource::IrOnly);
+        assert_eq!(rays[0].ray.side, Some(Side::Right));
+        assert_eq!(rays[1].ray.side, Some(Side::Left));
         for ray in &rays {
-            ray.validate().expect("ray is valid");
+            ray.ray.validate().expect("ray is valid");
         }
     }
 

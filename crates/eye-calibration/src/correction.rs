@@ -260,17 +260,8 @@ fn head_frame_correct(
 }
 
 impl GazeCorrection for UserProfile {
-    fn correct(&self, ray: &GazeRay) -> GazeRay {
-        let Some(source) = self.primary_source() else {
-            tracing::trace!(
-                eye = eye_label(EyeKey::from(ray.side)),
-                { field::REASON } = "no_profile_entry",
-                "ray uncorrected"
-            );
-            return ray.clone();
-        };
+    fn correct(&self, source: RaySource, ray: &GazeRay) -> Option<GazeRay> {
         self.correct_source(source, ray)
-            .unwrap_or_else(|| ray.clone())
     }
 }
 
@@ -420,11 +411,10 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_eye_passes_through() {
+    fn test_missing_eye_returns_none() {
         let profile = fixture_profile();
         let ray = straight_ray(Some(eye_core::Side::Left));
-        let corrected = profile.correct(&ray);
-        assert_eq!(corrected, ray);
+        assert_eq!(profile.correct(RaySource::IrOnly, &ray), None);
     }
 
     #[test]
@@ -433,8 +423,9 @@ mod tests {
         let ray = straight_ray(Some(eye_core::Side::Right));
         let expected_yaw_in = yaw_pitch_from_direction(&ray.direction).x.to_degrees();
 
-        let (corrected, records) =
-            eye_log::testing::capture_logs(tracing::Level::TRACE, || profile.correct(&ray));
+        let (corrected, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            profile.correct(RaySource::IrOnly, &ray).unwrap()
+        });
 
         let expected_yaw_out = yaw_pitch_from_direction(&corrected.direction)
             .x
@@ -471,8 +462,9 @@ mod tests {
         let profile = fixture_profile();
         let ray = straight_ray(Some(eye_core::Side::Left));
 
-        let (_, records) =
-            eye_log::testing::capture_logs(tracing::Level::TRACE, || profile.correct(&ray));
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::TRACE, || {
+            profile.correct(RaySource::IrOnly, &ray)
+        });
 
         let rec = records
             .iter()
@@ -521,7 +513,7 @@ mod tests {
             provenance: Provenance::default(),
         };
         let ray = straight_ray(Some(eye_core::Side::Right));
-        let corrected = profile.correct(&ray);
+        let corrected = profile.correct(RaySource::IrOnly, &ray).unwrap();
 
         let a = yaw_pitch_from_direction(&ray.direction);
         let b = design(&a);
@@ -558,7 +550,7 @@ mod tests {
         };
         let mut ray = straight_ray(Some(eye_core::Side::Right));
         ray.angular_cov = Matrix2::identity() * 1e-4;
-        let corrected = profile.correct(&ray);
+        let corrected = profile.correct(RaySource::IrOnly, &ray).unwrap();
 
         let expected = Matrix2::identity() * 1e-4 + Matrix2::identity() * 0.0025;
         assert_abs_diff_eq!(corrected.angular_cov, expected, epsilon = 1e-15);
@@ -663,8 +655,18 @@ mod tests {
         let affine_profile = single_eye_profile(CorrectionModel::Affine, theta);
 
         let ray = straight_ray(Some(eye_core::Side::Right));
-        let a = yaw_pitch_from_direction(&head_profile.correct(&ray).direction);
-        let b = yaw_pitch_from_direction(&affine_profile.correct(&ray).direction);
+        let a = yaw_pitch_from_direction(
+            &head_profile
+                .correct(RaySource::RgbOnly, &ray)
+                .unwrap()
+                .direction,
+        );
+        let b = yaw_pitch_from_direction(
+            &affine_profile
+                .correct(RaySource::RgbOnly, &ray)
+                .unwrap()
+                .direction,
+        );
         assert_abs_diff_eq!(a.x, b.x, epsilon = 1e-9);
         assert_abs_diff_eq!(a.y, b.y, epsilon = 1e-9);
     }
@@ -678,7 +680,8 @@ mod tests {
         let head_rotation =
             UnitQuaternion::from_axis_angle(&Vector3::x_axis(), 60.0_f64.to_radians());
         ray.head_rotation = Some(head_rotation);
-        let corrected = yaw_pitch_from_direction(&profile.correct(&ray).direction);
+        let corrected =
+            yaw_pitch_from_direction(&profile.correct(RaySource::RgbOnly, &ray).unwrap().direction);
 
         let th = SVector::<f64, 6>::from(theta);
         let dir_head = head_rotation.inverse() * ray.direction;
@@ -737,7 +740,7 @@ mod tests {
 
         let mut ray = straight_ray(Some(eye_core::Side::Right));
         ray.angular_cov = Matrix2::zeros();
-        let corrected = profile.correct(&ray);
+        let corrected = profile.correct(RaySource::RgbOnly, &ray).unwrap();
 
         let a = yaw_pitch_from_direction(&ray.direction);
         let b12 = design12(&a);
@@ -892,28 +895,5 @@ mod tests {
         for estimator in ["fused", "landmark", "", "test-kappa-ray"] {
             assert_eq!(legacy_source(estimator), RaySource::RgbOnly);
         }
-    }
-
-    #[test]
-    fn test_trait_correct_uses_primary_source() {
-        let profile = UserProfile {
-            version: PROFILE_VERSION,
-            name: "x".into(),
-            created_unix_s: 0,
-            rig_fingerprint: String::new(),
-            estimator: String::new(),
-            corrections: BTreeMap::from([(
-                RaySource::IrOnly,
-                BTreeMap::from([(EyeKey::Right, affine_entry([0.01, 0.0, 0.0, 0.0, 0.0, 0.0]))]),
-            )]),
-            calibration_pose: None,
-            provenance: Provenance::default(),
-        };
-        let ray = straight_ray(Some(eye_core::Side::Right));
-        let a = yaw_pitch_from_direction(&ray.direction);
-
-        let corrected = profile.correct(&ray);
-        let yaw = yaw_pitch_from_direction(&corrected.direction).x;
-        assert_abs_diff_eq!(yaw, a.x + 0.01, epsilon = 1e-12);
     }
 }

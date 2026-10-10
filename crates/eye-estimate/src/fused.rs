@@ -8,8 +8,8 @@ use eye_core::log::field;
 use eye_core::observation::{SCHEME_IR_PUPIL_PAIR, SCHEME_MEDIAPIPE_478};
 use eye_core::stage::{GazeEstimator, StageError};
 use eye_core::{
-    CameraModel, Ellipse2, EyeObservation, FaceObservation, GazeRay, Measured, Observations, Rig,
-    Side, Timestamp,
+    CameraModel, Ellipse2, EyeObservation, FaceObservation, GazeRay, Measured, Observations,
+    RaySource, Rig, Side, SourcedRay, Timestamp,
 };
 use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
 use eye_geometry::eyeball::{
@@ -879,12 +879,13 @@ impl GazeEstimator for FusedEstimator {
         Self::NAME
     }
 
-    fn estimate(&mut self, obs: &[Observations], rig: &Rig) -> Result<Vec<GazeRay>, StageError> {
-        Ok(self
+    fn estimate(&mut self, obs: &[Observations], rig: &Rig) -> Result<Vec<SourcedRay>, StageError> {
+        let selected = self
             .estimate_detailed(obs, rig)?
             .into_iter()
             .map(|(_, ray)| ray)
-            .collect())
+            .collect();
+        Ok(SourcedRay::tag(RaySource::RgbOnly, selected))
     }
 }
 

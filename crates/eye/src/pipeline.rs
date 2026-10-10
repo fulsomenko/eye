@@ -8,7 +8,7 @@ use eye_capture::pairing::{Pairer, PairingConfig};
 use eye_core::log::{field, span};
 use eye_core::{
     CameraId, CameraInfo, Frame, FrameSet, GazePoint, GazeRay, PixelFormat, Rig, ScreenModel,
-    Timestamp,
+    SourcedRay, Timestamp,
     stage::{Detector, GazeCorrection, GazeEstimator, GazeFilter, StageError},
 };
 use eye_geometry::screen::{confidence_from_cov, gaze_point, mm_to_px_logical, mm_to_px_physical};
@@ -18,12 +18,20 @@ use crate::config::Config;
 use crate::error::{ConfigError, StageKind};
 use crate::registry::Registry;
 
-/// Uncorrected rays of one frame set. `timestamp` is the newest frame's (the moment the set
-/// completed); each ray carries the time it describes.
+/// Uncorrected per-source candidates of one frame set. `timestamp` is the newest frame's (the
+/// moment the set completed); each candidate's ray carries the time it describes. Profile
+/// independent: `finish`/`finish_detailed` can be re-run on it with any correction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RayBatch {
     pub timestamp: Timestamp,
+    pub candidates: Vec<SourcedRay>,
+}
+
+/// What `finish_detailed` produced: the selected, corrected rays and the filtered point.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Finished {
     pub rays: Vec<GazeRay>,
+    pub point: Option<GazePoint>,
 }
 
 #[derive(Debug)]
@@ -266,13 +274,16 @@ impl Pipeline {
             result
         };
         match result {
-            Ok(rays) => {
+            Ok(candidates) => {
                 self.consecutive_errors = 0;
-                if rays.is_empty() {
+                if candidates.is_empty() {
                     tracing::debug!({ field::REASON } = "no_rays", "no gaze");
                     Ok(RayStep::NoGaze)
                 } else {
-                    Ok(RayStep::Rays(RayBatch { timestamp, rays }))
+                    Ok(RayStep::Rays(RayBatch {
+                        timestamp,
+                        candidates,
+                    }))
                 }
             }
             Err(e) => {
@@ -307,31 +318,32 @@ impl Pipeline {
         Ok(RayStep::Skipped(e))
     }
 
-    /// Correct each ray, intersect, fuse, filter. Under `cfg!(debug_assertions)` an invalid point
-    /// is dropped with `warn!`.
+    /// Select rays from the batch's candidates, intersect, fuse, filter. Under
+    /// `cfg!(debug_assertions)` an invalid point is dropped with `warn!`.
     pub fn finish(&mut self, batch: &RayBatch) -> Option<GazePoint> {
+        self.finish_detailed(batch).point
+    }
+
+    /// As [`Pipeline::finish`], but also returns the selected, corrected rays the point was
+    /// built from.
+    pub fn finish_detailed(&mut self, batch: &RayBatch) -> Finished {
         let screen = self.rig.screen();
-        let points: Vec<GazePoint> = batch
-            .rays
+        let rays = self
+            .estimator
+            .select(&batch.candidates, self.correction.as_deref());
+        let points: Vec<GazePoint> = rays
             .iter()
-            .map(|ray| {
-                self.correction
-                    .as_ref()
-                    .map_or_else(|| ray.clone(), |c| c.correct(ray))
-            })
-            .filter_map(|ray| {
-                let timestamp = ray.timestamp;
-                gaze_point(&ray, screen, timestamp)
-            })
+            .filter_map(|ray| gaze_point(ray, screen, ray.timestamp))
             .collect();
         let Some(fused) = fuse_points(&points, screen) else {
             tracing::debug!(
                 { field::REASON } = "no_fused_point",
-                rays = batch.rays.len(),
+                candidates = batch.candidates.len() as u64,
+                selected = rays.len() as u64,
                 points = points.len(),
                 "no gaze"
             );
-            return None;
+            return Finished { rays, point: None };
         };
         let started = std::time::Instant::now();
         let point = {
@@ -349,14 +361,19 @@ impl Pipeline {
             && let Err(e) = point.validate()
         {
             tracing::warn!(error = %e, "invalid gaze point dropped");
-            return None;
+            return Finished { rays, point: None };
         }
-        Some(point)
+        Finished {
+            rays,
+            point: Some(point),
+        }
     }
 
-    /// Replaces the correction and calls `filter.reset()` once.
+    /// Replaces the correction, drops the estimator's selection state, and calls
+    /// `filter.reset()` once.
     pub fn set_correction(&mut self, correction: Option<Box<dyn GazeCorrection>>) {
         self.correction = correction;
+        self.estimator.reset_selection();
         self.filter.reset();
         tracing::debug!(
             has_correction = self.correction.is_some(),
@@ -432,13 +449,13 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use approx::assert_relative_eq;
-    use eye_core::Illumination;
+    use eye_core::{Illumination, RaySource};
 
     use super::*;
     use crate::registry::PassThroughFilter;
     use crate::testkit::{
-        self, CountingFilter, FailingEstimator, FakeDetector, FakeEstimator, TWO_CAMERA_TOML,
-        YawOffset, fake_registry,
+        self, CountingFilter, FailingEstimator, FakeDetector, FakeEstimator,
+        ResetCountingEstimator, TWO_CAMERA_TOML, YawOffset, fake_registry,
     };
 
     fn one_camera_pipeline(max_consecutive_errors: u32) -> Pipeline {
@@ -611,14 +628,17 @@ mod tests {
             let mut pipeline = one_camera_pipeline(3);
             let batch = RayBatch {
                 timestamp: Timestamp::from_nanos(0),
-                rays: vec![GazeRay {
-                    side: None,
-                    timestamp: Timestamp::from_nanos(0),
-                    origin: nalgebra::Point3::new(155.0, 85.0, -500.0),
-                    direction: -nalgebra::Vector3::z_axis(),
-                    angular_cov: Matrix2::identity() * 1e-6,
-                    origin_cov: nalgebra::Matrix3::zeros(),
-                    head_rotation: None,
+                candidates: vec![SourcedRay {
+                    source: RaySource::RgbOnly,
+                    ray: GazeRay {
+                        side: None,
+                        timestamp: Timestamp::from_nanos(0),
+                        origin: nalgebra::Point3::new(155.0, 85.0, -500.0),
+                        direction: -nalgebra::Vector3::z_axis(),
+                        angular_cov: Matrix2::identity() * 1e-6,
+                        origin_cov: nalgebra::Matrix3::zeros(),
+                        head_rotation: None,
+                    },
                 }],
             };
             pipeline.finish(&batch)
@@ -632,7 +652,8 @@ mod tests {
             rec.fields.get(field::REASON),
             Some(&eye_log::Value::Str("no_fused_point".to_string()))
         );
-        assert_eq!(rec.fields.get("rays"), Some(&eye_log::Value::U64(1)));
+        assert_eq!(rec.fields.get("candidates"), Some(&eye_log::Value::U64(1)));
+        assert_eq!(rec.fields.get("selected"), Some(&eye_log::Value::U64(1)));
         assert_eq!(rec.fields.get("points"), Some(&eye_log::Value::U64(0)));
     }
 
@@ -725,14 +746,17 @@ mod tests {
         let mut pipeline = one_camera_pipeline(3);
         let batch = RayBatch {
             timestamp: Timestamp::from_nanos(105_000_000),
-            rays: vec![GazeRay {
-                side: None,
-                timestamp: Timestamp::from_nanos(37_000_000),
-                origin: nalgebra::Point3::new(155.0, 85.0, -500.0),
-                direction: nalgebra::Vector3::z_axis(),
-                angular_cov: Matrix2::identity() * 1e-6,
-                origin_cov: nalgebra::Matrix3::zeros(),
-                head_rotation: None,
+            candidates: vec![SourcedRay {
+                source: RaySource::RgbOnly,
+                ray: GazeRay {
+                    side: None,
+                    timestamp: Timestamp::from_nanos(37_000_000),
+                    origin: nalgebra::Point3::new(155.0, 85.0, -500.0),
+                    direction: nalgebra::Vector3::z_axis(),
+                    angular_cov: Matrix2::identity() * 1e-6,
+                    origin_cov: nalgebra::Matrix3::zeros(),
+                    head_rotation: None,
+                },
             }],
         };
         let point = pipeline.finish(&batch).expect("ray hits the panel");
@@ -744,14 +768,17 @@ mod tests {
         let mut pipeline = one_camera_pipeline(3);
         let batch = RayBatch {
             timestamp: Timestamp::from_nanos(0),
-            rays: vec![GazeRay {
-                side: None,
-                timestamp: Timestamp::from_nanos(0),
-                origin: nalgebra::Point3::new(155.0, 85.0, -500.0),
-                direction: -nalgebra::Vector3::z_axis(),
-                angular_cov: Matrix2::identity() * 1e-6,
-                origin_cov: nalgebra::Matrix3::zeros(),
-                head_rotation: None,
+            candidates: vec![SourcedRay {
+                source: RaySource::RgbOnly,
+                ray: GazeRay {
+                    side: None,
+                    timestamp: Timestamp::from_nanos(0),
+                    origin: nalgebra::Point3::new(155.0, 85.0, -500.0),
+                    direction: -nalgebra::Vector3::z_axis(),
+                    angular_cov: Matrix2::identity() * 1e-6,
+                    origin_cov: nalgebra::Matrix3::zeros(),
+                    head_rotation: None,
+                },
             }],
         };
         assert!(pipeline.finish(&batch).is_none());
@@ -762,14 +789,17 @@ mod tests {
         let mut pipeline = one_camera_pipeline(3);
         let batch = RayBatch {
             timestamp: Timestamp::from_nanos(0),
-            rays: vec![GazeRay {
-                side: None,
-                timestamp: Timestamp::from_nanos(0),
-                origin: nalgebra::Point3::new(155.0, 85.0, 500.0),
-                direction: nalgebra::Vector3::z_axis(),
-                angular_cov: Matrix2::identity() * 1e-6,
-                origin_cov: nalgebra::Matrix3::zeros(),
-                head_rotation: None,
+            candidates: vec![SourcedRay {
+                source: RaySource::RgbOnly,
+                ray: GazeRay {
+                    side: None,
+                    timestamp: Timestamp::from_nanos(0),
+                    origin: nalgebra::Point3::new(155.0, 85.0, 500.0),
+                    direction: nalgebra::Vector3::z_axis(),
+                    angular_cov: Matrix2::identity() * 1e-6,
+                    origin_cov: nalgebra::Matrix3::zeros(),
+                    head_rotation: None,
+                },
             }],
         };
         assert!(pipeline.finish(&batch).is_none());
@@ -787,6 +817,43 @@ mod tests {
         let point = pipeline.finish(&batch).expect("ray hits the panel");
         assert_relative_eq!(point.mm.x, 155.0 + 500.0 * 0.01_f64.tan(), epsilon = 1e-9);
         assert_relative_eq!(point.mm.y, 85.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_rays_batch_carries_sourced_candidates() {
+        let mut pipeline = one_camera_pipeline(3);
+        let set = FrameSet::single(testkit::frame("ir", 0, 100, Illumination::IrLit));
+        let RayStep::Rays(batch) = pipeline.rays(&set).expect("rays succeeds") else {
+            panic!("expected a ray batch")
+        };
+        assert_eq!(batch.candidates.len(), 1);
+        assert_eq!(batch.candidates[0].source, RaySource::RgbOnly);
+    }
+
+    #[test]
+    fn test_finish_detailed_returns_selected_corrected_rays() {
+        let mut pipeline = one_camera_pipeline(3);
+        pipeline.set_correction(Some(Box::new(YawOffset(0.01))));
+        let set = FrameSet::single(testkit::frame("ir", 0, 100, Illumination::IrLit));
+        let RayStep::Rays(batch) = pipeline.rays(&set).expect("rays succeeds") else {
+            panic!("expected a ray batch")
+        };
+
+        let finished = pipeline.finish_detailed(&batch);
+        assert_eq!(finished.rays.len(), 1);
+        let expected_direction =
+            nalgebra::Rotation3::from_axis_angle(&nalgebra::Vector3::y_axis(), 0.01)
+                * batch.candidates[0].ray.direction;
+        approx::assert_abs_diff_eq!(
+            finished.rays[0].direction.into_inner(),
+            expected_direction.into_inner(),
+            epsilon = 1e-12
+        );
+        assert_eq!(finished.rays[0].origin, batch.candidates[0].ray.origin);
+
+        let mut fresh = one_camera_pipeline(3);
+        fresh.set_correction(Some(Box::new(YawOffset(0.01))));
+        assert_eq!(finished.point, fresh.finish(&batch));
     }
 
     #[test]
@@ -918,6 +985,25 @@ mod tests {
             Box::new(CountingFilter {
                 resets: resets.clone(),
             }),
+            None,
+            3,
+        );
+        pipeline.set_correction(Some(Box::new(YawOffset(0.0))));
+        assert_eq!(resets.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_set_correction_resets_selection_once() {
+        let resets = Arc::new(AtomicU32::new(0));
+        let mut pipeline = Pipeline::new(
+            testkit::rig(),
+            Pairer::new(&[testkit::info("ir", PixelFormat::Gray8, 66)])
+                .expect("single-camera pairer"),
+            vec![(CameraId::from("ir"), Box::new(FakeDetector::new("fake")))],
+            Box::new(ResetCountingEstimator {
+                resets: resets.clone(),
+            }),
+            Box::new(PassThroughFilter),
             None,
             3,
         );

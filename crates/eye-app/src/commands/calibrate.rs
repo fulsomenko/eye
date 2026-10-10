@@ -12,7 +12,7 @@ use eye_bench::calibration::{
 };
 use eye_bench::metrics::{MetricParams, SessionMetrics, compute};
 use eye_bench::runner::replay_session;
-use eye_calibration::correction::{Provenance, UserProfile, legacy_source};
+use eye_calibration::correction::{Provenance, UserProfile};
 #[cfg(test)]
 use eye_calibration::protocol::TargetTiming;
 use eye_calibration::protocol::{FixationWindow, ProtocolConfig, TargetProtocol};
@@ -177,7 +177,6 @@ impl LiveFeedback {
             &self.windows,
             self.batches.iter(),
             latest_presentation(&self.windows, self.base_len),
-            legacy_source(&self.meta.estimator),
         )
     }
 
@@ -557,7 +556,6 @@ pub fn fit_recording(
     meta: ProfileMeta,
 ) -> anyhow::Result<FitResult> {
     let mut replayed = replay_session(dir, config, registry, protocol)?;
-    let source = legacy_source(replayed.pipeline.estimator_name());
     let run = &replayed.run;
     let base_len = run.protocol.grid[0] * run.protocol.grid[1];
     let windows = run.windows.clone();
@@ -566,7 +564,6 @@ pub fn fit_recording(
         &run.windows,
         run.steps.iter().filter_map(|s| s.batch.as_ref()),
         &include,
-        source,
     );
     anyhow::ensure!(
         !samples.is_empty(),
@@ -772,7 +769,9 @@ mod tests {
         write_synthetic_session,
     };
     use eye_core::session::TargetClock;
-    use eye_core::{CameraId, FrameHeader, Illumination, OutputId, PixelFormat};
+    use eye_core::{
+        CameraId, FrameHeader, Illumination, OutputId, PixelFormat, RaySource, SourcedRay,
+    };
     use eye_overlay::targets::TargetEvent;
     use nalgebra::{Matrix2, Matrix3, Point3, Vector3};
 
@@ -1137,7 +1136,6 @@ mod tests {
     #[test]
     fn test_fit_recording_rejected_targets_come_from_primary_source() {
         use eye_calibration::correction::{CorrectionModel, EyeKey};
-        use eye_core::RaySource;
 
         let report = |source, targets_rejected: Vec<u32>| EyeFitReport {
             source,
@@ -1404,21 +1402,24 @@ mod tests {
             &mut self,
             obs: &[eye_core::Observations],
             _rig: &Rig,
-        ) -> Result<Vec<eye_core::GazeRay>, eye_core::stage::StageError> {
+        ) -> Result<Vec<SourcedRay>, eye_core::stage::StageError> {
             let timestamp = obs
                 .iter()
                 .find(|o| o.camera.as_str() == "rgb")
                 .or_else(|| obs.first())
                 .map_or(Timestamp::from_nanos(0), |o| o.timestamp);
-            Ok(vec![eye_core::GazeRay {
-                side: None,
-                timestamp,
-                origin: Point3::new(155.0, 85.0, -500.0),
-                direction: Vector3::z_axis(),
-                angular_cov: Matrix2::identity() * 1e-6,
-                origin_cov: Matrix3::zeros(),
-                head_rotation: None,
-            }])
+            Ok(SourcedRay::tag(
+                RaySource::RgbOnly,
+                vec![eye_core::GazeRay {
+                    side: None,
+                    timestamp,
+                    origin: Point3::new(155.0, 85.0, -500.0),
+                    direction: Vector3::z_axis(),
+                    angular_cov: Matrix2::identity() * 1e-6,
+                    origin_cov: Matrix3::zeros(),
+                    head_rotation: None,
+                }],
+            ))
         }
     }
 
@@ -1616,7 +1617,7 @@ mod tests {
         let mid_a = onset_a + timing.settle.as_nanos() as u64 + timing.window.as_nanos() as u64 / 2;
         live.batches.push(RayBatch {
             timestamp: Timestamp::from_nanos(mid_a),
-            rays: vec![fake_ray(mid_a)],
+            candidates: SourcedRay::tag(RaySource::RgbOnly, vec![fake_ray(mid_a)]),
         });
 
         let onset_b = 10_000_000_000u64;
@@ -1630,7 +1631,7 @@ mod tests {
         let mid_b = onset_b + timing.settle.as_nanos() as u64 + timing.window.as_nanos() as u64 / 2;
         live.batches.push(RayBatch {
             timestamp: Timestamp::from_nanos(mid_b),
-            rays: vec![fake_ray(mid_b)],
+            candidates: SourcedRay::tag(RaySource::RgbOnly, vec![fake_ray(mid_b)]),
         });
 
         let samples = live.fit_samples();
@@ -1724,7 +1725,6 @@ mod tests {
             &independent_windows,
             live.batches.iter(),
             latest_presentation(&independent_windows, base_len),
-            legacy_source(&live.meta.estimator),
         );
         let fingerprint = |samples: &[FitSample]| -> Vec<(u64, u64, u64)> {
             samples
@@ -1760,6 +1760,32 @@ mod tests {
              targets 1-3 and the retry each contribute one sample, plus the late sample for \
              target 1"
         );
+    }
+
+    #[test]
+    fn test_live_samples_carry_candidate_sources() {
+        let targets_px = FOUR_BY_FOUR_CENTRES[..3].to_vec();
+        let config = kappa_ray_config(&targets_px, [0.0, 0.0], None);
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let protocol = TargetProtocol::new(ProtocolConfig::default()).unwrap();
+        let timing = protocol.timing();
+        let fit_cfg = FitConfig::default();
+        let meta = ProfileMeta {
+            estimator: "pccr".into(),
+            ..ProfileMeta::default()
+        };
+        let mut live = LiveFeedback::with_pipeline(pipeline, protocol, fit_cfg, meta);
+
+        let frames_per_target = (fit_cfg.min_samples_per_target * 2) as u64;
+        let messages = live_session(&targets_px, timing, frames_per_target);
+        run_live_session(&mut live, messages);
+
+        let samples = live.fit_samples();
+        assert!(!samples.is_empty());
+        assert!(samples.iter().all(|s| s.source == RaySource::RgbOnly));
     }
 
     #[test]
@@ -2014,17 +2040,20 @@ mod tests {
             onset_ns + timing.settle.as_nanos() as u64 + timing.window.as_nanos() as u64 / 2;
         live.batches.push(RayBatch {
             timestamp: Timestamp::from_nanos(mid_ns),
-            rays: (0..(fit_cfg.min_samples_per_target * 2))
-                .map(|_| GazeRay {
-                    side: None,
-                    timestamp: Timestamp::from_nanos(mid_ns),
-                    origin: eye,
-                    direction,
-                    angular_cov: Matrix2::identity() * 1e-6,
-                    origin_cov: Matrix3::zeros(),
-                    head_rotation: None,
-                })
-                .collect(),
+            candidates: SourcedRay::tag(
+                RaySource::RgbOnly,
+                (0..(fit_cfg.min_samples_per_target * 2))
+                    .map(|_| GazeRay {
+                        side: None,
+                        timestamp: Timestamp::from_nanos(mid_ns),
+                        origin: eye,
+                        direction,
+                        angular_cov: Matrix2::identity() * 1e-6,
+                        origin_cov: Matrix3::zeros(),
+                        head_rotation: None,
+                    })
+                    .collect(),
+            ),
         });
         live.on_hidden(
             targets_px.len(),
@@ -2104,17 +2133,20 @@ mod tests {
                 at_ns + timing.settle.as_nanos() as u64 + timing.window.as_nanos() as u64 / 2;
             live.batches.push(RayBatch {
                 timestamp: Timestamp::from_nanos(mid_ns),
-                rays: (0..2)
-                    .map(|_| GazeRay {
-                        side: None,
-                        timestamp: Timestamp::from_nanos(mid_ns),
-                        origin: eye,
-                        direction,
-                        angular_cov: Matrix2::identity() * 1e-6,
-                        origin_cov: Matrix3::zeros(),
-                        head_rotation: None,
-                    })
-                    .collect(),
+                candidates: SourcedRay::tag(
+                    RaySource::RgbOnly,
+                    (0..2)
+                        .map(|_| GazeRay {
+                            side: None,
+                            timestamp: Timestamp::from_nanos(mid_ns),
+                            origin: eye,
+                            direction,
+                            angular_cov: Matrix2::identity() * 1e-6,
+                            origin_cov: Matrix3::zeros(),
+                            head_rotation: None,
+                        })
+                        .collect(),
+                ),
             });
             live.on_hidden(retry_index, Timestamp::from_nanos(at_ns + 100_000_000_000));
         };

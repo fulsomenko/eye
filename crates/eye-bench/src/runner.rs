@@ -14,7 +14,9 @@ use eye_calibration::store::{read_rig, rig_from_table};
 use eye_capture::session::{RecordedCamera, Recording, SessionMeta};
 use eye_core::angles::yaw_pitch_from_direction;
 use eye_core::log::{field, span};
-use eye_core::{CameraInfo, Frame, FrameSet, GazePoint, OutputId, Rig, Timestamp};
+use eye_core::{
+    CameraInfo, Frame, FrameSet, GazePoint, GazeRay, OutputId, Rig, SourcedRay, Timestamp,
+};
 use nalgebra::{Point3, Unit, Vector3};
 
 use crate::error::BenchError;
@@ -26,6 +28,7 @@ use crate::row::{BenchRow, CalibrationMode, RowKind, RowOutcome};
 #[derive(Debug)]
 pub struct Step {
     pub batch: Option<RayBatch>,
+    pub selected: Vec<GazeRay>,
     pub point: Option<GazePoint>,
     /// `rays` returned `RayStep::Skipped` (a tolerated stage error).
     pub skipped: bool,
@@ -65,11 +68,17 @@ impl SessionRun {
         self.steps.iter().map(|s| s.processing).collect()
     }
 
-    /// Steps with both batch and point.
-    pub fn samples(&self) -> impl Iterator<Item = (&RayBatch, &GazePoint)> {
+    /// Steps with both selected rays and a point: the selected rays (for `eye_mm`), the batch's
+    /// uncorrected candidates (for the residuals), and the point.
+    pub fn samples(&self) -> impl Iterator<Item = (&[GazeRay], &[SourcedRay], &GazePoint)> {
         self.steps
             .iter()
-            .filter_map(|s| Some((s.batch.as_ref()?, s.point.as_ref()?)))
+            .filter(|s| !s.selected.is_empty())
+            .filter_map(|s| {
+                let candidates = s.batch.as_ref()?.candidates.as_slice();
+                let point = s.point.as_ref()?;
+                Some((s.selected.as_slice(), candidates, point))
+            })
     }
 }
 
@@ -106,22 +115,25 @@ fn step(pipeline: &mut Pipeline, set: &FrameSet) -> Result<Step, BenchError> {
     let started = Instant::now();
     let step = match pipeline.rays(set).map_err(pipeline_error)? {
         RayStep::Rays(batch) => {
-            let point = pipeline.finish(&batch);
+            let finished = pipeline.finish_detailed(&batch);
             Step {
                 batch: Some(batch),
-                point,
+                selected: finished.rays,
+                point: finished.point,
                 skipped: false,
                 processing: started.elapsed(),
             }
         }
         RayStep::NoGaze => Step {
             batch: None,
+            selected: Vec::new(),
             point: None,
             skipped: false,
             processing: started.elapsed(),
         },
         RayStep::Skipped(_) => Step {
             batch: None,
+            selected: Vec::new(),
             point: None,
             skipped: true,
             processing: started.elapsed(),
@@ -129,7 +141,7 @@ fn step(pipeline: &mut Pipeline, set: &FrameSet) -> Result<Step, BenchError> {
     };
     tracing::trace!(
         outcome = step_outcome(&step),
-        rays = step.batch.as_ref().map_or(0, |b| b.rays.len()) as u64,
+        candidates = step.batch.as_ref().map_or(0, |b| b.candidates.len()) as u64,
         point = step.point.is_some(),
         { field::ELAPSED_US } = step.processing.as_micros() as u64,
         "frame replayed"
@@ -333,7 +345,7 @@ pub fn window_at(windows: &[FixationWindow], t: Timestamp) -> Option<usize> {
 pub fn eval_input<'a>(
     rig: &Rig,
     windows: &[FixationWindow],
-    samples: impl IntoIterator<Item = (&'a RayBatch, &'a GazePoint)>,
+    samples: impl IntoIterator<Item = (&'a [GazeRay], &'a [SourcedRay], &'a GazePoint)>,
     processing: Vec<Duration>,
 ) -> EvalInput {
     let screen = rig.screen();
@@ -351,9 +363,9 @@ pub fn eval_input<'a>(
             points: Vec::new(),
         })
         .collect();
-    for (batch, point) in samples {
+    for (selected, candidates, point) in samples {
         let ts_ns = point.timestamp.as_nanos();
-        let Some(eye_mm) = mean_origin(&batch.rays) else {
+        let Some(eye_mm) = mean_origin(selected) else {
             tracing::debug!(
                 { field::TS_NS } = ts_ns,
                 { field::REASON } = "no_rays",
@@ -381,10 +393,10 @@ pub fn eval_input<'a>(
             "sample"
         );
         let target_mm3 = lift(&w.target_mm);
-        let rays: Vec<RayResidual> = batch
-            .rays
+        let rays: Vec<RayResidual> = candidates
             .iter()
-            .filter_map(|ray| {
+            .filter_map(|c| {
+                let ray = &c.ray;
                 ray.angular_cov.try_inverse()?;
                 let to_target = Unit::new_normalize(target_mm3 - ray.origin);
                 let residual_rad =
@@ -863,7 +875,7 @@ mod tests {
 
     use approx::assert_relative_eq;
     use eye_core::log::field;
-    use eye_core::{GazeRay, OutputId};
+    use eye_core::{GazeRay, OutputId, RaySource, SourcedRay};
     use eye_log::testing::capture_logs;
     use nalgebra::{Matrix2, Matrix3, Point2, Unit};
 
@@ -932,29 +944,26 @@ mod tests {
             target_px_logical: Point2::new(960.0, 540.0),
         };
         let windows = vec![window];
-        let batch = RayBatch {
-            timestamp: Timestamp::from_nanos(500_000_000),
-            rays: vec![
-                GazeRay {
-                    side: None,
-                    timestamp: Timestamp::from_nanos(500_000_000),
-                    origin: Point3::new(120.0, 85.0, -500.0),
-                    direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
-                    origin_cov: Matrix3::zeros(),
-                    angular_cov: Matrix2::identity() * 1e-6,
-                    head_rotation: None,
-                },
-                GazeRay {
-                    side: None,
-                    timestamp: Timestamp::from_nanos(500_000_000),
-                    origin: Point3::new(190.0, 85.0, -500.0),
-                    direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
-                    origin_cov: Matrix3::zeros(),
-                    angular_cov: Matrix2::identity() * 1e-6,
-                    head_rotation: None,
-                },
-            ],
-        };
+        let rays = vec![
+            GazeRay {
+                side: None,
+                timestamp: Timestamp::from_nanos(500_000_000),
+                origin: Point3::new(120.0, 85.0, -500.0),
+                direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
+                origin_cov: Matrix3::zeros(),
+                angular_cov: Matrix2::identity() * 1e-6,
+                head_rotation: None,
+            },
+            GazeRay {
+                side: None,
+                timestamp: Timestamp::from_nanos(500_000_000),
+                origin: Point3::new(190.0, 85.0, -500.0),
+                direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
+                origin_cov: Matrix3::zeros(),
+                angular_cov: Matrix2::identity() * 1e-6,
+                head_rotation: None,
+            },
+        ];
         let point = GazePoint {
             timestamp: Timestamp::from_nanos(500_000_000),
             output: OutputId::from("eDP-1"),
@@ -964,7 +973,13 @@ mod tests {
             cov_mm: Matrix2::zeros(),
             confidence: 1.0,
         };
-        let input = eval_input(&rig, &windows, [(&batch, &point)], Vec::new());
+        let candidates = SourcedRay::tag(RaySource::RgbOnly, rays.clone());
+        let input = eval_input(
+            &rig,
+            &windows,
+            [(rays.as_slice(), candidates.as_slice(), &point)],
+            Vec::new(),
+        );
         assert_eq!(input.windows[0].points.len(), 1);
         let eye_mm = input.windows[0].points[0].eye_mm;
         assert_relative_eq!(eye_mm.x, eye().x, epsilon = 1e-9);
@@ -985,29 +1000,26 @@ mod tests {
             target_px_logical: Point2::new(960.0, 540.0),
         };
         let windows = vec![window];
-        let batch = RayBatch {
-            timestamp: Timestamp::from_nanos(500_000_000),
-            rays: vec![
-                GazeRay {
-                    side: None,
-                    timestamp: Timestamp::from_nanos(500_000_000),
-                    origin: Point3::new(120.0, 85.0, -500.0),
-                    direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
-                    origin_cov: Matrix3::zeros(),
-                    angular_cov: Matrix2::identity() * 1e-6,
-                    head_rotation: None,
-                },
-                GazeRay {
-                    side: None,
-                    timestamp: Timestamp::from_nanos(500_000_000),
-                    origin: Point3::new(190.0, 85.0, -500.0),
-                    direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
-                    origin_cov: Matrix3::zeros(),
-                    angular_cov: Matrix2::identity() * 1e-6,
-                    head_rotation: None,
-                },
-            ],
-        };
+        let rays = vec![
+            GazeRay {
+                side: None,
+                timestamp: Timestamp::from_nanos(500_000_000),
+                origin: Point3::new(120.0, 85.0, -500.0),
+                direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
+                origin_cov: Matrix3::zeros(),
+                angular_cov: Matrix2::identity() * 1e-6,
+                head_rotation: None,
+            },
+            GazeRay {
+                side: None,
+                timestamp: Timestamp::from_nanos(500_000_000),
+                origin: Point3::new(190.0, 85.0, -500.0),
+                direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
+                origin_cov: Matrix3::zeros(),
+                angular_cov: Matrix2::identity() * 1e-6,
+                head_rotation: None,
+            },
+        ];
         let point = GazePoint {
             timestamp: Timestamp::from_nanos(500_000_000),
             output: OutputId::from("eDP-1"),
@@ -1017,11 +1029,17 @@ mod tests {
             cov_mm: Matrix2::zeros(),
             confidence: 1.0,
         };
-        let input = eval_input(&rig, &windows, [(&batch, &point)], Vec::new());
-        let rays = &input.windows[0].points[0].rays;
-        assert_eq!(rays.len(), 2);
+        let candidates = SourcedRay::tag(RaySource::RgbOnly, rays.clone());
+        let input = eval_input(
+            &rig,
+            &windows,
+            [(rays.as_slice(), candidates.as_slice(), &point)],
+            Vec::new(),
+        );
+        let residuals = &input.windows[0].points[0].rays;
+        assert_eq!(residuals.len(), 2);
         let target_mm3 = Point3::new(155.0, 85.0, 0.0);
-        for (ray, residual) in batch.rays.iter().zip(rays) {
+        for (ray, residual) in rays.iter().zip(residuals) {
             let to_target = Unit::new_normalize(target_mm3 - ray.origin);
             let expected =
                 yaw_pitch_from_direction(&ray.direction) - yaw_pitch_from_direction(&to_target);
@@ -1030,6 +1048,62 @@ mod tests {
             assert_eq!(residual.side, ray.side);
             assert_eq!(residual.angular_cov, ray.angular_cov);
         }
+    }
+
+    #[test]
+    fn test_eval_input_takes_eye_position_from_selected_rays() {
+        let rig = crate::testing::synthetic_rig();
+        let window = FixationWindow {
+            index: 0,
+            cell: (0, 0),
+            onset: Timestamp::from_nanos(0),
+            start: Timestamp::from_nanos(0),
+            end: Timestamp::from_nanos(1_000_000_000),
+            target_mm: Point2::new(155.0, 85.0),
+            target_px_logical: Point2::new(960.0, 540.0),
+        };
+        let windows = vec![window];
+        let selected_origin = Point3::new(100.0, 0.0, -500.0);
+        let selected = vec![GazeRay {
+            side: None,
+            timestamp: Timestamp::from_nanos(500_000_000),
+            origin: selected_origin,
+            direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
+            origin_cov: Matrix3::zeros(),
+            angular_cov: Matrix2::identity() * 1e-6,
+            head_rotation: None,
+        }];
+        let candidates = vec![SourcedRay {
+            source: RaySource::IrOnly,
+            ray: GazeRay {
+                side: None,
+                timestamp: Timestamp::from_nanos(500_000_000),
+                origin: Point3::new(155.0, 85.0, -500.0),
+                direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
+                origin_cov: Matrix3::zeros(),
+                angular_cov: Matrix2::identity() * 1e-6,
+                head_rotation: None,
+            },
+        }];
+        let point = GazePoint {
+            timestamp: Timestamp::from_nanos(500_000_000),
+            output: OutputId::from("eDP-1"),
+            mm: Point2::new(155.0, 85.0),
+            px_physical: Point2::new(0.0, 0.0),
+            px_logical: Point2::new(960.0, 540.0),
+            cov_mm: Matrix2::zeros(),
+            confidence: 1.0,
+        };
+        let input = eval_input(
+            &rig,
+            &windows,
+            [(selected.as_slice(), candidates.as_slice(), &point)],
+            Vec::new(),
+        );
+        let eye_mm = input.windows[0].points[0].eye_mm;
+        assert_relative_eq!(eye_mm.x, selected_origin.x, epsilon = 1e-9);
+        assert_relative_eq!(eye_mm.y, selected_origin.y, epsilon = 1e-9);
+        assert_relative_eq!(eye_mm.z, selected_origin.z, epsilon = 1e-9);
     }
 
     #[test]
@@ -1622,7 +1696,6 @@ mod tests {
             &replayed.run.windows,
             replayed.run.steps.iter().filter_map(|s| s.batch.as_ref()),
             |_| true,
-            eye_core::RaySource::RgbOnly,
         );
         crate::calibration::dot_session_fitter(&train, &replayed.run.rig).unwrap()
     }

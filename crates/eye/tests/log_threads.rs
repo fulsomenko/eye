@@ -10,7 +10,7 @@ use eye_capture::{CaptureError, FrameSource};
 use eye_core::log::{field, span};
 use eye_core::{
     CameraId, CameraInfo, CameraModel, Frame, FrameHeader, FrameSet, GazeRay, Illumination,
-    Observations, OutputId, PixelFormat, Rig, ScreenModel, Timestamp,
+    Observations, OutputId, PixelFormat, RaySource, Rig, ScreenModel, SourcedRay, Timestamp,
     stage::{Detector, GazeEstimator, StageError},
 };
 use eye_log::Value;
@@ -60,16 +60,23 @@ impl GazeEstimator for FixedEstimator {
         "fixed"
     }
 
-    fn estimate(&mut self, _obs: &[Observations], _rig: &Rig) -> Result<Vec<GazeRay>, StageError> {
-        Ok(vec![GazeRay {
-            side: None,
-            timestamp: Timestamp::from_nanos(0),
-            origin: nalgebra::Point3::new(155.0, 85.0, -500.0),
-            direction: nalgebra::Vector3::z_axis(),
-            angular_cov: nalgebra::Matrix2::identity() * 1e-6,
-            origin_cov: nalgebra::Matrix3::zeros(),
-            head_rotation: None,
-        }])
+    fn estimate(
+        &mut self,
+        _obs: &[Observations],
+        _rig: &Rig,
+    ) -> Result<Vec<SourcedRay>, StageError> {
+        Ok(SourcedRay::tag(
+            RaySource::RgbOnly,
+            vec![GazeRay {
+                side: None,
+                timestamp: Timestamp::from_nanos(0),
+                origin: nalgebra::Point3::new(155.0, 85.0, -500.0),
+                direction: nalgebra::Vector3::z_axis(),
+                angular_cov: nalgebra::Matrix2::identity() * 1e-6,
+                origin_cov: nalgebra::Matrix3::zeros(),
+                head_rotation: None,
+            }],
+        ))
     }
 }
 

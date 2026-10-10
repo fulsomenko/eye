@@ -7,7 +7,8 @@ use eye_core::log::field;
 use eye_core::observation::{SCHEME_MEDIAPIPE_478, mediapipe478};
 use eye_core::stage::{GazeEstimator, StageError};
 use eye_core::{
-    CameraId, CameraModel, FaceObservation, GazeRay, Measured, Observations, Rig, Side, Timestamp,
+    CameraId, CameraModel, FaceObservation, GazeRay, Measured, Observations, RaySource, Rig, Side,
+    SourcedRay, Timestamp,
 };
 use eye_geometry::camera::{Intrinsics, pixel_ray};
 use eye_geometry::eyeball::{
@@ -312,14 +313,14 @@ impl GazeEstimator for LandmarkEstimator {
         Self::NAME
     }
 
-    fn estimate(&mut self, obs: &[Observations], rig: &Rig) -> Result<Vec<GazeRay>, StageError> {
+    fn estimate(&mut self, obs: &[Observations], rig: &Rig) -> Result<Vec<SourcedRay>, StageError> {
         let mut rays = Vec::new();
         for o in obs {
             if let Some(frame) = self.estimate_frame(o, rig)? {
                 rays.extend(frame.eyes.into_iter().map(|e| e.ray));
             }
         }
-        Ok(rays)
+        Ok(SourcedRay::tag(RaySource::RgbOnly, rays))
     }
 }
 
