@@ -193,8 +193,9 @@ fn annulus_mean(diff: GrayView<'_>, centroid: Point2<f64>, r_min: f64, r_max: f6
 }
 
 /// Threshold, connected components and the per-blob filters of the IR pupil algorithm (steps 2
-/// to 5). Returns the surviving candidates, sorted by peak value before the area/aspect/contrast
-/// filters are applied.
+/// to 5). Components already smaller than `pupil_area_px[0]` are excluded from the
+/// `max_candidates` budget before truncation, since they can never pass the area gate; they are
+/// still run through that gate below so rejection counts and traces stay accurate.
 pub(crate) fn candidates(
     diff: GrayView<'_>,
     options: &IrClassicOptions,
@@ -214,17 +215,23 @@ pub(crate) fn candidates(
         options.min_threshold,
     );
 
-    let mut components: Vec<(Vec<usize>, u8)> = label_components(&th, w, h, t_hi, t_lo)
+    let components: Vec<(Vec<usize>, u8)> = label_components(&th, w, h, t_hi, t_lo)
         .into_iter()
         .map(|pixels| {
             let peak = pixels.iter().map(|&i| th[i]).max().unwrap_or(0);
             (pixels, peak)
         })
         .collect();
-    components.sort_by_key(|c| std::cmp::Reverse(c.1));
     let components_total = components.len() as u64;
-    let truncated = components.len() > options.max_candidates;
-    components.truncate(options.max_candidates);
+
+    let (mut plausible, mut sub_floor): (Vec<_>, Vec<_>) = components
+        .into_iter()
+        .partition(|(pixels, _)| pixels.len() as u32 >= options.pupil_area_px[0]);
+    plausible.sort_by_key(|c| std::cmp::Reverse(c.1));
+    let truncated = plausible.len() > options.max_candidates;
+    plausible.truncate(options.max_candidates);
+    let mut components = plausible;
+    components.append(&mut sub_floor);
 
     let mut out = Vec::new();
     let (mut rejected_area, mut rejected_aspect, mut rejected_contrast, mut rejected_iris_ratio) =
@@ -390,6 +397,39 @@ mod tests {
         let diff = crate::image::saturating_diff(lit.view(), dark.view()).unwrap();
         let (cands, _counts) = candidates(diff.view(), &IrClassicOptions::default());
         assert_eq!(cands.len(), 2);
+    }
+
+    #[test]
+    fn test_noise_specks_do_not_consume_candidate_budget() {
+        let scene = SyntheticIr::default_scene();
+        let (lit, dark) = scene.render();
+        let diff = crate::image::saturating_diff(lit.view(), dark.view()).unwrap();
+        let (w, h) = (diff.width(), diff.height());
+        let mut data = diff.data().to_vec();
+
+        // 100 single-pixel specks placed well outside the face ellipse (x in [220, 420]
+        // around the default scene's face), at full brightness so they out-rank the real
+        // pupils once sorted by peak.
+        for i in 0..100u32 {
+            let x = 10 + (i % 10) * 6;
+            let y = 10 + (i / 10) * 6;
+            data[(y * w + x) as usize] = 255;
+        }
+
+        let diff = eye_core::image::GrayImage::new(w, h, data).unwrap();
+        let options = IrClassicOptions {
+            max_candidates: 64,
+            ..IrClassicOptions::default()
+        };
+        let (cands, counts) = candidates(diff.view(), &options);
+        assert_eq!(
+            cands.len(),
+            2,
+            "expected both real pupils to survive the noise-speck budget, truncated={}, components_total={}, rejected_area={}",
+            counts.truncated,
+            counts.components_total,
+            counts.area
+        );
     }
 
     #[test]
