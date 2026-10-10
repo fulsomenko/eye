@@ -1,5 +1,6 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use eye::config::{Config, EnvOverrides};
+use eye_bench::matrix::BenchMatrix;
 use eye_bench::testing::{FOUR_BY_FOUR_CENTRES, SyntheticSession, write_synthetic_session};
 use predicates::prelude::*;
 
@@ -116,6 +117,26 @@ fn test_baseline_pipeline_filters_equal_builtin_default() {
             .config;
         assert_eq!(config.filter, builtin.filter, "{path}");
     }
+}
+
+#[test]
+fn test_fused_pccr_config_parses() {
+    let builtin = Config::builtin_default();
+    let config = Config::load_with(
+        Some(std::path::Path::new("../../bench/baseline/fused-pccr.toml")),
+        &EnvOverrides::default(),
+    )
+    .expect("loads baseline config")
+    .config;
+    assert_eq!(config.filter, builtin.filter);
+
+    let matrix =
+        BenchMatrix::from_path(std::path::Path::new("../../bench/baseline/dual.bench.toml"))
+            .expect("loads dual bench matrix");
+    assert!(
+        matrix.pipelines.iter().any(|p| p.name == "fused-pccr"),
+        "dual.bench.toml must list a fused-pccr pipeline"
+    );
 }
 
 #[test]

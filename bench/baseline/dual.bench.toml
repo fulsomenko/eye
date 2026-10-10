@@ -16,5 +16,9 @@ config = "rgb.toml"
 name = "fused"
 config = "fused.toml"
 
+[[pipeline]]
+name = "fused-pccr"
+config = "fused-pccr.toml"
+
 [evaluation]
 calibration = ["none", "loto"]

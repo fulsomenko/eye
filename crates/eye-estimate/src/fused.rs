@@ -28,8 +28,8 @@ use crate::pccr::{PccrEstimator, PccrOptions};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum IrChainKind {
-    #[default]
     Pupil,
+    #[default]
     Pccr,
 }
 
@@ -897,6 +897,7 @@ mod tests {
 
     fn fused_options_no_kappa() -> FusedOptions {
         FusedOptions {
+            ir: IrChainKind::Pupil,
             landmark: LandmarkOptions {
                 apply_kappa: false,
                 ..Default::default()
@@ -1887,6 +1888,16 @@ mod tests {
             FusedEstimator::from_config(&bad_nested, &rig),
             Err(StageError::Config(_))
         ));
+    }
+
+    #[test]
+    fn test_ir_chain_default_matches_bench_decision() {
+        assert_eq!(
+            IrChainKind::default(),
+            IrChainKind::Pccr,
+            "ir-pccr loto 6.53 deg (168 samples) beats ir loto 11.39 deg (230 samples) \
+             with enough samples (168 >= 115), so the default IR chain must be Pccr"
+        );
     }
 
     #[test]

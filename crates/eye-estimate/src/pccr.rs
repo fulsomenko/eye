@@ -630,8 +630,8 @@ mod tests {
 
         assert_eq!(
             FusedOptions::default().ir,
-            IrChainKind::Pupil,
-            "default ir chain stays Pupil"
+            IrChainKind::Pccr,
+            "default ir chain is now Pccr"
         );
     }
 
