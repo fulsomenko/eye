@@ -449,6 +449,6 @@ mod tests {
         assert_eq!(rec.level, LogLevel::Trace);
         assert_eq!(rec.fields[field::REASON], Value::Str("area".into()));
         assert_eq!(rec.fields["value"], Value::F64(3.0));
-        assert_eq!(rec.fields["min"], Value::F64(7.0));
+        assert_eq!(rec.fields["min"], Value::F64(4.0));
     }
 }

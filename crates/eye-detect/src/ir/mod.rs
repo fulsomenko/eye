@@ -54,8 +54,8 @@ impl Default for IrClassicOptions {
             background_size: 15,
             threshold_percentile: 99.9,
             min_threshold: 30,
-            pupil_area_px: [7, 120],
-            min_aspect: 0.5,
+            pupil_area_px: [4, 120],
+            min_aspect: 0.3,
             min_pupil_contrast: 1.3,
             max_iris_ratio: 0.8,
             pair_separation_px: [35.0, 95.0],
@@ -765,6 +765,67 @@ mod tests {
             Point2::new(290.3, 180.7),
             Point2::new(350.6, 181.2),
             0.05,
+        );
+    }
+
+    #[test]
+    fn test_small_pupil_above_area_floor_is_detected() {
+        let mut scene = SyntheticIr::default_scene();
+        for eye in &mut scene.eyes {
+            eye.pupil_radius = 1.1;
+            eye.iris_radius = 2.2;
+        }
+        let (lit, dark) = scene.render();
+        let detector = IrClassicDetector::new(IrClassicOptions::default());
+        let eyes = detector
+            .detect_pair(lit.view(), dark.view())
+            .unwrap()
+            .expect("face detected");
+        assert_pupils_within(
+            &eyes,
+            Point2::new(290.3, 180.7),
+            Point2::new(350.6, 181.2),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn test_half_occluded_pupil_is_detected() {
+        let mut scene = SyntheticIr::default_scene();
+        let left_center = scene.eyes[1].pupil_center;
+        let r = scene.eyes[1].pupil_radius;
+        let cutline = left_center.y - r + 0.65 * (2.0 * r);
+        let occluder_radius = 100.0;
+        scene.specular = vec![(
+            Point2::new(left_center.x, cutline - occluder_radius),
+            occluder_radius,
+            scene.skin_level,
+        )];
+        let (lit, dark) = scene.render();
+        let detector = IrClassicDetector::new(IrClassicOptions::default());
+        let eyes = detector
+            .detect_pair(lit.view(), dark.view())
+            .unwrap()
+            .expect("face detected");
+
+        let right = eyes[0].pupil.unwrap().value().center();
+        assert!(
+            (right - Point2::new(290.3, 180.7)).norm() <= 0.05,
+            "right pupil {right:?} moved"
+        );
+
+        let left = eyes[1].pupil.unwrap().value().center();
+        assert!(
+            (left.x - left_center.x).abs() <= 0.5,
+            "left pupil x {} not within 0.5 of {}",
+            left.x,
+            left_center.x
+        );
+        let uncovered_centroid_y = (cutline + (left_center.y + r)) / 2.0;
+        assert!(
+            (left.y - uncovered_centroid_y).abs() <= 1.5,
+            "left pupil y {} not within 1.5 of uncovered-segment centroid {uncovered_centroid_y}",
+            left.y
         );
     }
 
