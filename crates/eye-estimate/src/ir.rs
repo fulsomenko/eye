@@ -1,8 +1,12 @@
 use eye_core::log::field;
 use eye_core::observation::SCHEME_IR_PUPIL_PAIR;
-use eye_core::{CameraId, CameraModel, FaceObservation, Measured, Observations, Side, Timestamp};
+use eye_core::{
+    CameraId, CameraModel, EyeObservation, FaceObservation, Measured, Observations, Side, Timestamp,
+};
 use eye_geometry::camera::pixel_ray;
 use nalgebra::{Point2, Point3};
+
+use crate::log::side_str;
 
 /// Pixel-space pupil centres from one `ir-pupil-pair` observation.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +61,36 @@ impl PupilPair {
 
 fn pupil_centre(face: &FaceObservation, side: Side) -> Option<Measured<Point2<f64>>> {
     Some(face.eye(side)?.pupil?.map(|ellipse| ellipse.center()))
+}
+
+/// The first glint within `max_px` of `pupil`, if any.
+pub(crate) fn glint_near(
+    eye: &EyeObservation,
+    side: Side,
+    pupil: &Point2<f64>,
+    max_px: f64,
+) -> Option<Measured<Point2<f64>>> {
+    let found = eye
+        .glints
+        .iter()
+        .find(|g| (*g.value() - pupil).norm() <= max_px)
+        .copied();
+    if found.is_none() {
+        let nearest_px = eye
+            .glints
+            .iter()
+            .map(|g| (*g.value() - pupil).norm())
+            .min_by(f64::total_cmp);
+        tracing::debug!(
+            { field::REASON } = "no_glint",
+            side = side_str(side),
+            glints = eye.glints.len() as u64,
+            nearest_px,
+            max_glint_offset_px = max_px,
+            "glint rejected"
+        );
+    }
+    found
 }
 
 /// 3D pupil centres `[right, left]` in the reference frame under the equal-range assumption.

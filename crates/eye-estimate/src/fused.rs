@@ -12,13 +12,14 @@ use eye_core::{
     Side, Timestamp,
 };
 use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
-use eye_geometry::eyeball::{EyeParams, Kappa, gaze_ray, optical_axis, visual_axis};
+use eye_geometry::eyeball::{EyeParams, Kappa, gaze_ray, gaze_ray_pccr, optical_axis, visual_axis};
 use eye_geometry::triangulation::{Triangulated, View, triangulate};
 use eye_geometry::uncertainty::{block_diag, propagate_fn};
 use nalgebra::{Matrix3, Point3, Unit, UnitQuaternion, Vector2, Vector3, Vector6};
 use serde::Deserialize;
 
 use crate::EstimateError;
+use crate::ir::glint_near;
 use crate::ir_pupil::{IrPupilEstimator, IrPupilOptions};
 use crate::landmark::{LandmarkEstimator, LandmarkEye, LandmarkFrame, LandmarkOptions};
 use crate::log::{side_str, trace_ray};
@@ -51,6 +52,8 @@ pub struct FusedOptions {
     pub bias_alpha: f64,
     /// Frames a source must be observed against the reference before its bias is subtracted.
     pub bias_warmup: u32,
+    /// An IR glint within this many pixels of the cross-chain pupil selects `gaze_ray_pccr` over the pupil-sphere ray.
+    pub max_glint_offset_px: f64,
 }
 
 impl Default for FusedOptions {
@@ -65,6 +68,7 @@ impl Default for FusedOptions {
             gate_chi2: 9.21,
             bias_alpha: 0.05,
             bias_warmup: 10,
+            max_glint_offset_px: 3.0,
         }
     }
 }
@@ -89,6 +93,7 @@ impl IrChain {
 pub enum FusedSource {
     Stereo,
     IrOnRgbEyeball,
+    IrGlintOnRgbEyeball,
     InverseCovariance,
     RgbOnly,
     IrOnly,
@@ -99,6 +104,7 @@ impl FusedSource {
         match self {
             Self::Stereo => "stereo",
             Self::IrOnRgbEyeball => "ir-on-rgb-eyeball",
+            Self::IrGlintOnRgbEyeball => "ir-glint-on-rgb-eyeball",
             Self::InverseCovariance => "inverse-covariance",
             Self::RgbOnly => "rgb-only",
             Self::IrOnly => "ir-only",
@@ -521,16 +527,39 @@ impl FusedEstimator {
             }
         }
 
-        let ray = gaze_ray(
-            side,
-            &eye.centre,
-            ir_cam,
-            &pupil_px,
-            &params,
-            Some(&frame.viewer),
-            frame.timestamp,
-        )?;
-        Ok(Some((ray, FusedSource::IrOnRgbEyeball)))
+        let glint = aligned
+            .face
+            .as_ref()
+            .and_then(|f| f.eye(side))
+            .and_then(|e| glint_near(e, side, pupil_px.value(), self.options.max_glint_offset_px));
+        let (ray, source) = match glint {
+            Some(glint_px) => (
+                gaze_ray_pccr(
+                    side,
+                    &eye.centre,
+                    ir_cam,
+                    &pupil_px,
+                    &glint_px,
+                    &params,
+                    Some(&frame.viewer),
+                    frame.timestamp,
+                )?,
+                FusedSource::IrGlintOnRgbEyeball,
+            ),
+            None => (
+                gaze_ray(
+                    side,
+                    &eye.centre,
+                    ir_cam,
+                    &pupil_px,
+                    &params,
+                    Some(&frame.viewer),
+                    frame.timestamp,
+                )?,
+                FusedSource::IrOnRgbEyeball,
+            ),
+        };
+        Ok(Some((ray, source)))
     }
 
     /// The selected candidate per side, at most one per side.
@@ -884,8 +913,8 @@ mod tests {
     use super::*;
     use crate::landmark::LandmarkOptions;
     use crate::testutil::{
-        EYE_CENTRES, synthetic_eye_centres, synthetic_ir_observation_at, synthetic_rgb_observation,
-        test_rig,
+        EYE_CENTRES, synthetic_eye_centres, synthetic_ir_observation_at,
+        synthetic_pccr_observation, synthetic_rgb_observation, test_rig,
     };
 
     fn frontal_screen_from_head() -> Isometry3<f64> {
@@ -1189,6 +1218,136 @@ mod tests {
     }
 
     #[test]
+    fn test_cross_chain_uses_glint_ray_when_glint_present() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+
+        let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.0, 1);
+        let mut ir =
+            synthetic_pccr_observation(&rig, target, centres[0] - EYE_CENTRES[0], 0.0, 0.0, 1);
+        ir.timestamp = rgb.timestamp;
+
+        let mut options = fused_options_no_kappa();
+        options.stereo = false;
+        let mut estimator = FusedEstimator::new(options);
+        let candidates = estimator
+            .candidates(&[rgb, ir], &rig)
+            .expect("estimate succeeds");
+
+        for side in [Side::Right, Side::Left] {
+            let centre = match side {
+                Side::Right => centres[0],
+                Side::Left => centres[1],
+            };
+            let truth = Unit::new_normalize(Point3::new(target.x, target.y, 0.0) - centre);
+            let (_, _, found) = candidates
+                .iter()
+                .find(|(s, source, _)| *s == side && *source == FusedSource::IrGlintOnRgbEyeball)
+                .expect("ir-glint-on-rgb-eyeball candidate present");
+            let error = angle_deg(&found.direction, &truth);
+            assert!(error < 0.05, "side {side:?}: error {error} deg");
+        }
+    }
+
+    #[test]
+    fn test_glint_candidate_is_gated_against_reference() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+
+        let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.0, 1);
+        let mut ir =
+            synthetic_pccr_observation(&rig, target, centres[0] - EYE_CENTRES[0], 0.0, 0.0, 1);
+        ir.timestamp = rgb.timestamp;
+
+        let mut options = fused_options_no_kappa();
+        options.stereo = false;
+        let mut estimator = FusedEstimator::new(options);
+        estimator
+            .estimate_detailed(&[rgb, ir], &rig)
+            .expect("estimate succeeds");
+
+        for side in [Side::Right, Side::Left] {
+            let decision = estimator
+                .decisions()
+                .iter()
+                .find(|d| d.side == side && d.source == FusedSource::IrGlintOnRgbEyeball)
+                .expect("ir-glint-on-rgb-eyeball decision present");
+            assert!(decision.accepted, "side {side:?}: decision {decision:?}");
+            assert!(
+                decision.mahalanobis2.is_some(),
+                "side {side:?}: decision {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cross_chain_glint_ray_is_second_order_in_centre_error() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let params = EyeParams::default();
+        let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
+
+        let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.0, 1);
+        let ir_with_glint =
+            synthetic_pccr_observation(&rig, target, centres[0] - EYE_CENTRES[0], 0.0, 0.0, 1);
+        let ir_without_glint = synthetic_ir_observation_at(&rig, centres, target, 0.0, 1);
+
+        let mut options = fused_options_no_kappa();
+        options.stereo = false;
+        let estimator = FusedEstimator::new(options);
+
+        let mut reference = LandmarkEstimator::new(LandmarkOptions {
+            apply_kappa: false,
+            ..Default::default()
+        });
+        let frame = reference
+            .estimate_frame(&rgb, &rig)
+            .expect("estimate succeeds")
+            .expect("frame present");
+        let true_eye = frame
+            .eyes
+            .iter()
+            .find(|e| e.side == Side::Right)
+            .expect("right eye present")
+            .clone();
+        let mut shifted_eye = true_eye.clone();
+        shifted_eye.centre.position.x += 3.0;
+
+        let truth = Unit::new_normalize(Point3::new(target.x, target.y, 0.0) - centres[0]);
+
+        let (glint_ray, glint_source) = estimator
+            .cross_chain(&shifted_eye, &frame, &ir_with_glint, &rig)
+            .expect("cross chain succeeds")
+            .expect("glint candidate present");
+        assert_eq!(glint_source, FusedSource::IrGlintOnRgbEyeball);
+        let glint_error = angle_deg(&glint_ray.direction, &truth);
+
+        let (pupil_ray, pupil_source) = estimator
+            .cross_chain(&shifted_eye, &frame, &ir_without_glint, &rig)
+            .expect("cross chain succeeds")
+            .expect("pupil-sphere candidate present");
+        assert_eq!(pupil_source, FusedSource::IrOnRgbEyeball);
+        let pupil_error = angle_deg(&pupil_ray.direction, &truth);
+
+        assert!(
+            glint_error < 0.2,
+            "glint candidate error {glint_error} deg under a 3 mm centre error"
+        );
+        assert!(
+            pupil_error > 10.0,
+            "pupil-sphere candidate error {pupil_error} deg should be first order in the centre \
+             error"
+        );
+    }
+
+    #[test]
     fn test_selection_picks_min_determinant_among_accepted() {
         let rig = test_rig();
         let screen_from_head = frontal_screen_from_head();
@@ -1432,7 +1591,8 @@ mod tests {
                 FusedSource::Stereo
                 | FusedSource::InverseCovariance
                 | FusedSource::RgbOnly
-                | FusedSource::IrOnly => {
+                | FusedSource::IrOnly
+                | FusedSource::IrGlintOnRgbEyeball => {
                     assert_eq!(ray.timestamp, Timestamp::from_nanos(68_000_000));
                     assert!(ray.head_rotation.is_some());
                 }

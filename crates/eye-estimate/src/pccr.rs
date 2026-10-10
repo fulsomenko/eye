@@ -8,7 +8,7 @@ use nalgebra::{Matrix6, Point2, Point3, Unit, UnitQuaternion, Vector3, Vector6};
 use serde::Deserialize;
 
 use crate::EstimateError;
-use crate::ir::PupilPair;
+use crate::ir::{PupilPair, glint_near};
 use crate::log::{side_str, trace_ray};
 use crate::options::parse_options;
 
@@ -119,7 +119,6 @@ impl PccrEstimator {
         Ok(rays)
     }
 
-    /// The first glint within `max_glint_offset_px` of `pupil`, if any.
     fn glint_for(
         &self,
         face: &eye_core::FaceObservation,
@@ -134,28 +133,7 @@ impl PccrEstimator {
             );
             return None;
         };
-        let max = self.options.max_glint_offset_px;
-        let found = eye
-            .glints
-            .iter()
-            .find(|g| (*g.value() - pupil.value()).norm() <= max)
-            .copied();
-        if found.is_none() {
-            let nearest_px = eye
-                .glints
-                .iter()
-                .map(|g| (*g.value() - pupil.value()).norm())
-                .min_by(f64::total_cmp);
-            tracing::debug!(
-                { field::REASON } = "no_glint",
-                side = side_str(side),
-                glints = eye.glints.len() as u64,
-                nearest_px,
-                max_glint_offset_px = max,
-                "glint rejected"
-            );
-        }
-        found
+        glint_near(eye, side, pupil.value(), self.options.max_glint_offset_px)
     }
 
     fn solve(
