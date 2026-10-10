@@ -1,7 +1,6 @@
 //! IR-from-RGB stereo extrinsics: the rigid transform between two cameras recovered from
 //! boards seen simultaneously by both, refined jointly with all board poses.
 
-use eye_core::log::field;
 use eye_core::{CameraId, Measured, Rig};
 use eye_geometry::camera::Intrinsics;
 use eye_geometry::lsq::{self, ResidualModel, SolveOptions};
@@ -13,7 +12,8 @@ use nalgebra::{
 
 use crate::checkerboard::BoardObservation;
 use crate::error::CalibrationError;
-use crate::intrinsics::{homography_dlt, pose_from_homography, reject_views};
+use crate::intrinsics::{homography_dlt, pose_from_homography};
+use crate::views::{RejectionConfig, solve_with_view_rejection, trace_lm_solve};
 
 #[derive(Debug, Clone)]
 pub struct StereoView {
@@ -209,16 +209,7 @@ fn solve_joint(
         sigma: cams.sigma,
     };
     let fit = lsq::solve(&problem, x0, opts)?;
-    tracing::trace!(
-        views = corners.len() as u64,
-        params = fit.x.len() as u64,
-        residuals = problem.num_residuals() as u64,
-        chi2 = fit.chi2,
-        dof = fit.dof as u64,
-        evaluations = fit.evaluations as u64,
-        chi2_reduced = fit.chi2_reduced(),
-        "lm solve"
-    );
+    trace_lm_solve(corners.len(), problem.num_residuals(), &fit);
     let b_from_a = problem.b_from_a(&fit.x);
     let board_poses = (0..corners.len())
         .map(|v| problem.a_from_board(&fit.x, v))
@@ -245,19 +236,6 @@ fn initial_params(t0: Vector3<f64>, poses_a: &[Isometry3<f64>]) -> DVector<f64> 
         x0[base + 3] = t.x;
         x0[base + 4] = t.y;
         x0[base + 5] = t.z;
-    }
-    x0
-}
-
-fn subset_params(x: &DVector<f64>, kept: &[usize]) -> DVector<f64> {
-    let mut x0 = DVector::zeros(6 + 6 * kept.len());
-    x0.rows_mut(0, 6).copy_from(&x.rows(0, 6));
-    for (new_v, &orig_v) in kept.iter().enumerate() {
-        let src = 6 + 6 * orig_v;
-        let dst = 6 + 6 * new_v;
-        for off in 0..6 {
-            x0[dst + off] = x[src + off];
-        }
     }
     x0
 }
@@ -341,43 +319,31 @@ pub fn calibrate_stereo(
         intr_b,
         sigma: cfg.corner_sigma_px,
     };
-    let (fit1, x1) = solve_joint(&cams, &corners, r0_x, &r0_v, x0, &opts)?;
-
-    let per_view_rms1: Vec<f64> = corners
-        .iter()
-        .zip(&fit1.board_poses)
-        .map(|(pts, pose)| view_rms(intr_a, intr_b, &fit1.b_from_a, pose, pts))
-        .collect();
-
-    let (kept, threshold_px) = reject_views(&per_view_rms1, cfg.view_outlier_factor);
-    for (view, &rms_px) in per_view_rms1.iter().enumerate() {
-        if !kept.contains(&view) {
-            tracing::debug!(
-                view = view as u64,
-                rms_px,
-                threshold_px,
-                { field::REASON } = "rms_above_threshold",
-                "view rejected"
-            );
-        }
-    }
-    if kept.len() < cfg.min_views {
-        return Err(CalibrationError::InsufficientData {
-            what: "views",
-            need: cfg.min_views,
-            got: kept.len(),
-        });
-    }
-
-    let final_fit = if kept.len() == views.len() {
-        fit1
-    } else {
-        let kept_corners: Vec<ViewCorr> = kept.iter().map(|&i| corners[i].clone()).collect();
-        let kept_r0_v: Vec<UnitQuaternion<f64>> = kept.iter().map(|&i| r0_v[i]).collect();
-        let x0_2 = subset_params(&x1, &kept);
-        let (fit2, _) = solve_joint(&cams, &kept_corners, r0_x, &kept_r0_v, x0_2, &opts)?;
-        fit2
-    };
+    let vf = solve_with_view_rejection(
+        views.len(),
+        6,
+        x0,
+        RejectionConfig {
+            min_views: cfg.min_views,
+            factor: cfg.view_outlier_factor,
+        },
+        |kept, x0| {
+            let kc: Vec<ViewCorr> = kept.iter().map(|&i| corners[i].clone()).collect();
+            let kr: Vec<UnitQuaternion<f64>> = kept.iter().map(|&i| r0_v[i]).collect();
+            solve_joint(&cams, &kc, r0_x, &kr, x0, &opts)
+        },
+        |fit, pos, view| {
+            view_rms(
+                intr_a,
+                intr_b,
+                &fit.b_from_a,
+                &fit.board_poses[pos],
+                &corners[view],
+            )
+        },
+    )?;
+    let kept = vf.kept;
+    let final_fit = vf.refit.unwrap_or(vf.first);
 
     let mut sq_sum = 0.0;
     let mut n_total = 0usize;
@@ -450,6 +416,7 @@ pub fn is_static(prev: &BoardObservation, cur: &BoardObservation, tol_px: f64) -
 
 #[cfg(test)]
 mod tests {
+    use eye_core::log::field;
     use eye_core::{CameraModel, OutputId, ScreenModel};
     use eye_geometry::synth::SplitMix64;
     use nalgebra::Vector2;
@@ -680,7 +647,7 @@ mod tests {
 
         let lm_solve: Vec<_> = records
             .iter()
-            .filter(|r| r.message == "lm solve" && r.target == "eye_calibration::stereo")
+            .filter(|r| r.message == "lm solve" && r.target == "eye_calibration::views")
             .collect();
         assert_eq!(lm_solve.len(), 1);
     }
@@ -701,7 +668,7 @@ mod tests {
 
         let rejected: Vec<_> = records
             .iter()
-            .filter(|r| r.message == "view rejected" && r.target == "eye_calibration::stereo")
+            .filter(|r| r.message == "view rejected" && r.target == "eye_calibration::views")
             .collect();
         assert_eq!(rejected.len(), 1);
         let rec = rejected[0];
@@ -715,7 +682,7 @@ mod tests {
 
         let lm_solve: Vec<_> = records
             .iter()
-            .filter(|r| r.message == "lm solve" && r.target == "eye_calibration::stereo")
+            .filter(|r| r.message == "lm solve" && r.target == "eye_calibration::views")
             .collect();
         assert_eq!(lm_solve.len(), 2);
     }

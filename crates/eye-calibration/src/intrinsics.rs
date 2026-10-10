@@ -1,7 +1,6 @@
 //! Zhang's camera calibration: per-view homographies, the closed-form intrinsics solution,
 //! pose recovery, and a joint Levenberg-Marquardt refinement over all views at once.
 
-use eye_core::log::field;
 use eye_core::{CameraId, Rig};
 use eye_geometry::GeometryError;
 use eye_geometry::camera::{Distortion, Intrinsics};
@@ -14,6 +13,7 @@ use nalgebra::{
 use crate::checkerboard::BoardObservation;
 use crate::error::CalibrationError;
 use crate::nominal::focal_prior;
+use crate::views::{RejectionConfig, solve_with_view_rejection, trace_lm_solve};
 
 /// The two Dell Latitude 7420 webcam lens modules' published diagonal FOV, same as `identify_module`.
 const DELL_DIAG_FOV_DEG: [f64; 2] = [75.8, 87.0];
@@ -358,16 +358,7 @@ fn solve_joint(
         sigma: ctx.sigma,
     };
     let fit = lsq::solve(&problem, x0, opts)?;
-    tracing::trace!(
-        views = corners.len() as u64,
-        params = fit.x.len() as u64,
-        residuals = problem.num_residuals() as u64,
-        chi2 = fit.chi2,
-        dof = fit.dof as u64,
-        evaluations = fit.evaluations as u64,
-        chi2_reduced = fit.chi2_reduced(),
-        "lm solve"
-    );
+    trace_lm_solve(corners.len(), problem.num_residuals(), &fit);
     let intrinsics = problem.intrinsics(&fit.x);
     let poses = (0..corners.len())
         .map(|v| problem.pose(&fit.x, v))
@@ -400,19 +391,6 @@ fn initial_params(n_intr: usize, k: &Matrix3<f64>, poses: &[Isometry3<f64>]) -> 
     x0
 }
 
-fn subset_params(n_intr: usize, x: &DVector<f64>, kept: &[usize]) -> DVector<f64> {
-    let mut x0 = DVector::zeros(n_intr + 6 * kept.len());
-    x0.rows_mut(0, n_intr).copy_from(&x.rows(0, n_intr));
-    for (new_v, &orig_v) in kept.iter().enumerate() {
-        let src = n_intr + 6 * orig_v;
-        let dst = n_intr + 6 * new_v;
-        for off in 0..6 {
-            x0[dst + off] = x[src + off];
-        }
-    }
-    x0
-}
-
 /// Per-axis RMS reprojection error for one view: sqrt(sum(dx^2 + dy^2) / (2N)).
 fn view_rms(intr: &Intrinsics, pose: &Isometry3<f64>, pts: &ViewCorners) -> f64 {
     let mut sq = 0.0;
@@ -422,28 +400,6 @@ fn view_rms(intr: &Intrinsics, pose: &Isometry3<f64>, pts: &ViewCorners) -> f64 
         }
     }
     (sq / (2.0 * pts.len() as f64)).sqrt()
-}
-
-/// Drops views whose RMS exceeds `factor * median`, returns (kept indices, threshold).
-pub(crate) fn reject_views(per_view_rms: &[f64], factor: f64) -> (Vec<usize>, f64) {
-    let mut sorted = per_view_rms.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).expect("RMS values are finite"));
-    let mid = sorted.len() / 2;
-    let median = if sorted.is_empty() {
-        0.0
-    } else if sorted.len() % 2 == 1 {
-        sorted[mid]
-    } else {
-        (sorted[mid - 1] + sorted[mid]) / 2.0
-    };
-    let threshold = factor * median;
-    let kept = per_view_rms
-        .iter()
-        .enumerate()
-        .filter(|&(_, &r)| r <= threshold)
-        .map(|(i, _)| i)
-        .collect();
-    (kept, threshold)
 }
 
 pub fn calibrate_intrinsics(
@@ -508,53 +464,37 @@ pub fn calibrate_intrinsics(
         sigma: cfg.corner_sigma_px,
     };
     let opts = SolveOptions::default();
-    let (fit1, x1) = solve_joint(ctx, &corners, &r0, x0, &opts)?;
 
-    let per_view_rms1: Vec<f64> = corners
-        .iter()
-        .zip(&fit1.poses)
-        .map(|(pts, pose)| view_rms(&fit1.intrinsics, pose, pts))
-        .collect();
-
-    let (kept, threshold_px) = reject_views(&per_view_rms1, cfg.view_outlier_factor);
-    for (view, &rms_px) in per_view_rms1.iter().enumerate() {
-        if !kept.contains(&view) {
-            tracing::debug!(
-                view = view as u64,
-                rms_px,
-                threshold_px,
-                { field::REASON } = "rms_above_threshold",
-                "view rejected"
-            );
-        }
-    }
-
-    if kept.len() < cfg.min_views {
-        return Err(CalibrationError::InsufficientData {
-            what: "views",
-            need: cfg.min_views,
-            got: kept.len(),
-        });
-    }
-
-    let (final_fit, per_view_rms_px) = if kept.len() == views.len() {
-        (fit1, per_view_rms1)
-    } else {
-        let kept_corners: Vec<ViewCorners> = kept.iter().map(|&i| corners[i].clone()).collect();
-        let kept_r0: Vec<UnitQuaternion<f64>> = kept.iter().map(|&i| r0[i]).collect();
-        let x0_2 = subset_params(n_intr, &x1, &kept);
-        let (fit2, _) = solve_joint(ctx, &kept_corners, &kept_r0, x0_2, &opts)?;
-
-        let mut rms_all = vec![0.0; views.len()];
-        for (new_v, &orig_v) in kept.iter().enumerate() {
-            rms_all[orig_v] = view_rms(&fit2.intrinsics, &fit2.poses[new_v], &corners[orig_v]);
-        }
-        for (i, slot) in rms_all.iter_mut().enumerate() {
-            if !kept.contains(&i) {
-                *slot = view_rms(&fit2.intrinsics, &fit1.poses[i], &corners[i]);
+    let vf = solve_with_view_rejection(
+        views.len(),
+        n_intr,
+        x0,
+        RejectionConfig {
+            min_views: cfg.min_views,
+            factor: cfg.view_outlier_factor,
+        },
+        |kept, x0| {
+            let kc: Vec<ViewCorners> = kept.iter().map(|&i| corners[i].clone()).collect();
+            let kr: Vec<UnitQuaternion<f64>> = kept.iter().map(|&i| r0[i]).collect();
+            solve_joint(ctx, &kc, &kr, x0, &opts)
+        },
+        |fit, pos, view| view_rms(&fit.intrinsics, &fit.poses[pos], &corners[view]),
+    )?;
+    let kept = vf.kept.clone();
+    let (final_fit, per_view_rms_px) = match vf.refit {
+        None => (vf.first, vf.per_view_rms),
+        Some(fit2) => {
+            let mut rms_all = vec![0.0; views.len()];
+            for (new_v, &orig_v) in kept.iter().enumerate() {
+                rms_all[orig_v] = view_rms(&fit2.intrinsics, &fit2.poses[new_v], &corners[orig_v]);
             }
+            for (i, slot) in rms_all.iter_mut().enumerate() {
+                if !kept.contains(&i) {
+                    *slot = view_rms(&fit2.intrinsics, &vf.first.poses[i], &corners[i]);
+                }
+            }
+            (fit2, rms_all)
         }
-        (fit2, rms_all)
     };
     for (view, &rms_px) in per_view_rms_px.iter().enumerate() {
         tracing::trace!(
@@ -716,6 +656,7 @@ pub(crate) fn synthetic_board_poses(
 #[cfg(test)]
 mod tests {
     use approx::{assert_abs_diff_eq, assert_relative_eq};
+    use eye_core::log::field;
     use eye_core::{CameraId, CameraModel, OutputId, Rig, ScreenModel};
     use nalgebra::{Translation3, Vector3};
 

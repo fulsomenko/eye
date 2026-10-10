@@ -14,3 +14,4 @@ pub mod store;
 #[cfg(test)]
 mod testutil;
 pub mod user_fit;
+mod views;
