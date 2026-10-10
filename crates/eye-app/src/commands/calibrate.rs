@@ -8,7 +8,7 @@ use eye::config::Config;
 use eye::pipeline::{Pipeline, RayStep};
 use eye::registry::Registry;
 use eye_bench::calibration::{
-    dot_session_fitter, fit_samples, latest_presentation, loto, position_key,
+    dot_session_fitter, fit_samples, latest_presentation, loto_with, position_key,
 };
 use eye_bench::metrics::{MetricParams, SessionMetrics, compute};
 use eye_bench::runner::replay_session;
@@ -498,10 +498,12 @@ pub fn fit_recording(
     let mut replayed = replay_session(dir, config, registry, protocol)?;
     let run = &replayed.run;
     let base_len = run.protocol.grid[0] * run.protocol.grid[1];
+    let windows = run.windows.clone();
+    let include = latest_presentation(&windows, base_len);
     let samples = fit_samples(
         &run.windows,
         run.steps.iter().filter_map(|s| s.batch.as_ref()),
-        latest_presentation(&run.windows, base_len),
+        &include,
     );
     anyhow::ensure!(
         !samples.is_empty(),
@@ -523,7 +525,7 @@ pub fn fit_recording(
         .into_iter()
         .collect();
     profile.provenance.protocol = Some(run.protocol);
-    let expected = match loto(&mut replayed, &dot_session_fitter) {
+    let expected = match loto_with(&mut replayed, &dot_session_fitter, &include) {
         Ok(estimate) => {
             for warning in &estimate.warnings {
                 tracing::warn!(%warning, "leave-one-target-out estimate");
@@ -890,6 +892,10 @@ mod tests {
             result.rejected_targets.is_empty(),
             "the retry's unbiased samples replaced the rejected ones: {:?}",
             result.rejected_targets
+        );
+        assert!(
+            result.expected.unwrap().angular_error_deg.unwrap().p95 < 0.1,
+            "the loto estimate must not be scored on the rejected presentation"
         );
     }
 

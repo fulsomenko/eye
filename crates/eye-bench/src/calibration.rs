@@ -71,9 +71,11 @@ pub fn fit_samples<'a>(
 pub struct LotoOutcome {
     pub input: EvalInput,
     pub warnings: Vec<String>,
+    /// Windows `include` dropped before folding (e.g. a rejected presentation superseded by a retry).
+    pub excluded_windows: usize,
 }
 
-fn fold_keys(windows: &[FixationWindow]) -> Vec<(u64, u64)> {
+fn fold_keys<'a>(windows: impl Iterator<Item = &'a FixationWindow>) -> Vec<(u64, u64)> {
     let mut keys = Vec::new();
     for w in windows {
         let key = position_key(w);
@@ -143,6 +145,16 @@ pub fn cross(
 
 /// Err when there is no window or every fold failed. Leaves the pipeline uncorrected.
 pub fn loto(replayed: &mut Replayed, fitter: Fitter<'_>) -> Result<LotoOutcome, String> {
+    loto_with(replayed, fitter, &|_| true)
+}
+
+/// LOTO over the windows that `include` admits: folds, training sets and held-out sets all use
+/// the same predicate.
+pub fn loto_with(
+    replayed: &mut Replayed,
+    fitter: Fitter<'_>,
+    include: &dyn Fn(&FixationWindow) -> bool,
+) -> Result<LotoOutcome, String> {
     if replayed.run.windows.is_empty() {
         return Err("no fixation windows".to_string());
     }
@@ -153,16 +165,18 @@ pub fn loto(replayed: &mut Replayed, fitter: Fitter<'_>) -> Result<LotoOutcome, 
     )
     .entered();
 
+    let excluded_windows = replayed.run.windows.iter().filter(|w| !include(w)).count();
+
     let mut warnings = Vec::new();
     let mut eval_windows = Vec::new();
     let mut first_error: Option<String> = None;
     let mut any_ok = false;
 
-    for key in fold_keys(&replayed.run.windows) {
+    for key in fold_keys(replayed.run.windows.iter().filter(|w| include(w))) {
         let train = fit_samples(
             &replayed.run.windows,
             replayed.run.steps.iter().filter_map(|s| s.batch.as_ref()),
-            |w| position_key(w) != key,
+            |w| include(w) && position_key(w) != key,
         );
         let profile = match fitter(&train, &replayed.run.rig) {
             Ok(profile) => profile,
@@ -171,7 +185,7 @@ pub fn loto(replayed: &mut Replayed, fitter: Fitter<'_>) -> Result<LotoOutcome, 
                     .run
                     .windows
                     .iter()
-                    .find(|w| position_key(w) == key)
+                    .find(|w| include(w) && position_key(w) == key)
                     .expect("key was derived from these windows");
                 tracing::warn!(
                     target_px_x = held_out_window.target_px_logical.x,
@@ -194,7 +208,7 @@ pub fn loto(replayed: &mut Replayed, fitter: Fitter<'_>) -> Result<LotoOutcome, 
             .run
             .windows
             .iter()
-            .filter(|w| position_key(w) == key)
+            .filter(|w| include(w) && position_key(w) == key)
             .cloned()
             .collect();
 
@@ -229,6 +243,7 @@ pub fn loto(replayed: &mut Replayed, fitter: Fitter<'_>) -> Result<LotoOutcome, 
             processing: replayed.run.processing(),
         },
         warnings,
+        excluded_windows,
     })
 }
 
@@ -249,7 +264,7 @@ pub fn dot_session_fitter_with(
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use approx::assert_relative_eq;
     use eye_calibration::protocol::ProtocolConfig;
@@ -419,6 +434,116 @@ mod tests {
         };
         let result = loto(replayed, &fitter);
         (result, calls.into_inner())
+    }
+
+    type SpyWithResult = (
+        Result<LotoOutcome, String>,
+        Vec<BTreeMap<(u64, u64), usize>>,
+    );
+
+    fn spy_loto_with(
+        replayed: &mut Replayed,
+        include: &dyn Fn(&FixationWindow) -> bool,
+    ) -> SpyWithResult {
+        let calls: RefCell<Vec<BTreeMap<(u64, u64), usize>>> = RefCell::new(Vec::new());
+        let fitter = |samples: &[FitSample], rig: &Rig| {
+            let mut counts: BTreeMap<(u64, u64), usize> = BTreeMap::new();
+            for s in samples {
+                *counts
+                    .entry((s.target_mm.x.to_bits(), s.target_mm.y.to_bits()))
+                    .or_insert(0) += 1;
+            }
+            calls.borrow_mut().push(counts);
+            dot_session_fitter(samples, rig)
+        };
+        let result = loto_with(replayed, &fitter, include);
+        (result, calls.into_inner())
+    }
+
+    #[test]
+    fn test_loto_excludes_rejected_presentation_from_training_and_scoring() {
+        let base: Vec<(f64, f64)> = FOUR_BY_FOUR_CENTRES[..9].to_vec();
+        let bad_index = 4;
+        let mut targets = base.clone();
+        targets.push(base[bad_index]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: targets.clone(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let config = kappa_ray_config(&targets, [0.0, 0.0], Some((bad_index, [10.0, 0.0])));
+        let mut replayed = replay_session(
+            &session_dir,
+            &config,
+            &fake_registry(),
+            &ProtocolConfig::default(),
+        )
+        .unwrap();
+
+        let windows = replayed.run.windows.clone();
+        let include = latest_presentation(&windows, 9);
+        let rejected_key = position_key(&windows[bad_index]);
+
+        let (result, calls) = spy_loto_with(&mut replayed, &include);
+        let outcome = result.unwrap();
+
+        let frames_per_target = 24;
+        for (i, counts) in calls.iter().enumerate() {
+            if let Some(&count) = counts.get(&rejected_key) {
+                assert_eq!(
+                    count, frames_per_target,
+                    "fold {i} trained on both the rejected presentation and its retry"
+                );
+            }
+        }
+
+        let target_key =
+            |w: &crate::metrics::EvalWindow| (w.target_mm.x.to_bits(), w.target_mm.y.to_bits());
+        assert!(
+            outcome
+                .input
+                .windows
+                .iter()
+                .all(|w| target_key(w) != rejected_key || w.target_index != bad_index),
+            "a held-out window must never be the rejected presentation"
+        );
+        assert_eq!(outcome.excluded_windows, 1);
+
+        let metrics =
+            crate::metrics::compute(&outcome.input, &crate::metrics::MetricParams::default());
+        assert!(
+            metrics.angular_error_deg.unwrap().mean < 0.1,
+            "pooled mean should drop once the 10 deg presentation is excluded"
+        );
+    }
+
+    #[test]
+    fn test_loto_with_include_all_matches_loto() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let config = kappa_ray_config(&FOUR_BY_FOUR_CENTRES, [3.0, -1.0], None);
+        let mut replayed = replay_session(
+            &session_dir,
+            &config,
+            &fake_registry(),
+            &ProtocolConfig::default(),
+        )
+        .unwrap();
+
+        let (result, calls) = spy_loto_with(&mut replayed, &|_| true);
+        result.unwrap();
+        assert_eq!(calls.len(), 16);
+        for keys in &calls {
+            assert_eq!(keys.len(), 15);
+        }
     }
 
     #[test]
