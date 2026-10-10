@@ -32,6 +32,10 @@ pub enum BenchError {
     MissingCamera { camera: String, session: String },
     #[error("recording {session} has no [rig] snapshot")]
     NoRig { session: String },
+    #[error("rig mismatch for session {session}: {reason}")]
+    RigMismatch { session: String, reason: String },
+    #[error("rig source: {0}")]
+    RigSource(String),
     #[error("bench matrix: {0}")]
     Matrix(String),
 }

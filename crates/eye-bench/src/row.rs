@@ -44,6 +44,10 @@ pub struct BenchRow {
     pub kind: RowKind,
     /// Session id, or `"all"` for an aggregate row.
     pub session: String,
+    /// The rig this row scored with: `"session"`, `"stored"` or `"file:<path>"`.
+    pub rig_source: String,
+    /// `""` for an error row or an aggregate spanning sessions with no single rig.
+    pub rig_fingerprint: String,
     /// FrameSets whose pipeline step was skipped after a stage error (they count as dropout).
     pub step_errors: usize,
     /// Non-fatal problems (e.g. a failed calibration fold); listed under `## Warnings`.

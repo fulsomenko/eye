@@ -7,15 +7,17 @@ use std::time::{Duration, Instant};
 use eye::config::{Config, EnvOverrides};
 use eye::pipeline::{Pipeline, PipelineError, RayBatch, RayStep};
 use eye::registry::Registry;
+use eye_calibration::correction::rig_fingerprint;
+use eye_calibration::error::CalibrationError;
 use eye_calibration::protocol::{FixationWindow, ProtocolConfig, TargetProtocol};
-use eye_calibration::store::rig_from_table;
-use eye_capture::session::{RecordedCamera, Recording};
+use eye_calibration::store::{read_rig, rig_from_table};
+use eye_capture::session::{RecordedCamera, Recording, SessionMeta};
 use eye_core::log::{field, span};
-use eye_core::{CameraInfo, Frame, FrameSet, GazePoint, Rig, Timestamp};
+use eye_core::{CameraInfo, Frame, FrameSet, GazePoint, OutputId, Rig, Timestamp};
 use nalgebra::{Point3, Vector3};
 
 use crate::error::BenchError;
-use crate::matrix::{BenchMatrix, PipelineSpec};
+use crate::matrix::{BenchMatrix, PipelineSpec, RigSource};
 use crate::metrics::{EvalInput, EvalPoint, EvalWindow, Summary, compute};
 use crate::report::BenchReport;
 use crate::row::{BenchRow, CalibrationMode, RowKind, RowOutcome};
@@ -36,6 +38,9 @@ pub struct SessionRun {
     pub rig: Rig,
     /// The protocol the windows were built from (the recording's, else the fallback).
     pub protocol: ProtocolConfig,
+    /// `"session"`, `"stored"` or `"file:<path>"`.
+    pub rig_source: String,
+    pub rig_fingerprint: String,
     pub windows: Vec<FixationWindow>,
     pub steps: Vec<Step>,
 }
@@ -131,6 +136,81 @@ fn step(pipeline: &mut Pipeline, set: &FrameSet) -> Result<Step, BenchError> {
     Ok(step)
 }
 
+/// The session's own rig, parsed from its `[rig]` snapshot.
+#[allow(clippy::result_large_err)]
+fn session_rig(meta: &SessionMeta) -> Result<Rig, BenchError> {
+    let rig_table = meta.rig.as_ref().ok_or_else(|| BenchError::NoRig {
+        session: meta.session_id.clone(),
+    })?;
+    rig_from_table(rig_table).map_err(|e| BenchError::Calibration(Box::new(e)))
+}
+
+/// `candidate` must carry every camera `recorded` has (same id, width, height) and `recorded`'s
+/// screen output.
+#[allow(clippy::result_large_err)]
+fn check_rig_compatible(recorded: &Rig, candidate: &Rig, session: &str) -> Result<(), BenchError> {
+    if candidate.screen().output != recorded.screen().output {
+        return Err(BenchError::RigMismatch {
+            session: session.to_string(),
+            reason: format!(
+                "rig output {:?} does not match recording output {:?}",
+                candidate.screen().output,
+                recorded.screen().output
+            ),
+        });
+    }
+    for cam in recorded.cameras() {
+        match candidate.camera(cam.id.as_str()) {
+            Some(c) if c.width == cam.width && c.height == cam.height => {}
+            Some(c) => {
+                return Err(BenchError::RigMismatch {
+                    session: session.to_string(),
+                    reason: format!(
+                        "camera {:?} is {}x{} in the override rig but {}x{} in the recording",
+                        cam.id, c.width, c.height, cam.width, cam.height
+                    ),
+                });
+            }
+            None => {
+                return Err(BenchError::RigMismatch {
+                    session: session.to_string(),
+                    reason: format!("override rig has no camera {:?}", cam.id),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves the rig a replay runs with, and the label its rows are recorded under.
+#[allow(clippy::result_large_err)]
+pub fn resolve_rig(
+    meta: &SessionMeta,
+    source: &RigSource,
+    store: &dyn Fn(&OutputId) -> Result<Option<Rig>, CalibrationError>,
+) -> Result<(Rig, String), BenchError> {
+    match source {
+        RigSource::Session => Ok((session_rig(meta)?, source.label())),
+        RigSource::Stored => {
+            let recorded = session_rig(meta)?;
+            let output = recorded.screen().output.clone();
+            let stored = store(&output)
+                .map_err(|e| BenchError::RigSource(e.to_string()))?
+                .ok_or_else(|| {
+                    BenchError::RigSource(format!("no stored rig for output {output}"))
+                })?;
+            check_rig_compatible(&recorded, &stored, &meta.session_id)?;
+            Ok((stored, source.label()))
+        }
+        RigSource::File(path) => {
+            let recorded = session_rig(meta)?;
+            let file_rig = read_rig(path).map_err(|e| BenchError::RigSource(e.to_string()))?;
+            check_rig_compatible(&recorded, &file_rig, &meta.session_id)?;
+            Ok((file_rig, source.label()))
+        }
+    }
+}
+
 /// Replays one recording through a fresh pipeline without correction.
 ///
 /// `fallback` is used only when the recording carries no protocol.
@@ -141,6 +221,29 @@ pub fn replay_session(
     registry: &Registry,
     fallback: &ProtocolConfig,
 ) -> Result<Replayed, BenchError> {
+    replay_session_with_rig(
+        dir,
+        config,
+        registry,
+        fallback,
+        &RigSource::Session,
+        &|_| Ok(None),
+    )
+}
+
+/// Replays one recording through a fresh pipeline without correction, scoring it with the rig
+/// `rig_source` resolves to (`store` is consulted only for `RigSource::Stored`).
+///
+/// `fallback` is used only when the recording carries no protocol.
+#[allow(clippy::result_large_err)]
+pub fn replay_session_with_rig(
+    dir: &Path,
+    config: &Config,
+    registry: &Registry,
+    fallback: &ProtocolConfig,
+    rig_source: &RigSource,
+    store: &dyn Fn(&OutputId) -> Result<Option<Rig>, CalibrationError>,
+) -> Result<Replayed, BenchError> {
     let capture = |source| BenchError::Capture {
         session: dir.to_path_buf(),
         source,
@@ -148,10 +251,8 @@ pub fn replay_session(
     let recording = Recording::open(dir).map_err(capture)?;
     let meta = recording.meta();
     let session = meta.session_id.clone();
-    let rig_table = meta.rig.as_ref().ok_or_else(|| BenchError::NoRig {
-        session: session.clone(),
-    })?;
-    let rig = rig_from_table(rig_table).map_err(|e| BenchError::Calibration(Box::new(e)))?;
+    let (rig, rig_source_label) = resolve_rig(meta, rig_source, store)?;
+    let rig_fingerprint_value = rig_fingerprint(&rig);
     let cameras = config
         .cameras
         .iter()
@@ -202,6 +303,8 @@ pub fn replay_session(
             session,
             rig,
             protocol,
+            rig_source: rig_source_label,
+            rig_fingerprint: rig_fingerprint_value,
             windows,
             steps,
         },
@@ -379,12 +482,14 @@ fn load_pipeline_config(spec: &PipelineSpec) -> Result<Config, BenchError> {
     }
 }
 
+/// `rig_source` is the row's `rig_source` label; error rows never carry a `rig_fingerprint`.
 fn error_row(
     pipeline: &str,
     mode: CalibrationMode,
     kind: RowKind,
     session: &str,
     step_errors: usize,
+    rig_source: &str,
     message: String,
 ) -> BenchRow {
     BenchRow {
@@ -392,6 +497,8 @@ fn error_row(
         calibration: mode,
         kind,
         session: session.to_string(),
+        rig_source: rig_source.to_string(),
+        rig_fingerprint: String::new(),
         step_errors,
         warnings: Vec::new(),
         outcome: RowOutcome::Error { message },
@@ -400,6 +507,7 @@ fn error_row(
 
 /// A broken config gives error rows for every session of that pipeline (and its aggregates).
 fn config_error_rows(spec: &PipelineSpec, matrix: &BenchMatrix, message: &str) -> Vec<BenchRow> {
+    let rig_source = matrix.evaluation.rig.label();
     let mut rows = Vec::new();
     for dir in &matrix.recordings {
         let session = session_name(dir);
@@ -410,6 +518,7 @@ fn config_error_rows(spec: &PipelineSpec, matrix: &BenchMatrix, message: &str) -
                 RowKind::Session,
                 &session,
                 0,
+                &rig_source,
                 message.to_string(),
             ));
         }
@@ -421,6 +530,7 @@ fn config_error_rows(spec: &PipelineSpec, matrix: &BenchMatrix, message: &str) -
             RowKind::Aggregate,
             "all",
             0,
+            &rig_source,
             "no session produced a result".to_string(),
         ));
     }
@@ -431,6 +541,7 @@ fn rows_for_pipeline(
     spec: &PipelineSpec,
     matrix: &BenchMatrix,
     registry: &Registry,
+    store: &dyn Fn(&OutputId) -> Result<Option<Rig>, CalibrationError>,
 ) -> Vec<BenchRow> {
     let config = match load_pipeline_config(spec) {
         Ok(config) => config,
@@ -454,7 +565,14 @@ fn rows_for_pipeline(
         )
         .entered();
         let started = Instant::now();
-        let result = replay_session(dir, &config, registry, &matrix.evaluation.protocol);
+        let result = replay_session_with_rig(
+            dir,
+            &config,
+            registry,
+            &matrix.evaluation.protocol,
+            &matrix.evaluation.rig,
+            store,
+        );
         match &result {
             Ok(r) => {
                 tracing::info!(
@@ -482,10 +600,21 @@ fn rows_for_pipeline(
             pipeline = %spec.name,
         )
         .entered();
-        let (step_errors, replay_error) = match &replayed[index].1 {
-            Ok(r) => (r.run.step_errors(), None),
-            Err(e) => (0, Some(e.to_string())),
-        };
+        let (step_errors, replay_error, rig_source, rig_fingerprint_value) =
+            match &replayed[index].1 {
+                Ok(r) => (
+                    r.run.step_errors(),
+                    None,
+                    r.run.rig_source.clone(),
+                    r.run.rig_fingerprint.clone(),
+                ),
+                Err(e) => (
+                    0,
+                    Some(e.to_string()),
+                    matrix.evaluation.rig.label(),
+                    String::new(),
+                ),
+            };
 
         for &mode in &matrix.evaluation.calibration {
             if let Some(message) = &replay_error {
@@ -495,6 +624,7 @@ fn rows_for_pipeline(
                     RowKind::Session,
                     &session,
                     0,
+                    &rig_source,
                     message.clone(),
                 ));
                 continue;
@@ -508,6 +638,8 @@ fn rows_for_pipeline(
                         calibration: mode,
                         kind: RowKind::Session,
                         session: session.clone(),
+                        rig_source: rig_source.clone(),
+                        rig_fingerprint: rig_fingerprint_value.clone(),
                         step_errors,
                         warnings,
                         outcome: RowOutcome::Ok { metrics },
@@ -528,6 +660,7 @@ fn rows_for_pipeline(
                         RowKind::Session,
                         &session,
                         step_errors,
+                        &rig_source,
                         message,
                     ));
                 }
@@ -535,6 +668,7 @@ fn rows_for_pipeline(
         }
     }
 
+    let rig_source = matrix.evaluation.rig.label();
     for &mode in &matrix.evaluation.calibration {
         match per_mode.get(&mode) {
             Some((inputs, step_errors)) if !inputs.is_empty() => {
@@ -552,6 +686,8 @@ fn rows_for_pipeline(
                     calibration: mode,
                     kind: RowKind::Aggregate,
                     session: "all".to_string(),
+                    rig_source: rig_source.clone(),
+                    rig_fingerprint: String::new(),
                     step_errors: *step_errors,
                     warnings: Vec::new(),
                     outcome: RowOutcome::Ok { metrics },
@@ -570,6 +706,7 @@ fn rows_for_pipeline(
                     RowKind::Aggregate,
                     "all",
                     0,
+                    &rig_source,
                     "no session produced a result".to_string(),
                 ));
             }
@@ -644,7 +781,17 @@ fn log_aggregate_scored(
     );
 }
 
+/// Delegates to `run_matrix_with_store` with a store that never has a rig (`RigSource::Stored`
+/// then always fails with `BenchError::RigSource`).
 pub fn run_matrix(matrix: &BenchMatrix, registry: &Registry) -> BenchReport {
+    run_matrix_with_store(matrix, registry, &|_| Ok(None))
+}
+
+pub fn run_matrix_with_store(
+    matrix: &BenchMatrix,
+    registry: &Registry,
+    store: &dyn Fn(&OutputId) -> Result<Option<Rig>, CalibrationError>,
+) -> BenchReport {
     tracing::info!(
         pipelines = matrix.pipelines.len() as u64,
         recordings = matrix.recordings.len() as u64,
@@ -653,7 +800,7 @@ pub fn run_matrix(matrix: &BenchMatrix, registry: &Registry) -> BenchReport {
     );
     let mut rows = Vec::new();
     for spec in &matrix.pipelines {
-        rows.extend(rows_for_pipeline(spec, matrix, registry));
+        rows.extend(rows_for_pipeline(spec, matrix, registry, store));
     }
     BenchReport::new(matrix.evaluation.metrics.clone(), rows)
 }
@@ -673,7 +820,7 @@ mod tests {
     use crate::row::RowOutcome;
     use crate::testing::{
         FOUR_BY_FOUR_CENTRES, SyntheticSession, fake_registry, fixed_ray_config, fixed_ray_toml,
-        kappa_ray_toml, write_synthetic_session,
+        kappa_ray_toml, synthetic_rig, write_synthetic_session,
     };
 
     fn eye() -> Point3<f64> {
@@ -1632,6 +1779,8 @@ mod tests {
                 calibration: CalibrationMode::None,
                 kind: RowKind::Session,
                 session: "s".to_string(),
+                rig_source: "session".to_string(),
+                rig_fingerprint: String::new(),
                 step_errors: 0,
                 warnings: Vec::new(),
                 outcome: RowOutcome::Error {
@@ -1697,5 +1846,177 @@ mod tests {
         assert_eq!(rec.fields["sessions"], eye_log::Value::U64(2));
         assert_eq!(rec.fields["samples"], eye_log::Value::U64(768));
         assert!(!rec.context.contains_key(field::SESSION_ID));
+    }
+
+    fn file_rig_with_doubled_screen_x() -> Rig {
+        let rig = synthetic_rig();
+        let mut screen = rig.screen().clone();
+        screen.size_mm.x *= 2.0;
+        Rig::new(rig.cameras().to_vec(), screen).unwrap()
+    }
+
+    /// Pinning: a `file:` rig with the recording's camera and output, but a doubled screen width,
+    /// is used and its provenance recorded. The synthetic estimator ignores the rig entirely
+    /// (ignores its `_rig` parameter; see `crate::testing::KappaRayEstimator::estimate`), so the
+    /// `none`-mode mean is unaffected by the override; both runs score the single right-column
+    /// target at mean 0.0 deg.
+    #[test]
+    fn test_rig_override_file_is_used_and_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let targets = vec![(1680.0, 405.0)];
+        let spec = SyntheticSession {
+            targets: targets.clone(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let toml_path = dir.path().join("kappa.toml");
+        std::fs::write(&toml_path, kappa_ray_toml(&targets, [0.0, 0.0], None)).unwrap();
+
+        let base_matrix = BenchMatrix {
+            recordings: vec![session_dir],
+            pipelines: vec![PipelineSpec {
+                name: "kappa".to_string(),
+                config: Some(toml_path),
+            }],
+            evaluation: crate::matrix::Evaluation {
+                calibration: vec![CalibrationMode::None],
+                ..Default::default()
+            },
+        };
+        let base_report = run_matrix(&base_matrix, &fake_registry());
+        let base_row = base_report
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Session)
+            .unwrap();
+        assert_eq!(base_row.rig_source, "session");
+        let RowOutcome::Ok {
+            metrics: base_metrics,
+        } = &base_row.outcome
+        else {
+            panic!("expected ok row: {base_row:?}");
+        };
+        let base_mean = base_metrics.angular_error_deg.as_ref().unwrap().mean;
+
+        let file_rig = file_rig_with_doubled_screen_x();
+        let rig_path = dir.path().join("file_rig.toml");
+        eye_calibration::store::write_rig(&rig_path, &file_rig).unwrap();
+
+        let mut override_matrix = base_matrix;
+        override_matrix.evaluation.rig = RigSource::File(rig_path.clone());
+        let override_report = run_matrix(&override_matrix, &fake_registry());
+        let override_row = override_report
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Session)
+            .unwrap();
+        assert_eq!(
+            override_row.rig_source,
+            format!("file:{}", rig_path.display())
+        );
+        assert_eq!(override_row.rig_fingerprint, rig_fingerprint(&file_rig));
+        let RowOutcome::Ok {
+            metrics: override_metrics,
+        } = &override_row.outcome
+        else {
+            panic!("expected ok row: {override_row:?}");
+        };
+        let override_mean = override_metrics.angular_error_deg.as_ref().unwrap().mean;
+
+        assert_relative_eq!(base_mean, 0.0, epsilon = 1e-6);
+        assert_relative_eq!(override_mean, 0.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_rig_override_rejects_camera_size_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession::default();
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+
+        let rig = synthetic_rig();
+        let mut cameras = rig.cameras().to_vec();
+        cameras[0].width = 320;
+        cameras[0].height = 180;
+        let bad_rig = Rig::new(cameras, rig.screen().clone()).unwrap();
+        let rig_path = dir.path().join("bad_rig.toml");
+        eye_calibration::store::write_rig(&rig_path, &bad_rig).unwrap();
+
+        let recording = Recording::open(&session_dir).unwrap();
+        let err =
+            resolve_rig(recording.meta(), &RigSource::File(rig_path), &|_| Ok(None)).unwrap_err();
+        let BenchError::RigMismatch { reason, .. } = err else {
+            panic!("expected RigMismatch: {err:?}");
+        };
+        assert!(reason.contains("ir"), "{reason}");
+    }
+
+    #[test]
+    fn test_rig_override_stored_uses_recording_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession::default();
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let recording = Recording::open(&session_dir).unwrap();
+
+        let stored_rig = synthetic_rig();
+        let lookup = stored_rig.clone();
+        let store = move |output: &OutputId| -> Result<Option<Rig>, CalibrationError> {
+            if output.as_str() == "eDP-1" {
+                Ok(Some(lookup.clone()))
+            } else {
+                Ok(None)
+            }
+        };
+        let (rig, label) = resolve_rig(recording.meta(), &RigSource::Stored, &store).unwrap();
+        assert_eq!(label, "stored");
+        assert_eq!(rig, stored_rig);
+    }
+
+    #[test]
+    fn test_rig_override_stored_errors_without_a_stored_rig() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession::default();
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let recording = Recording::open(&session_dir).unwrap();
+
+        let err = resolve_rig(recording.meta(), &RigSource::Stored, &|_| Ok(None)).unwrap_err();
+        assert!(matches!(err, BenchError::RigSource(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_rig_stored_with_no_store_entry_is_error_row_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let toml_path = dir.path().join("kappa.toml");
+        std::fs::write(
+            &toml_path,
+            kappa_ray_toml(&FOUR_BY_FOUR_CENTRES, [3.0, -1.0], None),
+        )
+        .unwrap();
+        let matrix = BenchMatrix {
+            recordings: vec![session_dir],
+            pipelines: vec![PipelineSpec {
+                name: "kappa".to_string(),
+                config: Some(toml_path),
+            }],
+            evaluation: crate::matrix::Evaluation {
+                calibration: vec![CalibrationMode::None],
+                rig: RigSource::Stored,
+                ..Default::default()
+            },
+        };
+        let report = run_matrix_with_store(&matrix, &fake_registry(), &|_| Ok(None));
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Session)
+            .unwrap();
+        assert_eq!(row.rig_source, "stored");
+        assert!(matches!(row.outcome, RowOutcome::Error { .. }), "{row:?}");
     }
 }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use eye_calibration::protocol::{ProtocolConfig, TargetProtocol};
 use eye_calibration::user_fit::FitConfig;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::error::BenchError;
 use crate::metrics::MetricParams;
@@ -38,6 +38,8 @@ pub struct Evaluation {
     pub fit: FitConfig,
     /// Required when `calibration` lists `Profile`; resolved against the matrix's directory.
     pub profile: Option<PathBuf>,
+    /// Which rig scores every row this matrix produces.
+    pub rig: RigSource,
 }
 
 impl Default for Evaluation {
@@ -48,7 +50,50 @@ impl Default for Evaluation {
             metrics: MetricParams::default(),
             fit: FitConfig::default(),
             profile: None,
+            rig: RigSource::Session,
         }
+    }
+}
+
+/// `"session"` (the recording's snapshot), `"stored"` (the profile store's rig for the recording's
+/// output) or `"file:<path>"` (a rig TOML as written by `write_rig`, relative to the matrix).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum RigSource {
+    #[default]
+    Session,
+    Stored,
+    File(PathBuf),
+}
+
+impl RigSource {
+    /// Parses a `--rig` / `evaluation.rig` string: `"session"`, `"stored"` or `"file:<path>"`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "session" => Ok(RigSource::Session),
+            "stored" => Ok(RigSource::Stored),
+            _ => s.strip_prefix("file:").map(|p| RigSource::File(PathBuf::from(p))).ok_or_else(
+                || format!("invalid rig source {s:?} (expected \"session\", \"stored\" or \"file:<path>\")"),
+            ),
+        }
+    }
+
+    /// The row label: `"session"`, `"stored"` or `"file:<path>"`.
+    pub fn label(&self) -> String {
+        match self {
+            RigSource::Session => "session".to_string(),
+            RigSource::Stored => "stored".to_string(),
+            RigSource::File(path) => format!("file:{}", path.display()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RigSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        RigSource::parse(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -86,6 +131,10 @@ impl BenchMatrix {
             pipeline.config = pipeline.config.take().map(|p| resolve(dir, p));
         }
         matrix.evaluation.profile = matrix.evaluation.profile.take().map(|p| resolve(dir, p));
+        matrix.evaluation.rig = match matrix.evaluation.rig {
+            RigSource::File(p) => RigSource::File(resolve(dir, p)),
+            other => other,
+        };
         matrix.validate()?;
         tracing::debug!(
             path = %path.display(),
@@ -283,6 +332,22 @@ calibration = ["profile"]
         );
         let err = BenchMatrix::from_path(&path).unwrap_err();
         assert!(matches!(err, BenchError::Matrix(ref m) if m.contains("evaluation.profile")));
+    }
+
+    #[test]
+    fn test_rig_source_parses_session_stored_file() {
+        fn from_toml(s: &str) -> Result<RigSource, toml::de::Error> {
+            toml::from_str(&format!("rig = {s:?}"))
+                .map(|w: std::collections::HashMap<String, RigSource>| w["rig"].clone())
+        }
+
+        assert_eq!(from_toml("session").unwrap(), RigSource::Session);
+        assert_eq!(from_toml("stored").unwrap(), RigSource::Stored);
+        assert_eq!(
+            from_toml("file:rigs/stereo.toml").unwrap(),
+            RigSource::File(PathBuf::from("rigs/stereo.toml"))
+        );
+        assert!(from_toml("nope").is_err());
     }
 
     #[test]

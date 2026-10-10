@@ -364,6 +364,8 @@ mod tests {
             calibration: CalibrationMode::None,
             kind,
             session: session.to_owned(),
+            rig_source: "session".to_owned(),
+            rig_fingerprint: String::new(),
             step_errors: 0,
             warnings: vec![],
             outcome,

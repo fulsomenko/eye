@@ -2,10 +2,10 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use eye::config::{Config, ConfigSource, EnvOverrides};
-use eye_bench::matrix::BenchMatrix;
+use eye_bench::matrix::{BenchMatrix, RigSource};
 use eye_bench::report::BenchReport;
 use eye_bench::row::{CalibrationMode, RowKind, RowOutcome};
-use eye_bench::runner::run_matrix;
+use eye_bench::runner::run_matrix_with_store;
 
 use crate::ctx::Ctx;
 use crate::paths::utc_stamp;
@@ -21,6 +21,9 @@ pub struct Args {
     /// Profile file for calibration mode `profile`; overrides the matrix's evaluation.profile
     #[arg(long, value_name = "FILE")]
     pub profile: Option<PathBuf>,
+    /// Rig to score every row with: `session`, `stored` or `file:PATH`; overrides evaluation.rig
+    #[arg(long, value_parser = RigSource::parse, value_name = "SOURCE")]
+    pub rig: Option<RigSource>,
     /// Recording directories; override the matrix's list
     #[arg(value_name = "RECORDING")]
     pub recordings: Vec<PathBuf>,
@@ -71,6 +74,9 @@ pub fn build_matrix(config_path: Option<PathBuf>, args: &Args) -> anyhow::Result
     if args.profile.is_some() {
         matrix.evaluation.profile = args.profile.clone();
     }
+    if let Some(rig) = &args.rig {
+        matrix.evaluation.rig = rig.clone();
+    }
     matrix.validate()?;
     Ok(matrix)
 }
@@ -98,7 +104,12 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         },
     };
     let matrix = build_matrix(config_path, &args)?;
-    let report = run_matrix(&matrix, &eye::registry::Registry::with_defaults());
+    let store = eye_calibration::store::ProfileStore::open_default()?;
+    let report = run_matrix_with_store(
+        &matrix,
+        &eye::registry::Registry::with_defaults(),
+        &|output| store.load_rig(output),
+    );
     let dir = report_dir(ctx.output.clone(), SystemTime::now());
     report.write_to(&dir)?;
     print!("{}", report.to_markdown());
@@ -125,6 +136,7 @@ mod tests {
             matrix,
             calibration,
             profile: None,
+            rig: None,
             recordings: recordings.into_iter().map(PathBuf::from).collect(),
         }
     }
@@ -274,6 +286,8 @@ mod tests {
             calibration: CalibrationMode::None,
             kind,
             session: "s".to_owned(),
+            rig_source: "session".to_owned(),
+            rig_fingerprint: String::new(),
             step_errors: 0,
             warnings: vec![],
             outcome,
