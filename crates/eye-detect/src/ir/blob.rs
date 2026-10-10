@@ -273,8 +273,9 @@ pub(crate) fn candidates(
         }
 
         let r = (n / std::f64::consts::PI).sqrt();
-        let iris_mean = annulus_mean(diff, centroid, 1.25 * r, 2.0 * r).max(1.0);
-        let outer_mean = annulus_mean(diff, centroid, 2.5 * r, 3.5 * r).max(1.0);
+        let r_ring = r.max(options.min_ring_radius_px);
+        let iris_mean = annulus_mean(diff, centroid, 1.25 * r_ring, 2.0 * r_ring).max(1.0);
+        let outer_mean = annulus_mean(diff, centroid, 2.5 * r_ring, 3.5 * r_ring).max(1.0);
 
         let blob_mean = pixels
             .iter()
@@ -420,6 +421,41 @@ mod tests {
                 other => panic!("unexpected field types: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn test_small_bright_pupil_passes_iris_ratio() {
+        let mut scene = SyntheticIr::default_scene();
+        for eye in &mut scene.eyes {
+            eye.pupil_radius = 1.2;
+        }
+        let (lit, dark) = scene.render();
+        let diff = crate::image::saturating_diff(lit.view(), dark.view()).unwrap();
+        let (cands, counts) = candidates(diff.view(), &IrClassicOptions::default());
+        assert_eq!(
+            cands.len(),
+            2,
+            "expected both small pupils to pass, rejected_iris_ratio={}, rejected_area={}",
+            counts.iris_ratio,
+            counts.area
+        );
+    }
+
+    #[test]
+    fn test_skin_specular_still_rejected_by_iris_ratio() {
+        let mut scene = SyntheticIr::default_scene();
+        scene.specular = vec![
+            (Point2::new(370.0, 240.0), 1.5, 255),
+            (Point2::new(411.0, 181.0), 1.5, 255),
+        ];
+        let (lit, dark) = scene.render();
+        let diff = crate::image::saturating_diff(lit.view(), dark.view()).unwrap();
+        let (cands, counts) = candidates(diff.view(), &IrClassicOptions::default());
+        assert_eq!(cands.len(), 2, "only the two real pupils should survive");
+        assert_eq!(
+            counts.iris_ratio, 2,
+            "both specular highlights must still be rejected by iris_ratio"
+        );
     }
 
     #[test]

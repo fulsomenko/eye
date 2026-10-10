@@ -31,6 +31,9 @@ pub struct IrClassicOptions {
     pub min_aspect: f64,
     pub min_pupil_contrast: f64,
     pub max_iris_ratio: f64,
+    /// Floor on the radius used to place the iris/outer annuli; below it the "iris" annulus
+    /// falls inside the pupil's own bright halo.
+    pub min_ring_radius_px: f64,
     pub pair_separation_px: [f64; 2],
     pub max_pair_tilt_deg: f64,
     pub edge_rays: usize,
@@ -58,6 +61,7 @@ impl Default for IrClassicOptions {
             min_aspect: 0.3,
             min_pupil_contrast: 1.3,
             max_iris_ratio: 0.8,
+            min_ring_radius_px: 2.2,
             pair_separation_px: [35.0, 95.0],
             max_pair_tilt_deg: 30.0,
             edge_rays: 16,
@@ -773,7 +777,6 @@ mod tests {
         let mut scene = SyntheticIr::default_scene();
         for eye in &mut scene.eyes {
             eye.pupil_radius = 1.1;
-            eye.iris_radius = 2.2;
         }
         let (lit, dark) = scene.render();
         let detector = IrClassicDetector::new(IrClassicOptions::default());
