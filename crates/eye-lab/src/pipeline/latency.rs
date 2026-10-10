@@ -185,6 +185,7 @@ mod tests {
         let stats = TrackerStats {
             capture_to_emit: eye::tracker::LatencySummary {
                 count: 100,
+                window: 100,
                 p50: Duration::from_millis(20),
                 p95: Duration::from_millis(60),
                 max: Duration::from_millis(80),

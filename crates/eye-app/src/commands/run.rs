@@ -172,9 +172,10 @@ pub fn stats_line(
         0.0
     };
     format!(
-        "{points} points in {secs:.1} s ({rate:.1}/s), emit p50 {emit_p50:.1} ms, p95 {emit_p95:.1} ms, present p50 {present_p50:.1} ms, p95 {present_p95:.1} ms, {frames_dropped} frames dropped, {sink_drops} sink drops",
+        "{points} points in {secs:.1} s ({rate:.1}/s), emit p50 {emit_p50:.1} ms, p95 {emit_p95:.1} ms (n = {emit_window}), present p50 {present_p50:.1} ms, p95 {present_p95:.1} ms, {frames_dropped} frames dropped, {sink_drops} sink drops",
         emit_p50 = stats.capture_to_emit.p50.as_secs_f64() * 1000.0,
         emit_p95 = stats.capture_to_emit.p95.as_secs_f64() * 1000.0,
+        emit_window = stats.capture_to_emit.window,
         present_p50 = present.p50.as_secs_f64() * 1000.0,
         present_p95 = present.p95.as_secs_f64() * 1000.0,
     )
@@ -661,6 +662,7 @@ mod tests {
             points_emitted: 242,
             capture_to_emit: eye::tracker::LatencySummary {
                 count: 142,
+                window: 100,
                 p50: Duration::from_millis(31),
                 p95: Duration::from_millis(44),
                 max: Duration::from_millis(61),
@@ -677,7 +679,7 @@ mod tests {
         let line = stats_line(&stats, &present, Duration::from_secs(5), 100);
         assert_eq!(
             line,
-            "142 points in 5.0 s (28.4/s), emit p50 31.0 ms, p95 44.0 ms, present p50 48.0 ms, p95 61.0 ms, 0 frames dropped, 3 sink drops"
+            "142 points in 5.0 s (28.4/s), emit p50 31.0 ms, p95 44.0 ms (n = 100), present p50 48.0 ms, p95 61.0 ms, 0 frames dropped, 3 sink drops"
         );
 
         let mut stats = stats;

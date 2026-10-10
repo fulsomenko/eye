@@ -1,13 +1,12 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eye_core::CameraId;
-
-const WINDOW: usize = 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LatencySummary {
     pub count: usize,
+    pub window: usize,
     pub p50: Duration,
     pub p95: Duration,
     pub max: Duration,
@@ -38,39 +37,81 @@ pub struct TrackerStats {
     pub sink_drops: BTreeMap<&'static str, u64>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct LatencyWindow {
-    samples: VecDeque<Duration>,
+    samples: VecDeque<(Instant, Duration)>,
+    horizon: Duration,
     count: usize,
 }
 
 impl LatencyWindow {
-    pub(crate) fn record(&mut self, d: Duration) {
-        if self.samples.len() == WINDOW {
-            self.samples.pop_front();
+    pub(crate) fn new(horizon: Duration) -> Self {
+        Self {
+            samples: VecDeque::new(),
+            horizon,
+            count: 0,
         }
-        self.samples.push_back(d);
-        self.count += 1;
     }
 
-    pub(crate) fn summary(&self) -> LatencySummary {
-        let mut sorted: Vec<Duration> = self.samples.iter().copied().collect();
+    pub(crate) fn record(&mut self, now: Instant, d: Duration) {
+        self.samples.push_back((now, d));
+        self.count += 1;
+        self.prune(now);
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some(&(t, _)) = self.samples.front() {
+            if now.saturating_duration_since(t) > self.horizon {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn summary(&self, now: Instant) -> LatencySummary {
+        let mut sorted: Vec<Duration> = self
+            .samples
+            .iter()
+            .filter(|&&(t, _)| now.saturating_duration_since(t) <= self.horizon)
+            .map(|&(_, d)| d)
+            .collect();
         sorted.sort_unstable();
         let Some(&max) = sorted.last() else {
-            return LatencySummary::default();
+            return LatencySummary {
+                count: self.count,
+                ..Default::default()
+            };
         };
         LatencySummary {
             count: self.count,
-            p50: nearest_rank(&sorted, 500),
-            p95: nearest_rank(&sorted, 950),
+            window: sorted.len(),
+            p50: percentile(&sorted, 50.0),
+            p95: percentile(&sorted, 95.0),
             max,
         }
     }
 }
 
-fn nearest_rank(sorted: &[Duration], per_mille: usize) -> Duration {
-    let rank = (per_mille * sorted.len()).div_ceil(1000).max(1);
-    sorted[rank - 1]
+impl Default for LatencyWindow {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(5))
+    }
+}
+
+/// Hyndman and Fan type 7 on sorted durations, interpolating in nanoseconds.
+fn percentile(sorted: &[Duration], p: f64) -> Duration {
+    let n = sorted.len();
+    if n == 1 {
+        return sorted[0];
+    }
+    let h = (n - 1) as f64 * (p / 100.0) + 1.0;
+    let floor = h.floor() as usize;
+    let frac = h - floor as f64;
+    let lower = sorted[(floor - 1).min(n - 1)].as_nanos() as f64;
+    let upper = sorted[floor.min(n - 1)].as_nanos() as f64;
+    let nanos = lower + frac * (upper - lower);
+    Duration::from_nanos(nanos.round() as u64)
 }
 
 #[cfg(test)]
@@ -78,31 +119,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_latency_window_nearest_rank() {
-        let mut window = LatencyWindow::default();
-        for ms in (1..=100).rev() {
-            window.record(Duration::from_millis(ms));
-        }
-        assert_eq!(
-            window.summary(),
-            LatencySummary {
-                count: 100,
-                p50: Duration::from_millis(50),
-                p95: Duration::from_millis(95),
-                max: Duration::from_millis(100),
-            }
-        );
+    fn test_latency_percentile_type7() {
+        let sorted: Vec<Duration> = (1..=100).map(Duration::from_millis).collect();
+        assert_eq!(percentile(&sorted, 50.0), Duration::from_micros(50_500));
+        assert_eq!(percentile(&sorted, 95.0), Duration::from_micros(95_050));
+
+        let sorted: Vec<Duration> = (1..=4).map(Duration::from_millis).collect();
+        assert_eq!(percentile(&sorted, 95.0), Duration::from_micros(3_850));
     }
 
     #[test]
-    fn test_latency_window_keeps_last_1024() {
+    fn test_latency_window_drops_samples_older_than_horizon() {
+        let t0 = Instant::now();
         let mut window = LatencyWindow::default();
-        for ms in 0..2000u64 {
-            window.record(Duration::from_millis(ms));
+        for ms in 1..=1000u64 {
+            window.record(t0, Duration::from_millis(ms % 10 + 1));
         }
-        let summary = window.summary();
-        assert_eq!(summary.count, 2000);
-        assert_eq!(summary.max, Duration::from_millis(1999));
-        assert_eq!(summary.p50, Duration::from_millis(1487));
+        let t1 = t0 + Duration::from_secs(6);
+        for _ in 0..50 {
+            window.record(t1, Duration::from_millis(200));
+        }
+        let summary = window.summary(t1);
+        assert_eq!(summary.window, 50);
+        assert_eq!(summary.p95, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn test_latency_window_empty_is_default() {
+        assert_eq!(
+            LatencyWindow::default().summary(Instant::now()),
+            LatencySummary::default()
+        );
+
+        let t0 = Instant::now();
+        let mut window = LatencyWindow::default();
+        window.record(t0, Duration::from_millis(10));
+
+        let summary = window.summary(t0 + Duration::from_secs(4));
+        assert_eq!(summary.window, 1);
+
+        let summary = window.summary(t0 + Duration::from_secs(6));
+        assert_eq!(summary.window, 0);
     }
 }

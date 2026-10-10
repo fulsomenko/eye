@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Select, Sender, TrySendError};
 use eye_core::log::{field, span};
@@ -41,10 +41,11 @@ impl Shared {
     }
 
     pub(crate) fn snapshot(&self) -> TrackerStats {
+        let now = Instant::now();
         let mut stats = self.with_stats(|s| {
             let mut counts = s.counts.clone();
-            counts.capture_to_emit = s.capture_to_emit.summary();
-            counts.processing = s.processing.summary();
+            counts.capture_to_emit = s.capture_to_emit.summary(now);
+            counts.processing = s.processing.summary(now);
             counts
         });
         for (camera, dropped) in &self.dropped {
@@ -270,6 +271,7 @@ impl PipelineThread {
         });
 
         let now = Timestamp::now();
+        let instant = Instant::now();
         let sinks = self.sinks.len();
         let subscribers = self.subscribers.len();
         let capture_to_emit = now.0.saturating_sub(point.timestamp.0);
@@ -279,8 +281,8 @@ impl PipelineThread {
             s.counts.subscriber_drops += subscriber_drops;
             s.counts.sinks = sinks;
             s.counts.subscribers = subscribers;
-            s.capture_to_emit.record(capture_to_emit);
-            s.processing.record(processing);
+            s.capture_to_emit.record(instant, capture_to_emit);
+            s.processing.record(instant, processing);
             for sink in &self.sinks {
                 s.counts.sink_drops.insert(sink.name(), sink.dropped());
             }
