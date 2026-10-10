@@ -41,6 +41,25 @@ pub fn frame_span(
     )
 }
 
+/// Spawns a named thread that runs `f` inside the caller's current span, so every record the
+/// thread emits carries the same `run`/`session` context as the spawner.
+pub fn spawn_in_current_span<F, T>(
+    name: impl Into<String>,
+    f: F,
+) -> std::io::Result<std::thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let parent = tracing::Span::current();
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let _parent = parent.entered();
+            f()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -55,6 +74,9 @@ mod tests {
     struct Recorded {
         span_name: Option<&'static str>,
         fields: Vec<&'static str>,
+        meta: Option<&'static Metadata<'static>>,
+        last_entered: Option<u64>,
+        entered: Vec<(u64, Option<String>)>,
     }
     struct NameVisitor<'a>(&'a mut Vec<&'static str>);
     impl Visit for NameVisitor<'_> {
@@ -70,14 +92,31 @@ mod tests {
         fn new_span(&self, attrs: &Attributes<'_>) -> Id {
             let mut r = self.0.lock().unwrap();
             r.span_name = Some(attrs.metadata().name());
+            r.meta = Some(attrs.metadata());
             attrs.record(&mut NameVisitor(&mut r.fields));
             Id::from_u64(1)
         }
         fn record(&self, _: &Id, _: &Record<'_>) {}
         fn record_follows_from(&self, _: &Id, _: &Id) {}
         fn event(&self, _: &Event<'_>) {}
-        fn enter(&self, _: &Id) {}
-        fn exit(&self, _: &Id) {}
+        fn enter(&self, id: &Id) {
+            let mut r = self.0.lock().unwrap();
+            r.last_entered = Some(id.into_u64());
+            r.entered.push((
+                id.into_u64(),
+                std::thread::current().name().map(String::from),
+            ));
+        }
+        fn exit(&self, _: &Id) {
+            self.0.lock().unwrap().last_entered = None;
+        }
+        fn current_span(&self) -> tracing_core::span::Current {
+            let r = self.0.lock().unwrap();
+            match (r.last_entered, r.meta) {
+                (Some(id), Some(meta)) => tracing_core::span::Current::new(Id::from_u64(id), meta),
+                _ => tracing_core::span::Current::none(),
+            }
+        }
     }
 
     #[test]
@@ -97,6 +136,27 @@ mod tests {
                 field::ILLUMINATION,
                 field::SET_CAMERAS,
             ]
+        );
+    }
+
+    #[test]
+    fn test_spawn_in_current_span_runs_inside_the_spawners_span() {
+        let rec = Arc::new(Mutex::new(Recorded::default()));
+        tracing::subscriber::with_default(Recorder(rec.clone()), || {
+            let _parent = frame_span("ir", 1, 1, "ir_lit", 1).entered();
+            let name = super::spawn_in_current_span("probe", || {
+                std::thread::current().name().map(String::from)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+            assert_eq!(name, Some("probe".to_string()));
+        });
+        assert!(
+            rec.lock()
+                .unwrap()
+                .entered
+                .contains(&(1, Some("probe".to_string())))
         );
     }
 

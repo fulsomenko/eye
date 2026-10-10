@@ -616,6 +616,7 @@ dependencies = [
  "thiserror",
  "toml",
  "tracing",
+ "tracing-core",
 ]
 
 [[package]]
