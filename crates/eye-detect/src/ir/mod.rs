@@ -12,7 +12,7 @@ use eye_core::observation::SCHEME_IR_PUPIL_PAIR;
 use eye_core::stage::{Detector, StageError};
 use eye_core::{
     CameraId, Ellipse2, EyeObservation, FaceObservation, Frame, FrameSet, Illumination, Measured,
-    Observations, PixelFormat, Side,
+    Observations, PixelFormat, Side, Timestamp,
 };
 use nalgebra::Point2;
 
@@ -52,6 +52,14 @@ pub struct IrClassicOptions {
     /// Lower bound on the 1-sigma pupil-centre noise from the ellipse fit, px
     /// (EYE-106 replay: about 0.3 px frame to frame on real IR).
     pub pupil_sigma_floor_px: f64,
+    /// Candidates farther than this from the previous accepted pupil (scaled by the lit-frame
+    /// gap over 133 ms) are gated out before contrast ranking.
+    pub track_gate_px: f64,
+    /// Accept a candidate only if its area is within this ratio of the previous accepted
+    /// blob's area (both ways).
+    pub track_area_ratio: f64,
+    /// Forget the previous pair after this gap, ms.
+    pub track_max_gap_ms: f64,
 }
 
 impl Default for IrClassicOptions {
@@ -76,16 +84,27 @@ impl Default for IrClassicOptions {
             glint_min_excess: 15.0,
             glint_sigma_px: 0.5,
             pupil_sigma_floor_px: 0.3,
+            track_gate_px: 5.0,
+            track_area_ratio: 2.0,
+            track_max_gap_ms: 400.0,
         }
     }
 }
 
 type PupilAndGlint = (Measured<Ellipse2>, Option<Measured<Point2<f64>>>);
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PairPrior {
+    pub at: Timestamp,
+    pub right: (Point2<f64>, u32),
+    pub left: (Point2<f64>, u32),
+}
+
 #[derive(Debug)]
 pub struct IrClassicDetector {
     options: IrClassicOptions,
     last_dark: HashMap<CameraId, Frame>,
+    last_pair: HashMap<CameraId, PairPrior>,
 }
 
 impl IrClassicDetector {
@@ -95,6 +114,7 @@ impl IrClassicDetector {
         Self {
             options,
             last_dark: HashMap::new(),
+            last_pair: HashMap::new(),
         }
     }
 
@@ -107,16 +127,39 @@ impl IrClassicDetector {
             && matches!(illumination, Illumination::IrLit | Illumination::IrDark)
     }
 
-    /// Pure core, unit-testable without frames. Returns `[right, left]`.
+    /// Pure core, unit-testable without frames. Returns `[right, left]`. Equivalent to
+    /// `detect_pair_with_prior` with no prior.
     pub fn detect_pair(
         &self,
         lit: GrayView<'_>,
         dark: GrayView<'_>,
     ) -> Result<Option<[EyeObservation; 2]>, DetectError> {
+        self.detect_pair_with_prior(lit, dark, None, Timestamp::from_nanos(0))
+            .map(|r| r.map(|(eyes, _prior)| eyes))
+    }
+
+    /// `detect_pair`, gated against the previous accepted pair when one is given and still
+    /// within `track_max_gap_ms` of `at`. Returns the accepted eyes plus the prior the caller
+    /// should pass to the next frame.
+    pub(crate) fn detect_pair_with_prior(
+        &self,
+        lit: GrayView<'_>,
+        dark: GrayView<'_>,
+        prior: Option<&PairPrior>,
+        at: Timestamp,
+    ) -> Result<Option<([EyeObservation; 2], PairPrior)>, DetectError> {
         let diff = saturating_diff(lit, dark)?;
         let diff = diff.view();
         let (cands, counts) = blob::candidates(diff, &self.options);
-        let Some((i, j)) = pupil::select_pair(&cands, &self.options) else {
+
+        let gap_ms = prior
+            .map(|p| at.nanos_since(p.at).max(0) as f64 / 1e6)
+            .unwrap_or(0.0);
+        let active_prior = prior.filter(|_| gap_ms <= self.options.track_max_gap_ms);
+
+        let Some((i, j, _switched)) =
+            pupil::select_pair_with_prior(&cands, active_prior, gap_ms, &self.options)
+        else {
             let reason = match cands.len() {
                 0 => "no_candidates",
                 1 => "single_candidate",
@@ -142,6 +185,19 @@ impl IrClassicDetector {
         } else {
             ((pupil_j, glint_j), (pupil_i, glint_i))
         };
+        let next_prior = if cands[i].centroid.x <= cands[j].centroid.x {
+            PairPrior {
+                at,
+                right: (cands[i].centroid, cands[i].area),
+                left: (cands[j].centroid, cands[j].area),
+            }
+        } else {
+            PairPrior {
+                at,
+                right: (cands[j].centroid, cands[j].area),
+                left: (cands[i].centroid, cands[i].area),
+            }
+        };
 
         let mut right_eye = EyeObservation::new(Side::Right);
         right_eye.pupil = Some(right.0);
@@ -166,7 +222,7 @@ impl IrClassicDetector {
             );
         }
 
-        Ok(Some([right_eye, left_eye]))
+        Ok(Some(([right_eye, left_eye], next_prior)))
     }
 
     fn pupil_and_glint(
@@ -236,14 +292,25 @@ impl IrClassicDetector {
             let face = match self.paired_dark(frame) {
                 Some(dark) => {
                     let start = std::time::Instant::now();
-                    let result = self
-                        .detect_pair(GrayView::from_frame(frame)?, GrayView::from_frame(dark)?)?;
+                    let prior = self.last_pair.get(&h.camera).copied();
+                    let result = self.detect_pair_with_prior(
+                        GrayView::from_frame(frame)?,
+                        GrayView::from_frame(dark)?,
+                        prior.as_ref(),
+                        h.timestamp,
+                    )?;
                     tracing::trace!(
                         { field::ELAPSED_US } = start.elapsed().as_micros() as u64,
                         face = result.is_some(),
                         "ir-classic frame"
                     );
-                    result.map(face_from_pupils)
+                    match result {
+                        Some((eyes, next_prior)) => {
+                            self.last_pair.insert(h.camera.clone(), next_prior);
+                            Some(face_from_pupils(eyes))
+                        }
+                        None => None,
+                    }
                 }
                 None => None,
             };
@@ -622,11 +689,36 @@ mod tests {
         let index_path = std::path::Path::new(&dir).join("index.jsonl");
         let index = std::fs::read_to_string(&index_path).expect("index.jsonl readable");
 
+        let targets_path = std::path::Path::new(&dir).join("targets.jsonl");
+        let targets_raw = std::fs::read_to_string(&targets_path).expect("targets.jsonl readable");
+        let records: Vec<eye_core::session::TargetRecord> = targets_raw
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("targets.jsonl line parses"))
+            .collect();
+        let protocol = eye_core::session::ProtocolConfig::from_target_records(
+            &records,
+            &eye_core::session::ProtocolConfig::default(),
+        )
+        .unwrap_or_default();
+        let settle_ns = protocol.settle_ms * 1_000_000;
+        // Target windows: [shown_ns + settle, hidden_ns), so the eye has stopped travelling.
+        let windows: Vec<(u64, u64)> = records
+            .iter()
+            .filter_map(|r| r.hidden_ns.map(|hidden| (r.shown_ns + settle_ns, hidden)))
+            .collect();
+
         let mut detector = IrClassicDetector::new(IrClassicOptions::default());
         let mut lit_count = 0u64;
         // Indexed by side: [Right, Left].
         let mut glint_counts = [0u64; 2];
         let mut vectors: [Vec<(f64, f64)>; 2] = [Vec::new(), Vec::new()];
+        let mut centres: [Vec<Point2<f64>>; 2] = [Vec::new(), Vec::new()];
+        let mut prev_centre: [Option<Point2<f64>>; 2] = [None, None];
+        let mut jump_counts = [0u64; 2];
+        let mut window_centres: [Vec<Vec<Point2<f64>>>; 2] = [
+            vec![Vec::new(); windows.len()],
+            vec![Vec::new(); windows.len()],
+        ];
 
         for line in index.lines() {
             let illumination = match json_string_field(line, "illumination") {
@@ -635,7 +727,7 @@ mod tests {
                 _ => continue,
             };
             let seq = json_number_field(line, "seq").unwrap_or(0);
-            let ts_ns = json_number_field(line, "timestamp").unwrap_or(0);
+            let ts_ns = json_number_field(line, "timestamp_ns").unwrap_or(0);
             let path = std::path::Path::new(&dir).join(format!("frames/ir/{seq:08}.pgm"));
             let pixels = read_pgm(&path);
             let frame = ir_frame(illumination, ts_ns, seq, &pixels);
@@ -654,6 +746,22 @@ mod tests {
                         Side::Right => 0,
                         Side::Left => 1,
                     };
+                    if let Some(pupil) = eye.pupil {
+                        let centre = pupil.value().center();
+                        if let Some(prev) = prev_centre[side]
+                            && (centre - prev).norm() > 3.0
+                        {
+                            jump_counts[side] += 1;
+                        }
+                        prev_centre[side] = Some(centre);
+                        centres[side].push(centre);
+                        if let Some(w) = windows
+                            .iter()
+                            .position(|&(start, end)| ts_ns >= start && ts_ns < end)
+                        {
+                            window_centres[side][w].push(centre);
+                        }
+                    }
                     if let (Some(pupil), Some(glint)) = (eye.pupil, eye.glints.first().copied()) {
                         glint_counts[side] += 1;
                         let v = *glint.value() - pupil.value().center();
@@ -689,6 +797,35 @@ mod tests {
                 glint_counts[side]
             );
             println!("{name} eye pupil-glint vector std: x={std_x:.3} y={std_y:.3}");
+
+            let mut window_stds: Vec<f64> = window_centres[side]
+                .iter()
+                .filter(|pts| pts.len() >= 2)
+                .map(|pts| {
+                    let n = pts.len() as f64;
+                    let mean_x = pts.iter().map(|p| p.x).sum::<f64>() / n;
+                    let mean_y = pts.iter().map(|p| p.y).sum::<f64>() / n;
+                    (pts.iter()
+                        .map(|p| (p.x - mean_x).powi(2) + (p.y - mean_y).powi(2))
+                        .sum::<f64>()
+                        / n)
+                        .sqrt()
+                })
+                .collect();
+            window_stds.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+            let within_window_std = match window_stds.len() {
+                0 => 0.0,
+                len if len.is_multiple_of(2) => {
+                    (window_stds[len / 2 - 1] + window_stds[len / 2]) / 2.0
+                }
+                len => window_stds[len / 2],
+            };
+            println!(
+                "{name} eye within-window centre std (median over {} windows): {within_window_std:.3} px, jumps > 3px: {}/{}",
+                window_stds.len(),
+                jump_counts[side],
+                centres[side].len()
+            );
         }
     }
 
@@ -868,6 +1005,172 @@ mod tests {
         ];
         let (lit, dark) = scene.render();
         assert_eq!(detector.detect_pair(lit.view(), dark.view()).unwrap(), None);
+    }
+
+    #[test]
+    fn test_prior_rejects_brighter_distractor_near_previous_pupil() {
+        let detector = IrClassicDetector::new(IrClassicOptions::default());
+        let baseline = SyntheticIr::default_scene();
+        let (base_lit, base_dark) = baseline.render();
+        let (_, prior) = detector
+            .detect_pair_with_prior(
+                base_lit.view(),
+                base_dark.view(),
+                None,
+                Timestamp::from_nanos(0),
+            )
+            .unwrap()
+            .expect("baseline face detected");
+
+        let mut scene = SyntheticIr::default_scene();
+        let mut distractor = SyntheticEye::at(Point2::new(300.0, 184.0));
+        distractor.pupil_level = 240;
+        scene.eyes.push(distractor);
+        let (lit, dark) = scene.render();
+
+        let eyes = detector
+            .detect_pair(lit.view(), dark.view())
+            .unwrap()
+            .expect("face detected");
+        let right = eyes[0].pupil.unwrap().value().center();
+        assert!(
+            (right - Point2::new(290.3, 180.7)).norm() > 1.0,
+            "expected the distractor to win without a prior, got {right:?}"
+        );
+
+        let at = Timestamp::from_nanos(68_000_000);
+        let (eyes, _next) = detector
+            .detect_pair_with_prior(lit.view(), dark.view(), Some(&prior), at)
+            .unwrap()
+            .expect("face detected");
+        assert_pupils_within(
+            &eyes,
+            Point2::new(290.3, 180.7),
+            Point2::new(350.6, 181.2),
+            0.05,
+        );
+    }
+
+    #[test]
+    fn test_prior_is_dropped_after_max_gap() {
+        let detector = IrClassicDetector::new(IrClassicOptions::default());
+        let scene = SyntheticIr::default_scene();
+        let (lit, dark) = scene.render();
+        let (_, prior) = detector
+            .detect_pair_with_prior(lit.view(), dark.view(), None, Timestamp::from_nanos(0))
+            .unwrap()
+            .expect("face detected");
+
+        // 500ms exceeds the default track_max_gap_ms of 400ms.
+        let at = Timestamp::from_nanos(500_000_000);
+        use eye_log::Value;
+        use eye_log::testing::capture_logs;
+        let (result, logs) = capture_logs(tracing::Level::DEBUG, || {
+            detector.detect_pair_with_prior(lit.view(), dark.view(), Some(&prior), at)
+        });
+        let (eyes, _next) = result.unwrap().expect("face detected");
+        assert_pupils_within(
+            &eyes,
+            Point2::new(290.3, 180.7),
+            Point2::new(350.6, 181.2),
+            0.05,
+        );
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "pair accepted")
+            .expect("event emitted");
+        assert_eq!(rec.fields["gated"], Value::Bool(false));
+        assert_eq!(rec.fields["switched"], Value::Bool(false));
+        assert!(!logs.iter().any(|r| r.message == "pair switched"));
+    }
+
+    #[test]
+    fn test_gate_scales_with_frame_gap() {
+        let detector = IrClassicDetector::new(IrClassicOptions::default());
+        let scene = SyntheticIr::default_scene();
+        let (lit, dark) = scene.render();
+        let (_, prior) = detector
+            .detect_pair_with_prior(lit.view(), dark.view(), None, Timestamp::from_nanos(0))
+            .unwrap()
+            .expect("face detected");
+
+        let mut moved = SyntheticIr::default_scene();
+        moved.eyes[0].pupil_center.x += 8.0;
+        let (lit2, dark2) = moved.render();
+
+        // 266ms = 2 * 133ms, scaling the 5px base gate to 10px.
+        let at = Timestamp::from_nanos(266_000_000);
+        use eye_log::Value;
+        use eye_log::testing::capture_logs;
+        let (result, logs) = capture_logs(tracing::Level::DEBUG, || {
+            detector.detect_pair_with_prior(lit2.view(), dark2.view(), Some(&prior), at)
+        });
+        let (eyes, _next) = result.unwrap().expect("face detected");
+        assert_pupils_within(
+            &eyes,
+            Point2::new(298.3, 180.7),
+            Point2::new(350.6, 181.2),
+            0.5,
+        );
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "pair accepted")
+            .expect("event emitted");
+        assert_eq!(rec.fields["gated"], Value::Bool(true));
+        assert_eq!(rec.fields["switched"], Value::Bool(false));
+    }
+
+    #[test]
+    fn test_switch_is_logged_when_no_candidate_passes_the_gate() {
+        let detector = IrClassicDetector::new(IrClassicOptions::default());
+        let scene = SyntheticIr::default_scene();
+        let (lit, dark) = scene.render();
+        let (_, baseline_prior) = detector
+            .detect_pair_with_prior(lit.view(), dark.view(), None, Timestamp::from_nanos(0))
+            .unwrap()
+            .expect("face detected");
+
+        let stale_prior = PairPrior {
+            at: Timestamp::from_nanos(0),
+            right: (
+                baseline_prior.right.0 + nalgebra::Vector2::new(40.0, 0.0),
+                baseline_prior.right.1,
+            ),
+            left: (
+                baseline_prior.left.0 + nalgebra::Vector2::new(40.0, 0.0),
+                baseline_prior.left.1,
+            ),
+        };
+
+        let at = Timestamp::from_nanos(68_000_000);
+        use eye_log::Value;
+        use eye_log::testing::capture_logs;
+        let (result, logs) = capture_logs(tracing::Level::DEBUG, || {
+            detector.detect_pair_with_prior(lit.view(), dark.view(), Some(&stale_prior), at)
+        });
+        let (eyes, _next) = result.unwrap().expect("face detected");
+        assert_pupils_within(
+            &eyes,
+            Point2::new(290.3, 180.7),
+            Point2::new(350.6, 181.2),
+            0.05,
+        );
+
+        let switched_rec = logs
+            .iter()
+            .find(|r| r.message == "pair switched")
+            .expect("event emitted");
+        match switched_rec.fields["jump_px"] {
+            Value::F64(j) => assert!((39.0..41.0).contains(&j), "jump_px {j} out of range"),
+            ref other => panic!("expected F64 jump_px, got {other:?}"),
+        }
+
+        let accepted_rec = logs
+            .iter()
+            .find(|r| r.message == "pair accepted")
+            .expect("event emitted");
+        assert_eq!(accepted_rec.fields["switched"], Value::Bool(true));
+        assert_eq!(accepted_rec.fields["gated"], Value::Bool(false));
     }
 
     #[test]

@@ -26,6 +26,7 @@ approx.workspace = true
 eye-log.workspace = true
 image.workspace = true
 proptest.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 
 [features]

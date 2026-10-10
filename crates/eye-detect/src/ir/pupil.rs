@@ -5,8 +5,8 @@ use nalgebra::Point2;
 
 use crate::DetectError;
 use crate::ellipse::fit_ellipse;
-use crate::ir::IrClassicOptions;
 use crate::ir::blob::Candidate;
+use crate::ir::{IrClassicOptions, PairPrior};
 
 fn weighted_centroid(diff: GrayView<'_>, c: &Candidate) -> Point2<f64> {
     let (w, h) = (diff.width(), diff.height());
@@ -128,12 +128,20 @@ fn plausible(ellipse: &Ellipse2, centroid: Point2<f64>, r: f64) -> bool {
 }
 
 /// Picks the pair of candidates whose separation and tilt are plausible for the two eyes
-/// (algorithm step 9), preferring the pair with the largest combined contrast.
-pub(crate) fn select_pair(
+/// (algorithm step 9). When `prior` is given (and still active; the caller drops it past
+/// `track_max_gap_ms`), first restricts the geometrically valid pairs to those whose two
+/// candidates each land within `track_gate_px` (scaled by `gap_ms` over a 133 ms lit period) of
+/// the prior's matching eye and within `track_area_ratio` of its area, ranking those by combined
+/// contrast. Falls back to the ungated ranking by combined contrast over all geometrically
+/// valid pairs when no pair passes the gate (or there is no prior), reporting that as
+/// `switched = true` whenever a prior was active but did not match.
+pub(crate) fn select_pair_with_prior(
     candidates: &[Candidate],
+    prior: Option<&PairPrior>,
+    gap_ms: f64,
     options: &IrClassicOptions,
-) -> Option<(usize, usize)> {
-    let mut best: Option<(usize, usize, f64, f64, f64)> = None;
+) -> Option<(usize, usize, bool)> {
+    let mut valid: Vec<(usize, usize, f64, f64, f64)> = Vec::new();
     for i in 0..candidates.len() {
         for j in (i + 1)..candidates.len() {
             let a = &candidates[i];
@@ -159,15 +167,90 @@ pub(crate) fn select_pair(
                 );
                 continue;
             }
-            let score = a.contrast + b.contrast;
+            valid.push((i, j, a.contrast + b.contrast, dist, tilt));
+        }
+    }
+
+    if let Some(p) = prior {
+        let gate_px = options.track_gate_px * (gap_ms / 133.0).max(1.0);
+        let mut best: Option<(usize, usize, f64, f64, f64)> = None;
+        for &(i, j, score, dist, tilt) in &valid {
+            if !prior_gate_ok(
+                &candidates[i],
+                &candidates[j],
+                p,
+                gate_px,
+                options.track_area_ratio,
+            ) {
+                continue;
+            }
             if best.is_none_or(|(_, _, best_score, _, _)| score > best_score) {
                 best = Some((i, j, score, dist, tilt));
             }
         }
+        if let Some((i, j, score, dist, tilt)) = best {
+            tracing::debug!(
+                dist_px = dist,
+                tilt_deg = tilt,
+                score,
+                gated = true,
+                switched = false,
+                "pair accepted"
+            );
+            return Some((i, j, false));
+        }
+    }
+
+    let mut best: Option<(usize, usize, f64, f64, f64)> = None;
+    for &(i, j, score, dist, tilt) in &valid {
+        if best.is_none_or(|(_, _, best_score, _, _)| score > best_score) {
+            best = Some((i, j, score, dist, tilt));
+        }
     }
     let (i, j, score, dist, tilt) = best?;
-    tracing::debug!(dist_px = dist, tilt_deg = tilt, score, "pair accepted");
-    Some((i, j))
+
+    let switched = prior.is_some();
+    if let Some(p) = prior {
+        let jump_px = prior_jump_px(&candidates[i], &candidates[j], p);
+        tracing::debug!(jump_px, "pair switched");
+    }
+    tracing::debug!(
+        dist_px = dist,
+        tilt_deg = tilt,
+        score,
+        gated = false,
+        switched,
+        "pair accepted"
+    );
+    Some((i, j, switched))
+}
+
+fn prior_gate_ok(
+    a: &Candidate,
+    b: &Candidate,
+    prior: &PairPrior,
+    gate_px: f64,
+    area_ratio: f64,
+) -> bool {
+    let role_ok = |c: &Candidate, slot: (Point2<f64>, u32)| {
+        (c.centroid - slot.0).norm() <= gate_px && area_within_ratio(c.area, slot.1, area_ratio)
+    };
+    (role_ok(a, prior.right) && role_ok(b, prior.left))
+        || (role_ok(a, prior.left) && role_ok(b, prior.right))
+}
+
+fn area_within_ratio(area: u32, prior_area: u32, ratio: f64) -> bool {
+    if prior_area == 0 {
+        return true;
+    }
+    let r = f64::from(area) / f64::from(prior_area);
+    (1.0 / ratio..=ratio).contains(&r)
+}
+
+fn prior_jump_px(a: &Candidate, b: &Candidate, prior: &PairPrior) -> f64 {
+    let forward = (a.centroid - prior.right.0).norm() + (b.centroid - prior.left.0).norm();
+    let swapped = (a.centroid - prior.left.0).norm() + (b.centroid - prior.right.0).norm();
+    forward.min(swapped) / 2.0
 }
 
 fn fold_to_right_angle(deg: f64) -> f64 {

@@ -631,6 +631,7 @@ dependencies = [
  "ort",
  "proptest",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "toml",
