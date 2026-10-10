@@ -38,4 +38,20 @@ pub enum OverlayError {
     Panicked,
     #[error("invalid grid {cols}x{rows}: both must be at least 1")]
     InvalidGrid { cols: u32, rows: u32 },
+    #[error("spawning the overlay thread: {0}")]
+    Spawn(#[source] std::io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use super::*;
+
+    #[test]
+    fn test_overlay_error_spawn_displays_io_message() {
+        let err = OverlayError::Spawn(std::io::Error::other("no threads"));
+        assert_eq!(err.to_string(), "spawning the overlay thread: no threads");
+        assert!(err.source().is_some());
+    }
 }

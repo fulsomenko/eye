@@ -215,13 +215,7 @@ impl Tracker {
         let cameras = worker.captures.len();
         let sinks = worker.sinks.len();
         tracker.shared.with_stats(|s| s.counts.sinks = sinks);
-        let parent = tracing::Span::current();
-        let handle = std::thread::Builder::new()
-            .name("eye-pipeline".into())
-            .spawn(move || {
-                let _parent = parent.entered();
-                worker.run()
-            })
+        let handle = eye_core::log::spawn_in_current_span("eye-pipeline", move || worker.run())
             .map_err(TrackerError::Spawn)?;
         tracker.pipeline = Some(handle);
         tracing::info!(

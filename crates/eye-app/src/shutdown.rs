@@ -4,21 +4,17 @@ pub fn install() -> anyhow::Result<crossbeam_channel::Receiver<()>> {
 
     let mut signals = Signals::new([SIGINT, SIGTERM])?;
     let (tx, rx) = crossbeam_channel::bounded(1);
-    let parent = tracing::Span::current();
-    std::thread::Builder::new()
-        .name("eye-signals".into())
-        .spawn(move || {
-            let _enter = parent.entered();
-            let mut requested = false;
-            for signal in signals.forever() {
-                if requested {
-                    std::process::exit(130);
-                }
-                requested = true;
-                tracing::info!(signal, "shutting down; send the signal again to force");
-                let _ = tx.try_send(());
+    eye_core::log::spawn_in_current_span("eye-signals", move || {
+        let mut requested = false;
+        for signal in signals.forever() {
+            if requested {
+                std::process::exit(130);
             }
-        })?;
+            requested = true;
+            tracing::info!(signal, "shutting down; send the signal again to force");
+            let _ = tx.try_send(());
+        }
+    })?;
     Ok(rx)
 }
 

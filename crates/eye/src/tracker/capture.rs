@@ -33,14 +33,10 @@ pub(crate) fn spawn_capture(
     let evict = rx.clone();
     let dropped = Arc::new(AtomicU64::new(0));
     let counter = Arc::clone(&dropped);
-    let parent = tracing::Span::current();
-    let handle = std::thread::Builder::new()
-        .name(format!("eye-cap-{camera}"))
-        .spawn(move || {
-            let _parent = parent.entered();
-            capture_loop(source.as_mut(), &tx, &evict, &stop, &counter);
-        })
-        .map_err(TrackerError::Spawn)?;
+    let handle = eye_core::log::spawn_in_current_span(format!("eye-cap-{camera}"), move || {
+        capture_loop(source.as_mut(), &tx, &evict, &stop, &counter);
+    })
+    .map_err(TrackerError::Spawn)?;
     Ok(CaptureThread {
         camera,
         rx,

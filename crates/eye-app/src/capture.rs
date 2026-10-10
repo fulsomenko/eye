@@ -89,11 +89,8 @@ impl Capture {
             let tx = tx.clone();
             let stop = Arc::clone(&stop);
             let dropped = Arc::clone(&dropped);
-            let parent = tracing::Span::current();
-            let handle = std::thread::Builder::new()
-                .name(format!("eye-rec-{id}"))
-                .spawn(move || {
-                    let _enter = parent.entered();
+            let handle =
+                eye_core::log::spawn_in_current_span(format!("eye-rec-{id}"), move || {
                     capture_loop(source, id, tx, stop, dropped)
                 })?;
             threads.push(handle);

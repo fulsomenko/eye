@@ -392,26 +392,22 @@ fn spawn_captures(
             .find(|(route_id, _)| route_id == &id)
             .map(|(_, tx)| tx.clone());
         let stop = Arc::clone(stop);
-        let parent = tracing::Span::current();
-        let handle = std::thread::Builder::new()
-            .name(format!("eye-cal-{id}"))
-            .spawn(move || {
-                let _enter = parent.entered();
-                while !stop.load(Ordering::Relaxed) {
-                    match source.next_frame() {
-                        Ok(frame) => {
-                            if let Some(tx) = &tx {
-                                let _ = tx.try_send(frame);
-                            }
-                        }
-                        Err(CaptureError::Timeout { .. }) => continue,
-                        Err(err) => {
-                            tracing::warn!(camera = %id, error = %err, "capture ended");
-                            break;
+        let handle = eye_core::log::spawn_in_current_span(format!("eye-cal-{id}"), move || {
+            while !stop.load(Ordering::Relaxed) {
+                match source.next_frame() {
+                    Ok(frame) => {
+                        if let Some(tx) = &tx {
+                            let _ = tx.try_send(frame);
                         }
                     }
+                    Err(CaptureError::Timeout { .. }) => continue,
+                    Err(err) => {
+                        tracing::warn!(camera = %id, error = %err, "capture ended");
+                        break;
+                    }
                 }
-            })?;
+            }
+        })?;
         handles.push(handle);
     }
     Ok(handles)

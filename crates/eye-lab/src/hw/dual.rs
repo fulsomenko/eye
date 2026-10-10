@@ -1,7 +1,4 @@
-use std::{
-    thread::{self, JoinHandle},
-    time::Duration,
-};
+use std::{thread::JoinHandle, time::Duration};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use eye_capture::{CaptureError, FrameSource};
@@ -61,22 +58,18 @@ fn spawn_reader(
     mut source: Box<dyn FrameSource>,
 ) -> Result<(JoinHandle<()>, Receiver<Reading>), TestError> {
     let (tx, rx) = crossbeam_channel::bounded::<Reading>(64);
-    let parent = tracing::Span::current();
-    let handle = thread::Builder::new()
-        .name(format!("eye-lab-{name}"))
-        .spawn(move || {
-            let _enter = parent.entered();
-            loop {
-                let item = source
-                    .next_frame()
-                    .map(|f| (f.header().timestamp, f.header().illumination));
-                let stop = item.is_err();
-                if tx.send(item).is_err() || stop {
-                    return;
-                }
+    let handle = eye_core::log::spawn_in_current_span(format!("eye-lab-{name}"), move || {
+        loop {
+            let item = source
+                .next_frame()
+                .map(|f| (f.header().timestamp, f.header().illumination));
+            let stop = item.is_err();
+            if tx.send(item).is_err() || stop {
+                return;
             }
-        })
-        .map_err(|e| TestError::Other(format!("spawning the {name} reader: {e}")))?;
+        }
+    })
+    .map_err(|e| TestError::Other(format!("spawning the {name} reader: {e}")))?;
     Ok((handle, rx))
 }
 

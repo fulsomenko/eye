@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::thread;
 use std::time::Instant;
 
 use eye_core::Timestamp;
 use eye_core::log::field;
+use eye_core::log::spawn_in_current_span;
 use smithay_client_toolkit::compositor::{
     CompositorHandler, CompositorState, FrameCallbackData, Region,
 };
@@ -53,11 +53,10 @@ pub fn spawn<S: Scene>(
         crossbeam_channel::bounded::<Result<(u32, u32), OverlayError>>(1);
     let (tx, channel) = calloop::channel::sync_channel::<S::Msg>(64);
 
-    let parent = tracing::Span::current();
-    let thread = thread::spawn(move || {
-        let _parent = parent.entered();
+    let thread = spawn_in_current_span(format!("eye-overlay-{}", options.namespace), move || {
         run(options, scene, channel, startup_tx)
-    });
+    })
+    .map_err(OverlayError::Spawn)?;
 
     match startup_rx.recv() {
         Ok(Ok(logical)) => Ok(OverlayHandle {

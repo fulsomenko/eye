@@ -96,30 +96,25 @@ impl SinkLayer {
         let (tx, rx) = crossbeam_channel::bounded::<Msg>(capacity);
         let dropped = Arc::new(AtomicU64::new(0));
         let dropped_for_thread = Arc::clone(&dropped);
-        let span = tracing::Span::current();
-
-        let handle = std::thread::Builder::new()
-            .name("eye-log-writer".to_string())
-            .spawn(move || {
-                let _enter = span.enter();
-                let mut written: u64 = 0;
-                while let Ok(msg) = rx.recv() {
-                    match msg {
-                        Msg::Record(record) => {
-                            if sink.write(&record).is_ok() {
-                                written += 1;
-                            }
+        let handle = eye_core::log::spawn_in_current_span("eye-log-writer", move || {
+            let mut written: u64 = 0;
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    Msg::Record(record) => {
+                        if sink.write(&record).is_ok() {
+                            written += 1;
                         }
-                        Msg::Shutdown => break,
                     }
+                    Msg::Shutdown => break,
                 }
-                let _ = sink.flush();
-                ShutdownReport {
-                    written,
-                    dropped: dropped_for_thread.load(Ordering::Relaxed),
-                }
-            })
-            .expect("spawning eye-log-writer thread");
+            }
+            let _ = sink.flush();
+            ShutdownReport {
+                written,
+                dropped: dropped_for_thread.load(Ordering::Relaxed),
+            }
+        })
+        .expect("spawning eye-log-writer thread");
 
         (
             SinkLayer {
