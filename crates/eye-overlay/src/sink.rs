@@ -9,7 +9,7 @@ use nalgebra::Vector2;
 use crate::ellipse::logical_px_per_mm;
 use crate::error::OverlayError;
 use crate::handle::OverlayHandle;
-use crate::point::{Easing, HideRules, PointScene};
+use crate::point::{HideRules, Interpolation, PointScene};
 use crate::region::RegionScene;
 use crate::stats::PresentStats;
 use crate::surface::{SurfaceOptions, spawn};
@@ -26,7 +26,7 @@ pub struct OverlayOptions {
     pub mode: OverlayMode,
     pub px_per_mm: Vector2<f64>,
     pub color: [u8; 3],
-    pub easing: Easing,
+    pub interpolation: Interpolation,
     pub hide: HideRules,
 }
 
@@ -37,7 +37,7 @@ impl OverlayOptions {
             mode,
             px_per_mm: logical_px_per_mm(screen),
             color: [255, 64, 64],
-            easing: Easing::default(),
+            interpolation: Interpolation::default(),
             hide: HideRules::default(),
         }
     }
@@ -60,9 +60,13 @@ impl LayerShellOverlay {
         let handle = match options.mode {
             OverlayMode::Point => spawn(
                 surface,
-                PointScene::with_easing(options.px_per_mm, options.color, options.easing)
-                    .with_hide_rules(options.hide)
-                    .with_present_stats(present.clone()),
+                PointScene::with_interpolation(
+                    options.px_per_mm,
+                    options.color,
+                    options.interpolation,
+                )
+                .with_hide_rules(options.hide)
+                .with_present_stats(present.clone()),
             )?,
             OverlayMode::Region { cols, rows } => {
                 let grid = Grid::new(cols, rows).ok_or(OverlayError::InvalidGrid { cols, rows })?;

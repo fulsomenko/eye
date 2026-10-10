@@ -1,5 +1,6 @@
 //! Pin-point mode: a dot plus uncertainty ellipse for the latest gaze point.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use eye_core::GazePoint;
@@ -12,38 +13,31 @@ use crate::fade::{FADE_START, fade};
 use crate::scene::{PresentedAt, Scene, Schedule};
 use crate::stats::PresentStats;
 
-/// Display-rate easing toward the latest sample. `tau` is the time constant of the
-/// exponential approach; `snap_px` ends the animation when the drawn point (and, for the
-/// ellipse, both drawn semi-axes) are this close to the target. `reset_after` teleports
-/// instead of sweeping when a new sample arrives this long after the previous one.
+/// The scene draws the trajectory `max_lag` behind the newest sample, as a cubic Hermite
+/// between the two newest samples with backward-difference tangents. This adds no filtering.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Easing {
-    pub tau: Duration,
-    pub snap_px: f64,
-    pub reset_after: Duration,
+pub struct Interpolation {
+    /// `Duration::ZERO` draws samples as they arrive, with no interpolation.
+    pub max_lag: Duration,
 }
 
-impl Easing {
-    /// `tau` zero reproduces the pre-easing behaviour: one draw per sample, no sweep.
-    pub fn from_millis(easing_ms: u64) -> Self {
+const MIN_LAG: Duration = Duration::from_millis(16);
+
+impl Interpolation {
+    pub fn from_millis(ms: u64) -> Self {
         Self {
-            tau: Duration::from_millis(easing_ms),
-            ..Self::default()
+            max_lag: Duration::from_millis(ms),
         }
     }
 
     fn disabled(&self) -> bool {
-        self.tau.is_zero()
+        self.max_lag.is_zero()
     }
 }
 
-impl Default for Easing {
+impl Default for Interpolation {
     fn default() -> Self {
-        Self {
-            tau: Duration::from_millis(80),
-            snap_px: 0.5,
-            reset_after: Duration::from_secs(1),
-        }
+        Self::from_millis(80)
     }
 }
 
@@ -152,15 +146,25 @@ struct Eased {
     ellipse: Option<EasedEllipse>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Knot {
+    at: Instant,
+    pose: Eased,
+    /// Backward-difference tangent, in logical px per second.
+    tangent: Vector2<f64>,
+}
+
 #[derive(Debug)]
 pub struct PointScene {
     px_per_mm: Vector2<f64>,
     color: [u8; 3],
-    easing: Easing,
+    interp: Interpolation,
     latest: Option<(GazePoint, Instant)>,
-    target: Option<Eased>,
+    /// At most two: the segment `step` interpolates across. Cleared by `render` on
+    /// fade-out and on off-screen hide, so the next sample teleports.
+    knots: VecDeque<Knot>,
+    lag: Duration,
     drawn: Option<Eased>,
-    last_step: Option<Instant>,
     hide: HideRules,
     style: PointStyle,
     hidden_offscreen: bool,
@@ -168,35 +172,44 @@ pub struct PointScene {
     /// `timestamp.as_nanos()` of the latest sample whose first on-target commit has not
     /// been handed out as a presentation mark yet. A newer sample replaces an unmarked
     /// older one: the dot never reached it, nothing to measure. `render` takes this (sets
-    /// it to `None`) the moment `drawn` catches up to `target`, so a sample is marked at
-    /// most once even if `render` runs again before `on_presented` arrives.
+    /// it to `None`) the moment the drawn pose catches up to the newest knot, so a sample
+    /// is marked at most once even if `render` runs again before `on_presented` arrives.
     pending_mark: Option<u64>,
     /// The mark for the current commit, or `None` if this commit carries no mark. Reset
     /// to `None` at the top of every `render` and set at most once per sample, from
-    /// `pending_mark`, when `drawn` catches up to `target`.
+    /// `pending_mark`, when the drawn pose catches up to the newest knot.
     mark_ready: Option<u64>,
+    /// `now - lag >= k1.at`, reevaluated on every sample so a knot whose lag is already
+    /// zero starts `true`. `step` edge-triggers on this to return `true` exactly once on
+    /// the frame it flips, forcing a `render` even when nothing else is moving.
+    reached_rendered: bool,
 }
 
 impl PointScene {
     pub fn new(px_per_mm: Vector2<f64>, color: [u8; 3]) -> Self {
-        Self::with_easing(px_per_mm, color, Easing::default())
+        Self::with_interpolation(px_per_mm, color, Interpolation::default())
     }
 
-    pub fn with_easing(px_per_mm: Vector2<f64>, color: [u8; 3], easing: Easing) -> Self {
+    pub fn with_interpolation(
+        px_per_mm: Vector2<f64>,
+        color: [u8; 3],
+        interp: Interpolation,
+    ) -> Self {
         Self {
             px_per_mm,
             color,
-            easing,
+            interp,
             latest: None,
-            target: None,
+            knots: VecDeque::new(),
+            lag: Duration::ZERO,
             drawn: None,
-            last_step: None,
             hide: HideRules::default(),
             style: PointStyle::default(),
             hidden_offscreen: false,
             present: PresentStats::default(),
             pending_mark: None,
             mark_ready: None,
+            reached_rendered: false,
         }
     }
 
@@ -222,13 +235,13 @@ impl PointScene {
     /// Where the dot's target goes for a new sample, given the current target and the time
     /// since the previous sample; `None` means jump to the sample.
     fn zoned_center(&self, msg: &GazePoint, dt: Duration) -> Option<Point2<f64>> {
-        let current = self.target?;
+        let current = self.knots.back()?.pose.center;
         if self.style.hold_sigmas <= 0.0 {
             return None;
         }
         let cov_px = cov_mm_to_logical_px(&msg.cov_mm, &self.px_per_mm);
         let inv = cov_px.try_inverse()?;
-        let d = msg.px_logical - current.center;
+        let d = msg.px_logical - current;
         let m = (d.transpose() * inv * d)[(0, 0)].sqrt();
         if m > self.style.hold_sigmas {
             return Some(msg.px_logical - d * (self.style.hold_sigmas / m));
@@ -239,7 +252,15 @@ impl PointScene {
         } else {
             1.0
         };
-        Some(current.center + d * k)
+        Some(current + d * k)
+    }
+
+    /// `now - lag >= k1.at`: the drawn pose has caught up to the newest knot.
+    fn reached_latest(&self, now: Instant) -> bool {
+        self.knots.back().is_some_and(|k1| {
+            now.checked_sub(self.lag)
+                .is_some_and(|target_time| target_time >= k1.at)
+        })
     }
 
     fn target_for(&self, p: &GazePoint) -> Eased {
@@ -254,41 +275,38 @@ impl PointScene {
             ellipse,
         }
     }
+}
 
-    /// `true` while `drawn` is still short of `target` by more than `snap_px`, for the
-    /// center and (when both have an ellipse) for either semi-axis.
-    fn ease_toward_target(&mut self, dt: Duration) -> bool {
-        let (Some(target), Some(drawn)) = (self.target, self.drawn) else {
-            return false;
-        };
-        let alpha = 1.0 - (-dt.as_secs_f64() / self.easing.tau.as_secs_f64()).exp();
-        let lerp = |a: f64, b: f64| a + alpha * (b - a);
-
-        let center = Point2::new(
-            lerp(drawn.center.x, target.center.x),
-            lerp(drawn.center.y, target.center.y),
-        );
-        let center_moving = (center - target.center).norm() >= self.easing.snap_px;
-
-        let (ellipse, ellipse_moving) = match (drawn.ellipse, target.ellipse) {
-            (Some(d), Some(t)) => {
-                let axes = (lerp(d.axes.0, t.axes.0), lerp(d.axes.1, t.axes.1));
-                let angle = lerp_angle(d.angle, t.angle, alpha);
-                let moving = (axes.0 - t.axes.0).abs() >= self.easing.snap_px
-                    || (axes.1 - t.axes.1).abs() >= self.easing.snap_px;
-                (Some(EasedEllipse { axes, angle }), moving)
-            }
-            // The ellipse appeared, vanished, or there was none to begin with: no sweep.
-            _ => (target.ellipse, false),
-        };
-
-        let moving = center_moving || ellipse_moving;
-        self.drawn = Some(if moving {
-            Eased { center, ellipse }
-        } else {
-            target
-        });
-        moving
+/// Cubic Hermite on `[k0.at, k1.at]` at `tau` (the caller clamps `tau` into that interval).
+/// Ellipse axes and angle interpolate linearly, not via Hermite.
+fn hermite(k0: &Knot, k1: &Knot, tau: Instant) -> Eased {
+    let span = k1.at.saturating_duration_since(k0.at).as_secs_f64();
+    let h = if span > 0.0 {
+        tau.saturating_duration_since(k0.at).as_secs_f64() / span
+    } else {
+        1.0
+    };
+    let h00 = 2.0 * h.powi(3) - 3.0 * h.powi(2) + 1.0;
+    let h10 = h.powi(3) - 2.0 * h.powi(2) + h;
+    let h01 = -2.0 * h.powi(3) + 3.0 * h.powi(2);
+    let h11 = h.powi(3) - h.powi(2);
+    let center = k0.pose.center.coords * h00
+        + k0.tangent * span * h10
+        + k1.pose.center.coords * h01
+        + k1.tangent * span * h11;
+    let ellipse = match (k0.pose.ellipse, k1.pose.ellipse) {
+        (Some(a), Some(b)) => Some(EasedEllipse {
+            axes: (
+                a.axes.0 + h * (b.axes.0 - a.axes.0),
+                a.axes.1 + h * (b.axes.1 - a.axes.1),
+            ),
+            angle: lerp_angle(a.angle, b.angle, h),
+        }),
+        _ => k1.pose.ellipse,
+    };
+    Eased {
+        center: Point2::from(center),
+        ellipse,
     }
 }
 
@@ -304,49 +322,76 @@ impl Scene for PointScene {
     type Msg = GazePoint;
 
     fn on_msg(&mut self, msg: GazePoint, now: Instant) {
-        let mut target = self.target_for(&msg);
-        let stale = self.latest.as_ref().is_some_and(|(_, received)| {
-            now.saturating_duration_since(*received) > self.easing.reset_after
+        let mut pose = self.target_for(&msg);
+        let dt = self
+            .latest
+            .as_ref()
+            .map_or(Duration::ZERO, |(_, received)| {
+                now.saturating_duration_since(*received)
+            });
+        if let Some(center) = self.zoned_center(&msg, dt) {
+            pose.center = center;
+        }
+        let first = self.knots.is_empty();
+        let tangent = match self.knots.back() {
+            Some(prev) if now > prev.at => {
+                (pose.center - prev.pose.center) / now.duration_since(prev.at).as_secs_f64()
+            }
+            _ => Vector2::zeros(),
+        };
+        self.knots.push_back(Knot {
+            at: now,
+            pose,
+            tangent,
         });
-        if !stale {
-            let dt = self
-                .latest
-                .as_ref()
-                .map_or(Duration::ZERO, |(_, received)| {
-                    now.saturating_duration_since(*received)
-                });
-            if let Some(center) = self.zoned_center(&msg, dt) {
-                target.center = center;
+        if self.interp.disabled() {
+            while self.knots.len() > 1 {
+                self.knots.pop_front();
+            }
+            self.lag = Duration::ZERO;
+            self.drawn = Some(pose);
+        } else {
+            while self.knots.len() > 2 {
+                self.knots.pop_front();
+            }
+            if first {
+                self.lag = Duration::ZERO;
+                self.drawn = Some(pose);
+            } else {
+                let max_lag = self.interp.max_lag;
+                self.lag = dt.min(max_lag).max(MIN_LAG.min(max_lag));
             }
         }
-        if self.drawn.is_none() || stale || self.easing.disabled() {
-            self.drawn = Some(target);
-        } else if self.drawn == self.target {
-            // Settled: no in-flight animation whose dt this would shorten.
-            self.last_step = Some(now);
-        }
-        self.target = Some(target);
         self.pending_mark = Some(msg.timestamp.as_nanos());
         self.latest = Some((msg, now));
+        self.reached_rendered = self.reached_latest(now);
     }
 
     fn step(&mut self, now: Instant) -> bool {
-        if self.easing.disabled() {
-            if let Some(target) = self.target {
-                self.drawn = Some(target);
+        let moving = if self.knots.len() < 2 {
+            if let Some(k) = self.knots.back() {
+                self.drawn = Some(k.pose);
             }
-            self.last_step = Some(now);
-            return false;
-        }
-        let dt = self
-            .last_step
-            .map_or(Duration::ZERO, |t| now.saturating_duration_since(t));
-        self.last_step = Some(now);
-        let before = self.drawn;
-        let moving = self.ease_toward_target(dt);
-        // The settling step snaps `drawn` to `target` and reports `moving == false`;
-        // the surface must still draw this frame to present the settled point.
-        moving || self.drawn != before
+            false
+        } else {
+            let k0 = &self.knots[0];
+            let k1 = &self.knots[1];
+            match now.checked_sub(self.lag) {
+                Some(target_time) if target_time <= k1.at => {
+                    let tau = target_time.clamp(k0.at, k1.at);
+                    self.drawn = Some(hermite(k0, k1, tau));
+                    true
+                }
+                _ => {
+                    self.drawn = Some(k1.pose);
+                    false
+                }
+            }
+        };
+        let reached = self.reached_latest(now);
+        let just_reached = reached && !self.reached_rendered;
+        self.reached_rendered = reached;
+        moving || just_reached
     }
 
     fn render(&mut self, canvas: &mut Canvas<'_>, now: Instant) -> Schedule {
@@ -364,7 +409,7 @@ impl Scene for PointScene {
                 "stale gaze point hidden"
             );
             self.latest = None;
-            self.target = None;
+            self.knots.clear();
             self.drawn = None;
             return Schedule::Idle;
         }
@@ -378,7 +423,7 @@ impl Scene for PointScene {
             self.hidden_offscreen,
         );
         if self.hidden_offscreen {
-            self.target = None;
+            self.knots.clear();
             self.drawn = None;
             return Schedule::Idle;
         }
@@ -388,7 +433,7 @@ impl Scene for PointScene {
         let Some(drawn) = self.drawn else {
             return Schedule::Idle;
         };
-        if self.drawn == self.target {
+        if self.reached_latest(now) {
             self.mark_ready = self.pending_mark.take();
         }
         let max_axis = f64::from(w).hypot(f64::from(h));
@@ -488,10 +533,10 @@ mod tests {
     }
 
     fn zoned_scene() -> PointScene {
-        PointScene::with_easing(
+        PointScene::with_interpolation(
             Vector2::new(1.0, 1.0),
             [255, 64, 64],
-            Easing::from_millis(0),
+            Interpolation::from_millis(0),
         )
     }
 
@@ -659,171 +704,160 @@ mod tests {
         assert_alpha(&buf, 100, 100, 147.0, 3.0);
     }
 
-    #[test]
-    fn test_easing_moves_drawn_point_toward_target_exponentially() {
-        let now = Instant::now();
-        let mut scene = PointScene::with_easing(
+    fn scene_no_zone(max_lag_ms: u64) -> PointScene {
+        PointScene::with_interpolation(
             Vector2::new(1.0, 1.0),
             [255, 64, 64],
-            Easing {
-                tau: Duration::from_millis(80),
-                snap_px: 0.5,
-                reset_after: Duration::from_secs(1),
-            },
-        );
-        scene.drawn = Some(Eased {
-            center: Point2::new(0.0, 0.0),
-            ellipse: None,
-        });
-        scene.target = Some(Eased {
-            center: Point2::new(100.0, 0.0),
-            ellipse: None,
-        });
-        scene.last_step = Some(now);
+            Interpolation::from_millis(max_lag_ms),
+        )
+        .with_style(PointStyle {
+            hold_sigmas: 0.0,
+            ..PointStyle::default()
+        })
+    }
 
-        let moving = scene.step(now + Duration::from_millis(80));
-        assert!(moving);
-        assert_abs_diff_eq!(scene.drawn.unwrap().center.x, 63.2, epsilon = 0.5);
+    fn feed(scene: &mut PointScene, now: Instant, samples: &[(u64, f64)]) {
+        for &(ms, x) in samples {
+            let (p, t) = point_px(now + Duration::from_millis(ms), x, 0.0, 0.0, 1.0);
+            scene.on_msg(p, t);
+        }
     }
 
     #[test]
-    fn test_easing_moves_ellipse_axes_with_the_same_alpha() {
+    fn test_interpolation_passes_through_samples() {
         let now = Instant::now();
-        let mut scene = PointScene::with_easing(
-            Vector2::new(1.0, 1.0),
-            [255, 64, 64],
-            Easing {
-                tau: Duration::from_millis(80),
-                snap_px: 0.5,
-                reset_after: Duration::from_secs(1),
-            },
-        );
-        scene.drawn = Some(Eased {
-            center: Point2::new(0.0, 0.0),
-            ellipse: Some(EasedEllipse {
-                axes: (10.0, 10.0),
-                angle: 0.0,
-            }),
-        });
-        scene.target = Some(Eased {
-            center: Point2::new(0.0, 0.0),
-            ellipse: Some(EasedEllipse {
-                axes: (30.0, 30.0),
-                angle: 0.0,
-            }),
-        });
-        scene.last_step = Some(now);
+        let mut scene = scene_no_zone(80);
+        feed(&mut scene, now, &[(0, 0.0), (33, 10.0)]);
+        scene.step(now + Duration::from_millis(66));
+        assert_abs_diff_eq!(scene.drawn.unwrap().center.x, 10.0, epsilon = 1e-9);
 
-        let moving = scene.step(now + Duration::from_millis(80));
-        assert!(moving);
-        assert_abs_diff_eq!(
-            scene.drawn.unwrap().ellipse.unwrap().axes.0,
-            22.6,
-            epsilon = 0.5
-        );
-        assert_abs_diff_eq!(
-            scene.drawn.unwrap().ellipse.unwrap().axes.1,
-            22.6,
-            epsilon = 0.5
+        feed(&mut scene, now, &[(66, 20.0)]);
+        scene.step(now + Duration::from_millis(99));
+        assert_abs_diff_eq!(scene.drawn.unwrap().center.x, 20.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_interpolation_velocity_is_continuous_across_samples() {
+        let now = Instant::now();
+        let mut scene = scene_no_zone(80);
+        feed(&mut scene, now, &[(0, 0.0), (33, 10.0), (66, 30.0)]);
+
+        let (k0, k1) = (scene.knots[0], scene.knots[1]);
+        let before1 = hermite(&k0, &k1, now + Duration::from_millis(65));
+        let before2 = hermite(&k0, &k1, now + Duration::from_millis(66));
+        let v_before = before2.center.x - before1.center.x;
+
+        feed(&mut scene, now, &[(99, 60.0)]);
+        let (k0, k1) = (scene.knots[0], scene.knots[1]);
+        let after1 = hermite(&k0, &k1, now + Duration::from_millis(66));
+        let after2 = hermite(&k0, &k1, now + Duration::from_millis(67));
+        let v_after = after2.center.x - after1.center.x;
+
+        let rel_diff = (v_after - v_before).abs() / v_before.abs();
+        assert!(
+            rel_diff < 0.05,
+            "v_before {v_before} v_after {v_after} rel_diff {rel_diff}"
         );
     }
 
     #[test]
-    fn test_easing_stops_within_snap_distance() {
+    fn test_interpolation_holds_at_latest_sample_when_late() {
         let now = Instant::now();
-        let mut scene = PointScene::with_easing(
-            Vector2::new(1.0, 1.0),
-            [255, 64, 64],
-            Easing {
-                tau: Duration::from_millis(80),
-                snap_px: 0.5,
-                reset_after: Duration::from_secs(1),
-            },
-        );
-        scene.drawn = Some(Eased {
-            center: Point2::new(99.8, 0.0),
-            ellipse: None,
-        });
-        scene.target = Some(Eased {
-            center: Point2::new(100.0, 0.0),
-            ellipse: None,
-        });
-        scene.last_step = Some(now);
+        let mut scene = scene_no_zone(80);
+        feed(&mut scene, now, &[(0, 0.0), (33, 10.0)]);
 
-        let redraw = scene.step(now + Duration::from_millis(80));
+        let redraw = scene.step(now + Duration::from_millis(33 + 100));
         assert!(
             redraw,
-            "the settling step snaps drawn and must still be drawn"
+            "the dot reaches the latest sample on this call for the first time and must \
+             render once to catch it, rather than waiting for a later tick"
         );
-        assert_eq!(scene.drawn.unwrap().center, scene.target.unwrap().center);
+        assert_abs_diff_eq!(scene.drawn.unwrap().center.x, 10.0, epsilon = 1e-9);
 
-        let redraw_again = scene.step(now + Duration::from_millis(160));
-        assert!(!redraw_again, "already settled, nothing changed to redraw");
+        let redraw_again = scene.step(now + Duration::from_millis(33 + 100 + 16));
+        assert!(
+            !redraw_again,
+            "already caught; nothing left to render while idle"
+        );
     }
 
     #[test]
-    fn test_first_sample_is_drawn_without_easing() {
+    fn test_lag_is_clamped_to_max_lag() {
+        let now = Instant::now();
+        let mut scene = scene_no_zone(80);
+        feed(&mut scene, now, &[(0, 0.0), (133, 10.0)]);
+
+        let just_before = scene.step(now + Duration::from_millis(133 + 79));
+        assert!(just_before);
+        assert!(scene.drawn.unwrap().center.x < 10.0);
+
+        scene.step(now + Duration::from_millis(133 + 80));
+        assert_abs_diff_eq!(scene.drawn.unwrap().center.x, 10.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_interpolation_zero_draws_latest_immediately() {
+        let now = Instant::now();
+        let mut scene = scene_no_zone(0);
+        feed(&mut scene, now, &[(0, 0.0), (33, 10.0)]);
+
+        let redraw = scene.step(now + Duration::from_millis(33));
+        assert!(!redraw);
+        assert_abs_diff_eq!(scene.drawn.unwrap().center.x, 10.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_max_lag_below_16ms_does_not_panic() {
+        let now = Instant::now();
+        let mut scene = scene_no_zone(10);
+        feed(&mut scene, now, &[(0, 0.0), (33, 10.0)]);
+
+        scene.step(now + Duration::from_millis(33 + 10));
+        assert_abs_diff_eq!(scene.drawn.unwrap().center.x, 10.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_first_sample_is_drawn_immediately() {
         let now = Instant::now();
         let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
         let (p, received) = point_at(now, Matrix2::zeros(), 1.0);
         scene.on_msg(p, received);
-        assert_eq!(scene.drawn.unwrap().center, scene.target.unwrap().center);
         assert_eq!(scene.drawn.unwrap().center, Point2::new(100.5, 100.5));
     }
 
     #[test]
-    fn test_stale_target_resets_drawn_point() {
-        let now = Instant::now();
-        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
-        let (p0, received0) = point_at(now, Matrix2::zeros(), 1.0);
-        scene.on_msg(p0, received0);
-
-        let later = received0 + Duration::from_millis(1500);
-        let mut p1 = point_at(later, Matrix2::zeros(), 1.0).0;
-        p1.px_logical = Point2::new(500.0, 500.0);
-        scene.on_msg(p1, later);
-
-        assert_eq!(scene.drawn.unwrap().center, Point2::new(500.0, 500.0));
-    }
-
-    #[test]
-    fn test_easing_ellipse_angle_takes_shortest_half_turn() {
+    fn test_interpolation_ellipse_angle_takes_shortest_half_turn() {
         use std::f64::consts::FRAC_PI_2;
 
         let now = Instant::now();
-        let mut scene = PointScene::with_easing(
-            Vector2::new(1.0, 1.0),
-            [255, 64, 64],
-            Easing {
-                tau: Duration::from_millis(80),
-                snap_px: 0.5,
-                reset_after: Duration::from_secs(1),
+        let a_angle = FRAC_PI_2 - 0.05;
+        let b_angle = -FRAC_PI_2 + 0.05;
+        let k0 = Knot {
+            at: now,
+            pose: Eased {
+                center: Point2::new(0.0, 0.0),
+                ellipse: Some(EasedEllipse {
+                    axes: (30.0, 10.0),
+                    angle: a_angle,
+                }),
             },
-        );
-        let drawn_angle = FRAC_PI_2 - 0.05;
-        let target_angle = -FRAC_PI_2 + 0.05;
-        // The center also moves so `ease_toward_target` keeps the eased ellipse
-        // (angle included) instead of snapping straight to `target`.
-        scene.drawn = Some(Eased {
-            center: Point2::new(0.0, 0.0),
-            ellipse: Some(EasedEllipse {
-                axes: (30.0, 10.0),
-                angle: drawn_angle,
-            }),
-        });
-        scene.target = Some(Eased {
-            center: Point2::new(100.0, 0.0),
-            ellipse: Some(EasedEllipse {
-                axes: (30.0, 10.0),
-                angle: target_angle,
-            }),
-        });
-        scene.last_step = Some(now);
+            tangent: Vector2::zeros(),
+        };
+        let k1 = Knot {
+            at: now + Duration::from_millis(100),
+            pose: Eased {
+                center: Point2::new(0.0, 0.0),
+                ellipse: Some(EasedEllipse {
+                    axes: (30.0, 10.0),
+                    angle: b_angle,
+                }),
+            },
+            tangent: Vector2::zeros(),
+        };
 
-        scene.step(now + Duration::from_millis(80));
-
-        let new_angle = scene.drawn.unwrap().ellipse.unwrap().angle;
-        assert_abs_diff_eq!(new_angle - drawn_angle, 0.063, epsilon = 0.01);
+        let eased = hermite(&k0, &k1, now + Duration::from_millis(50));
+        let new_angle = eased.ellipse.unwrap().angle;
+        assert_abs_diff_eq!(new_angle - a_angle, 0.05, epsilon = 0.005);
     }
 
     fn point_at_xy(
@@ -950,70 +984,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sample_after_settled_pause_eases_from_arrival() {
-        let now = Instant::now();
-        let mut scene = PointScene::with_easing(
-            Vector2::new(1.0, 1.0),
-            [255, 64, 64],
-            Easing {
-                tau: Duration::from_millis(80),
-                snap_px: 0.5,
-                reset_after: Duration::from_secs(1),
-            },
-        );
-        scene.drawn = Some(Eased {
-            center: Point2::new(0.0, 0.0),
-            ellipse: None,
-        });
-        scene.target = Some(Eased {
-            center: Point2::new(0.0, 0.0),
-            ellipse: None,
-        });
-        let (p0, _) = point_at_xy(now, Point2::new(0.0, 0.0), Matrix2::zeros(), 1.0);
-        scene.latest = Some((p0, now));
-        scene.last_step = Some(now);
-
-        let later = now + Duration::from_millis(500);
-        let (p1, _) = point_at_xy(later, Point2::new(100.0, 0.0), Matrix2::zeros(), 1.0);
-        scene.on_msg(p1, later);
-
-        let moving = scene.step(later + Duration::from_millis(16));
-        assert!(moving);
-        assert_abs_diff_eq!(scene.drawn.unwrap().center.x, 18.1, epsilon = 1.0);
-    }
-
-    #[test]
-    fn test_sample_mid_animation_preserves_frame_clock() {
-        let now = Instant::now();
-        let mut scene = PointScene::with_easing(
-            Vector2::new(1.0, 1.0),
-            [255, 64, 64],
-            Easing {
-                tau: Duration::from_millis(80),
-                snap_px: 0.5,
-                reset_after: Duration::from_secs(1),
-            },
-        );
-        scene.drawn = Some(Eased {
-            center: Point2::new(0.0, 0.0),
-            ellipse: None,
-        });
-        scene.target = Some(Eased {
-            center: Point2::new(100.0, 0.0),
-            ellipse: None,
-        });
-        let (p0, _) = point_at_xy(now, Point2::new(100.0, 0.0), Matrix2::zeros(), 1.0);
-        scene.latest = Some((p0, now));
-        let last_step = now - Duration::from_millis(50);
-        scene.last_step = Some(last_step);
-
-        let (p1, _) = point_at_xy(now, Point2::new(150.0, 0.0), Matrix2::zeros(), 1.0);
-        scene.on_msg(p1, now);
-
-        assert_eq!(scene.last_step, Some(last_step));
-    }
-
-    #[test]
     fn test_logs_gaze_point_drawn_at_trace() {
         let now = Instant::now();
         let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
@@ -1071,14 +1041,10 @@ mod tests {
         let (w, h) = (200u32, 100u32);
         let mut buf = vec![0u8; (w * h * 4) as usize];
         let now = Instant::now();
-        let mut scene = PointScene::with_easing(
+        let mut scene = PointScene::with_interpolation(
             Vector2::new(1.0, 1.0),
             [255, 64, 64],
-            Easing {
-                tau: Duration::from_millis(80),
-                snap_px: 0.5,
-                reset_after: Duration::from_secs(1),
-            },
+            Interpolation::from_millis(80),
         );
         // The scene teleports to the first sample it ever sees (nothing to ease from),
         // so settle a baseline point before sending the sample under test.
@@ -1119,13 +1085,79 @@ mod tests {
     }
 
     #[test]
-    fn test_point_scene_without_easing_marks_first_render() {
-        let mut buf = vec![0u8; 4];
+    fn test_newest_sample_marks_on_crossing_frame_with_realistic_spacing() {
+        let (w, h) = (200u32, 100u32);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
         let now = Instant::now();
-        let mut scene = PointScene::with_easing(
+        let mut scene = PointScene::with_interpolation(
             Vector2::new(1.0, 1.0),
             [255, 64, 64],
-            Easing::from_millis(0),
+            Interpolation::from_millis(80),
+        );
+        let mut baseline = point_at_xy(now, Point2::new(0.0, 0.0), Matrix2::zeros(), 1.0).0;
+        baseline.timestamp = eye_core::Timestamp::from_nanos(500_000);
+        scene.on_msg(baseline, now);
+        {
+            let mut canvas = Canvas::new(&mut buf, (w, h), 1).expect("size");
+            scene.render(&mut canvas, now);
+        }
+
+        let second_at = now + Duration::from_millis(33);
+        let mut p = point_at_xy(second_at, Point2::new(100.0, 0.0), Matrix2::zeros(), 1.0).0;
+        p.timestamp = eye_core::Timestamp::from_nanos(1_000_000);
+        scene.on_msg(p, second_at);
+        {
+            let mut canvas = Canvas::new(&mut buf, (w, h), 1).expect("size");
+            scene.render(&mut canvas, second_at);
+        }
+        assert_eq!(
+            scene.presentation_mark(),
+            None,
+            "still easing toward target, nothing settled yet"
+        );
+
+        let mut redraw = true;
+        let mut t = second_at;
+        let mut first_tick = true;
+        while redraw {
+            t += Duration::from_millis(if first_tick { 7 } else { 16 });
+            first_tick = false;
+            redraw = scene.step(t);
+            if redraw {
+                let mut canvas = Canvas::new(&mut buf, (w, h), 1).expect("size");
+                scene.render(&mut canvas, t);
+            }
+        }
+        assert_eq!(scene.presentation_mark(), Some(1_000_000));
+        assert_abs_diff_eq!(scene.drawn.unwrap().center.x, 100.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_first_sample_marks_with_default_interpolation() {
+        let mut buf = vec![0u8; 4];
+        let now = Instant::now();
+        let mut scene = PointScene::new(Vector2::new(1.0, 1.0), [255, 64, 64]);
+        let mut p = point_at_xy(now, Point2::new(0.0, 0.0), Matrix2::zeros(), 1.0).0;
+        p.timestamp = eye_core::Timestamp::from_nanos(3_000_000);
+        scene.on_msg(p, now);
+
+        let mut canvas = Canvas::new(&mut buf, (1, 1), 1).expect("size");
+        scene.render(&mut canvas, now);
+        assert_eq!(
+            scene.presentation_mark(),
+            Some(3_000_000),
+            "the dot is drawn at the knot immediately, so the first sample needs no lag"
+        );
+    }
+
+    #[test]
+    fn test_point_scene_without_interpolation_marks_first_render() {
+        let mut buf = vec![0u8; 4];
+        let now = Instant::now();
+        let mut scene = PointScene::with_interpolation(
+            Vector2::new(1.0, 1.0),
+            [255, 64, 64],
+            Interpolation::from_millis(0),
         );
         let mut p = point_at_xy(now, Point2::new(0.0, 0.0), Matrix2::zeros(), 1.0).0;
         p.timestamp = eye_core::Timestamp::from_nanos(2_000_000);
@@ -1140,10 +1172,10 @@ mod tests {
     fn test_hidden_render_clears_stale_mark() {
         let mut buf = vec![0u8; 4];
         let now = Instant::now();
-        let mut scene = PointScene::with_easing(
+        let mut scene = PointScene::with_interpolation(
             Vector2::new(1.0, 1.0),
             [255, 64, 64],
-            Easing::from_millis(0),
+            Interpolation::from_millis(0),
         );
         let mut a = point_at_xy(now, Point2::new(0.0, 0.0), Matrix2::zeros(), 1.0).0;
         a.timestamp = eye_core::Timestamp::from_nanos(1_000_000);
@@ -1169,14 +1201,10 @@ mod tests {
         let (w, h) = (200u32, 100u32);
         let mut buf = vec![0u8; (w * h * 4) as usize];
         let now = Instant::now();
-        let mut scene = PointScene::with_easing(
+        let mut scene = PointScene::with_interpolation(
             Vector2::new(1.0, 1.0),
             [255, 64, 64],
-            Easing {
-                tau: Duration::from_millis(80),
-                snap_px: 0.5,
-                reset_after: Duration::from_secs(1),
-            },
+            Interpolation::from_millis(80),
         );
         let mut p0 = point_at_xy(now, Point2::new(0.0, 0.0), Matrix2::zeros(), 1.0).0;
         p0.timestamp = eye_core::Timestamp::from_nanos(1_000_000);
@@ -1203,10 +1231,10 @@ mod tests {
     fn test_settled_rerender_before_presented_does_not_remark() {
         let mut buf = vec![0u8; 4];
         let now = Instant::now();
-        let mut scene = PointScene::with_easing(
+        let mut scene = PointScene::with_interpolation(
             Vector2::new(1.0, 1.0),
             [255, 64, 64],
-            Easing::from_millis(0),
+            Interpolation::from_millis(0),
         );
         let mut p = point_at_xy(now, Point2::new(0.0, 0.0), Matrix2::zeros(), 1.0).0;
         p.timestamp = eye_core::Timestamp::from_nanos(1_000_000);
@@ -1228,10 +1256,10 @@ mod tests {
     fn test_point_scene_records_capture_to_present_from_presentation_time() {
         let mut buf = vec![0u8; 4];
         let now = Instant::now();
-        let mut scene = PointScene::with_easing(
+        let mut scene = PointScene::with_interpolation(
             Vector2::new(1.0, 1.0),
             [255, 64, 64],
-            Easing::from_millis(0),
+            Interpolation::from_millis(0),
         );
         let mut p = point_at_xy(now, Point2::new(0.0, 0.0), Matrix2::zeros(), 1.0).0;
         p.timestamp = eye_core::Timestamp::from_nanos(1_000_000);
@@ -1250,22 +1278,5 @@ mod tests {
         let summary = scene.present.summary();
         assert_eq!(summary.count, 1);
         assert_eq!(summary.p50, Duration::from_millis(40));
-    }
-
-    #[test]
-    fn test_easing_zero_disables_stepping() {
-        let now = Instant::now();
-        let mut scene = PointScene::with_easing(
-            Vector2::new(1.0, 1.0),
-            [255, 64, 64],
-            Easing::from_millis(0),
-        );
-        let (p, received) = point_at(now, Matrix2::zeros(), 1.0);
-        scene.on_msg(p, received);
-        assert_eq!(scene.drawn.unwrap().center, Point2::new(100.5, 100.5));
-
-        let moving = scene.step(received + Duration::from_millis(80));
-        assert!(!moving);
-        assert_eq!(scene.drawn.unwrap().center, Point2::new(100.5, 100.5));
     }
 }

@@ -136,7 +136,8 @@ pub struct OutputConfig {
     pub mode: OutputMode,
     /// `[cols, rows]`, used by region mode.
     pub grid: [u32; 2],
-    /// Point-mode render-rate easing time constant; 0 disables easing. Ignored in region mode.
+    /// Point-mode maximum render lag behind the newest sample; 0 draws samples as they
+    /// arrive. Ignored in region mode.
     pub easing_ms: u64,
     /// Point-mode hide margin, in logical px either side of the canvas; see
     /// `eye_overlay::point::HideRules`. Ignored in region mode.

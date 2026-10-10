@@ -295,7 +295,8 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         overlay_mode(&config.output),
         rig.screen(),
     );
-    overlay_options.easing = eye_overlay::point::Easing::from_millis(config.output.easing_ms);
+    overlay_options.interpolation =
+        eye_overlay::point::Interpolation::from_millis(config.output.easing_ms);
     overlay_options.hide = eye_overlay::point::HideRules {
         margin_px: config.output.hide_margin_px,
         min_confidence: config.output.hide_below_confidence,
