@@ -16,7 +16,7 @@ use eye_core::session::TargetRecord;
 use eye_core::{CameraInfo, Frame, Rig, ScreenModel, Timestamp};
 use eye_geometry::screen::px_logical_to_mm;
 use eye_overlay::targets::{
-    AppendSender, FeedbackSender, TargetDisplay, TargetEvent, TargetShown, TargetSpec,
+    AppendSender, FeedbackSender, FinishPolicy, TargetDisplay, TargetEvent, TargetShown, TargetSpec,
 };
 use eye_platform::EmitterGuard;
 
@@ -182,21 +182,16 @@ pub enum PumpEnd {
 
 /// Hooks `pump` drives alongside the frame/target recording. All methods default to no-ops.
 pub trait PumpObserver {
-    /// Whether this observer wants `record_targets` to connect the overlay's feedback channel
-    /// and call `attach_feedback` with the sender before pumping.
-    fn wants_feedback(&self) -> bool {
-        false
+    /// Whether `record_targets` should hold `Finished` back until the pump has acked every
+    /// `Hidden`, giving this observer a chance to append a retry first.
+    fn finish_policy(&self) -> FinishPolicy {
+        FinishPolicy::Immediate
     }
 
-    fn attach_feedback(&mut self, _sender: FeedbackSender) {}
-
-    /// Whether `record_targets` should hand this observer an `AppendSender` for the running
-    /// `TargetDisplay`, so it can re-present a target (e.g. after an online rejection).
-    fn wants_append(&self) -> bool {
-        false
-    }
-
-    fn attach_append(&mut self, _sender: AppendSender) {}
+    /// Called once by `record_targets` before pumping, with the overlay's feedback sender and an
+    /// `AppendSender` for the running `TargetDisplay` (e.g. to re-present a target after an
+    /// online rejection).
+    fn attach(&mut self, _feedback: FeedbackSender, _append: AppendSender) {}
 
     /// Called once `record_session` has resolved the rig and opened the camera sources, before
     /// any frame is pumped, so an observer that needs them (e.g. to build a `Pipeline`) can set
@@ -218,6 +213,19 @@ pub trait PumpObserver {
 pub struct NoopObserver;
 
 impl PumpObserver for NoopObserver {}
+
+/// Hands the observer both senders exactly once and returns the pump's settle sender only when
+/// the policy waits for acks.
+fn wire_observer(
+    observer: &mut dyn PumpObserver,
+    finish: FinishPolicy,
+    feedback: FeedbackSender,
+    appender: AppendSender,
+) -> Option<AppendSender> {
+    let settle = (finish == FinishPolicy::AwaitSettle).then(|| appender.clone());
+    observer.attach(feedback, appender);
+    settle
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn pump(
@@ -332,19 +340,9 @@ fn record_targets(
         .into_iter()
         .map(TargetSpec::from)
         .collect();
-    let track_append = observer.wants_append();
-    let display = if observer.wants_feedback() {
-        let (display, feedback) =
-            TargetDisplay::spawn_with_feedback(&output, protocol.lead_in(), specs, track_append)?;
-        observer.attach_feedback(feedback);
-        display
-    } else {
-        TargetDisplay::spawn(&output, protocol.lead_in(), specs, track_append)?
-    };
-    let settle = track_append.then(|| display.appender());
-    if track_append {
-        observer.attach_append(display.appender());
-    }
+    let finish = observer.finish_policy();
+    let (display, feedback) = TargetDisplay::spawn(&output, protocol.lead_in(), specs, finish)?;
+    let settle = wire_observer(observer, finish, feedback, display.appender());
     let end = pump(
         capture.frames(),
         display.events(),
@@ -1053,6 +1051,58 @@ mod tests {
         assert_eq!(acks.len(), 2);
         assert!(matches!(acks[0], AppendMsg::Append(_)));
         assert_eq!(acks[1], AppendMsg::Settled);
+    }
+
+    #[derive(Default)]
+    struct AttachCountingObserver {
+        finish: FinishPolicy,
+        attach_calls: u32,
+    }
+
+    impl PumpObserver for AttachCountingObserver {
+        fn finish_policy(&self) -> FinishPolicy {
+            self.finish
+        }
+
+        fn attach(&mut self, _feedback: FeedbackSender, _append: AppendSender) {
+            self.attach_calls += 1;
+        }
+    }
+
+    #[test]
+    fn test_wire_observer_attaches_once_and_returns_settle_only_for_await_settle() {
+        let (feedback_tx, _feedback_rx) = crossbeam_channel::unbounded();
+        let feedback = FeedbackSender::new(feedback_tx);
+        let (append_tx, append_rx) = crossbeam_channel::unbounded();
+        let appender = AppendSender::new(append_tx);
+
+        let mut immediate = AttachCountingObserver {
+            finish: FinishPolicy::Immediate,
+            attach_calls: 0,
+        };
+        let settle = wire_observer(
+            &mut immediate,
+            FinishPolicy::Immediate,
+            feedback.clone(),
+            appender.clone(),
+        );
+        assert!(settle.is_none());
+        assert_eq!(immediate.attach_calls, 1);
+
+        let mut await_settle = AttachCountingObserver {
+            finish: FinishPolicy::AwaitSettle,
+            attach_calls: 0,
+        };
+        let settle = wire_observer(
+            &mut await_settle,
+            FinishPolicy::AwaitSettle,
+            feedback,
+            appender,
+        );
+        assert_eq!(await_settle.attach_calls, 1);
+        let settle = settle.expect("await-settle policy returns a settle sender");
+        settle.settle();
+        assert_eq!(append_rx.try_recv().unwrap(), AppendMsg::Settled);
     }
 
     #[test]

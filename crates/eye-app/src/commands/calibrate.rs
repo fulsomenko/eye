@@ -24,7 +24,9 @@ use eye_core::log::{field, span};
 use eye_core::{CameraInfo, Frame, Rig, Timestamp};
 use eye_geometry::screen::px_logical_to_mm;
 use eye_overlay::ellipse::{cov_mm_to_logical_px, logical_px_per_mm};
-use eye_overlay::targets::{AppendSender, Feedback, FeedbackSender, TargetShown, TargetSpec};
+use eye_overlay::targets::{
+    AppendSender, Feedback, FeedbackSender, FinishPolicy, TargetShown, TargetSpec,
+};
 use nalgebra::Point2;
 
 use crate::cli::GIT_REV;
@@ -387,20 +389,13 @@ fn target_index_in_samples(samples: &[FitSample], target_mm: Point2<f64>) -> Opt
 }
 
 impl PumpObserver for LiveFeedback {
-    fn wants_feedback(&self) -> bool {
-        true
+    fn finish_policy(&self) -> FinishPolicy {
+        FinishPolicy::AwaitSettle
     }
 
-    fn attach_feedback(&mut self, sender: FeedbackSender) {
-        self.feedback = Some(sender);
-    }
-
-    fn wants_append(&self) -> bool {
-        true
-    }
-
-    fn attach_append(&mut self, sender: AppendSender) {
-        self.append = Some(sender);
+    fn attach(&mut self, feedback: FeedbackSender, append: AppendSender) {
+        self.feedback = Some(feedback);
+        self.append = Some(append);
     }
 
     fn prepare(&mut self, rig: &Rig, cameras: &[CameraInfo]) -> anyhow::Result<()> {
@@ -1317,9 +1312,11 @@ mod tests {
         crossbeam_channel::Receiver<eye_overlay::targets::AppendMsg>,
     ) {
         let (fb_tx, fb_rx) = crossbeam_channel::unbounded();
-        live.attach_feedback(FeedbackSender::new(fb_tx));
         let (append_tx, append_rx) = crossbeam_channel::unbounded();
-        live.attach_append(AppendSender::new(append_tx.clone()));
+        live.attach(
+            FeedbackSender::new(fb_tx),
+            AppendSender::new(append_tx.clone()),
+        );
         let settle = AppendSender::new(append_tx);
 
         let (frames_tx, frames_rx) = crossbeam_channel::bounded::<CaptureMsg>(0);

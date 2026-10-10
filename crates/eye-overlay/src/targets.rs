@@ -147,48 +147,31 @@ pub struct TargetDisplay {
     appends: crossbeam_channel::Sender<AppendMsg>,
 }
 
+/// Whether a `TargetDisplay` emits `Finished` right after the last target hides, or waits for the
+/// pump to ack every `Hidden` first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FinishPolicy {
+    /// `Finished` right after the last `Hidden`.
+    #[default]
+    Immediate,
+    /// `Finished` only once the pump has acked every `Hidden`, so a retry can still be appended.
+    AwaitSettle,
+}
+
 impl TargetDisplay {
     /// Validates (before connecting), connects on `output` with namespace "eye-targets", shows `lead_in` of blank,
-    /// then the targets in order.
+    /// then the targets in order. The returned `FeedbackSender` lets the caller push live
+    /// `Feedback` for the scene to draw under the current target.
     pub fn spawn(
         output: &OutputId,
         lead_in: Duration,
         targets: Vec<TargetSpec>,
-        track_append: bool,
-    ) -> Result<Self, TargetsError> {
-        let (display, _feedback) =
-            Self::spawn_inner(output, lead_in, targets, false, track_append)?;
-        Ok(display)
-    }
-
-    /// Like `spawn`, but the returned `FeedbackSender` lets the caller push live `Feedback` for
-    /// the scene to draw under the current target.
-    pub fn spawn_with_feedback(
-        output: &OutputId,
-        lead_in: Duration,
-        targets: Vec<TargetSpec>,
-        track_append: bool,
+        finish: FinishPolicy,
     ) -> Result<(Self, FeedbackSender), TargetsError> {
-        let (display, feedback) = Self::spawn_inner(output, lead_in, targets, true, track_append)?;
-        Ok((display, feedback.expect("requested with_feedback")))
-    }
-
-    fn spawn_inner(
-        output: &OutputId,
-        lead_in: Duration,
-        targets: Vec<TargetSpec>,
-        with_feedback: bool,
-        track_append: bool,
-    ) -> Result<(Self, Option<FeedbackSender>), TargetsError> {
         validate(&targets)?;
         let target_count = targets.len();
         let (events_tx, events) = crossbeam_channel::unbounded();
-        let (feedback_rx, feedback_tx) = if with_feedback {
-            let (tx, rx) = crossbeam_channel::unbounded();
-            (Some(rx), Some(FeedbackSender::new(tx)))
-        } else {
-            (None, None)
-        };
+        let (feedback_tx, feedback_rx) = crossbeam_channel::unbounded();
         let (appends_tx, appends_rx) = crossbeam_channel::unbounded();
         let failure = Arc::new(Mutex::new(None));
         let scene = TargetScene {
@@ -204,7 +187,7 @@ impl TargetDisplay {
             feedback: feedback_rx,
             latest_feedback: None,
             appends: appends_rx,
-            track_settle: track_append,
+            track_settle: finish == FinishPolicy::AwaitSettle,
             hidden_sent: 0,
             settled_received: 0,
             awaiting_finish: false,
@@ -230,7 +213,7 @@ impl TargetDisplay {
                 failure,
                 appends: appends_tx,
             },
-            feedback_tx,
+            FeedbackSender::new(feedback_tx),
         ))
     }
 
@@ -239,16 +222,9 @@ impl TargetDisplay {
         &self.events
     }
 
-    /// Pushes `spec` onto the running sequence; the scene renders it after the current targets
-    /// and does not emit `Finished` until it too has been shown.
-    pub fn append(&self, spec: TargetSpec) -> Result<(), TargetsError> {
-        validate(std::slice::from_ref(&spec))?;
-        let _ = self.appends.send(AppendMsg::Append(spec));
-        Ok(())
-    }
-
-    /// A cloneable handle equivalent to `append`, for a caller (e.g. a `PumpObserver`) that does
-    /// not hold this `TargetDisplay`.
+    /// A cloneable handle for appending a target to the running sequence (e.g. a `PumpObserver`
+    /// re-presenting one after an online rejection); the scene renders it after the current
+    /// targets and does not emit `Finished` until it too has been shown.
     pub fn appender(&self) -> AppendSender {
         AppendSender::new(self.appends.clone())
     }
@@ -304,7 +280,7 @@ pub(crate) struct TargetScene {
     confirmed_at: Option<Instant>,
     events: crossbeam_channel::Sender<TargetEvent>,
     failure: Arc<Mutex<Option<TargetsError>>>,
-    feedback: Option<crossbeam_channel::Receiver<Feedback>>,
+    feedback: crossbeam_channel::Receiver<Feedback>,
     latest_feedback: Option<Feedback>,
     appends: crossbeam_channel::Receiver<AppendMsg>,
     /// When set, `Finished` is held back until `settled_received` catches up with `hidden_sent`,
@@ -343,10 +319,8 @@ impl Scene for TargetScene {
             }
             self.lead_in = None;
         }
-        if let Some(rx) = &self.feedback {
-            for fb in rx.try_iter() {
-                self.latest_feedback = Some(fb);
-            }
+        for fb in self.feedback.try_iter() {
+            self.latest_feedback = Some(fb);
         }
         let had_current = self.targets.get(self.current).is_some();
         for msg in self.appends.try_iter() {
@@ -608,9 +582,14 @@ mod tests {
     fn scene(
         targets: Vec<TargetSpec>,
         lead_in: Duration,
-    ) -> (TargetScene, crossbeam_channel::Receiver<TargetEvent>) {
+    ) -> (
+        TargetScene,
+        crossbeam_channel::Receiver<TargetEvent>,
+        crossbeam_channel::Sender<Feedback>,
+    ) {
         let (tx, rx) = crossbeam_channel::unbounded();
         let (_appends_tx, appends_rx) = crossbeam_channel::unbounded();
+        let (feedback_tx, feedback_rx) = crossbeam_channel::unbounded();
         let scene = TargetScene {
             output: OutputId::from("eDP-1"),
             targets,
@@ -621,7 +600,7 @@ mod tests {
             confirmed_at: None,
             events: tx,
             failure: Arc::new(Mutex::new(None)),
-            feedback: None,
+            feedback: feedback_rx,
             latest_feedback: None,
             appends: appends_rx,
             track_settle: false,
@@ -630,7 +609,7 @@ mod tests {
             awaiting_finish: false,
             last_hidden: None,
         };
-        (scene, rx)
+        (scene, rx, feedback_tx)
     }
 
     fn render_into(
@@ -642,6 +621,29 @@ mod tests {
         buf.fill(0);
         let mut canvas = Canvas::new(buf, size, 1).expect("valid buffer");
         scene.render(&mut canvas, now)
+    }
+
+    #[test]
+    fn test_scene_feedback_channel_always_present() {
+        let targets = vec![TargetSpec::from((
+            Point2::new(50.0, 50.0),
+            Duration::from_millis(100),
+        ))];
+        let (mut scene, _rx, feedback_tx) = scene(targets, Duration::ZERO);
+        feedback_tx
+            .send(Feedback {
+                px_logical: Point2::new(50.0, 50.0),
+                cov_px: Matrix2::identity(),
+                calibrated: false,
+                at: Timestamp::from_nanos(1),
+            })
+            .unwrap();
+        let size = (200u32, 200u32);
+        let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
+
+        render_into(&mut scene, &mut buf, size, Instant::now());
+
+        assert!(scene.latest_feedback.is_some());
     }
 
     #[test]
@@ -663,7 +665,7 @@ mod tests {
                 retry: false,
             },
         ];
-        let (mut scene, rx) = scene(targets, Duration::ZERO);
+        let (mut scene, rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let size = (200u32, 200u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -764,7 +766,7 @@ mod tests {
             Point2::new(50.0, 50.0),
             Duration::from_secs(1),
         ))];
-        let (mut scene, _rx) = scene(targets, Duration::from_secs(1));
+        let (mut scene, _rx, _feedback_tx) = scene(targets, Duration::from_secs(1));
         let size = (200u32, 200u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -825,7 +827,7 @@ mod tests {
             timing,
             retry: false,
         }];
-        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let (mut scene, _rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let size = (200u32, 200u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -843,7 +845,7 @@ mod tests {
             timing,
             retry: false,
         }];
-        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let (mut scene, _rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let size = (200u32, 200u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -872,7 +874,7 @@ mod tests {
             timing,
             retry: false,
         }];
-        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let (mut scene, _rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let size = (200u32, 200u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -893,7 +895,7 @@ mod tests {
             timing,
             retry: false,
         }];
-        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let (mut scene, _rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let size = (200u32, 200u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -915,7 +917,7 @@ mod tests {
             Point2::new(960.5, 540.5),
             Duration::from_secs(1),
         ))];
-        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let (mut scene, _rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let size = (1920u32, 1080u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -932,7 +934,7 @@ mod tests {
             Point2::new(50.0, 50.0),
             Duration::from_secs(1),
         ))];
-        let (mut scene, rx) = scene(targets, Duration::ZERO);
+        let (mut scene, rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let t0 = Instant::now();
         let t = Timestamp::from_nanos(42);
 
@@ -961,7 +963,7 @@ mod tests {
             Point2::new(50.0, 50.0),
             Duration::from_secs(1),
         ))];
-        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let (mut scene, _rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let size = (200u32, 200u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -980,7 +982,7 @@ mod tests {
             TargetSpec::from((Point2::new(50.0, 50.0), Duration::from_millis(100))),
             TargetSpec::from((Point2::new(150.0, 50.0), Duration::from_millis(100))),
         ];
-        let (mut scene, rx) = scene(targets, Duration::ZERO);
+        let (mut scene, rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let size = (200u32, 200u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -1043,7 +1045,7 @@ mod tests {
             Point2::new(2000.0, 10.0),
             Duration::from_secs(1),
         ))];
-        let (mut scene, rx) = scene(targets, Duration::ZERO);
+        let (mut scene, rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let size = (1920u32, 1080u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -1068,7 +1070,7 @@ mod tests {
             Point2::new(100.25, 100.75),
             Duration::from_secs(1),
         ))];
-        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let (mut scene, _rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let size = (200u32, 200u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -1106,9 +1108,7 @@ mod tests {
             timing,
             retry: false,
         }];
-        let (mut scene, _rx) = scene(targets, Duration::ZERO);
-        let (fb_tx, fb_rx) = crossbeam_channel::unbounded();
-        scene.feedback = Some(fb_rx);
+        let (mut scene, _rx, fb_tx) = scene(targets, Duration::ZERO);
         let size = (200u32, 200u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -1156,9 +1156,7 @@ mod tests {
     fn test_feedback_without_targets_is_ignored() {
         let dwell = Duration::from_millis(100);
         let targets = vec![TargetSpec::from((Point2::new(50.0, 50.0), dwell))];
-        let (mut scene, _rx) = scene(targets, Duration::ZERO);
-        let (fb_tx, fb_rx) = crossbeam_channel::unbounded();
-        scene.feedback = Some(fb_rx);
+        let (mut scene, _rx, fb_tx) = scene(targets, Duration::ZERO);
         let size = (200u32, 200u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -1190,6 +1188,7 @@ mod tests {
         };
         let (events_tx, rx) = crossbeam_channel::unbounded();
         let (appends_tx, appends_rx) = crossbeam_channel::unbounded();
+        let (_feedback_tx, feedback_rx) = crossbeam_channel::unbounded();
         let mut scene = TargetScene {
             output: OutputId::from("eDP-1"),
             targets: vec![TargetSpec {
@@ -1204,7 +1203,7 @@ mod tests {
             confirmed_at: None,
             events: events_tx,
             failure: Arc::new(Mutex::new(None)),
-            feedback: None,
+            feedback: feedback_rx,
             latest_feedback: None,
             appends: appends_rx,
             track_settle: false,
@@ -1256,6 +1255,7 @@ mod tests {
         };
         let (events_tx, rx) = crossbeam_channel::unbounded();
         let (appends_tx, appends_rx) = crossbeam_channel::unbounded();
+        let (_feedback_tx, feedback_rx) = crossbeam_channel::unbounded();
         let mut scene = TargetScene {
             output: OutputId::from("eDP-1"),
             targets: vec![TargetSpec {
@@ -1270,7 +1270,7 @@ mod tests {
             confirmed_at: None,
             events: events_tx,
             failure: Arc::new(Mutex::new(None)),
-            feedback: None,
+            feedback: feedback_rx,
             latest_feedback: None,
             appends: appends_rx,
             track_settle: true,
@@ -1369,7 +1369,7 @@ mod tests {
             Point2::new(50.0, 50.0),
             Duration::from_millis(100),
         ))];
-        let (mut scene, rx) = scene(targets, Duration::ZERO);
+        let (mut scene, rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let size = (200u32, 200u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -1393,7 +1393,7 @@ mod tests {
             timing,
             retry: true,
         }];
-        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let (mut scene, _rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let size = (200u32, 200u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -1411,7 +1411,7 @@ mod tests {
             Point2::new(50.0, 50.0),
             Duration::from_secs(1),
         ))];
-        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let (mut scene, _rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let size = (200u32, 200u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -1468,7 +1468,7 @@ mod tests {
                 retry: false,
             },
         ];
-        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let (mut scene, _rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let size = (200u32, 200u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -1501,7 +1501,7 @@ mod tests {
             TargetSpec::from((Point2::new(50.0, 50.0), Duration::from_millis(100))),
             TargetSpec::from((Point2::new(150.0, 50.0), Duration::from_millis(100))),
         ];
-        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let (mut scene, _rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let size = (200u32, 200u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -1534,7 +1534,7 @@ mod tests {
             Point2::new(2000.0, 10.0),
             Duration::from_secs(1),
         ))];
-        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let (mut scene, _rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let size = (1920u32, 1080u32);
         let mut buf = vec![0u8; (size.0 * size.1 * 4) as usize];
         let t0 = Instant::now();
@@ -1560,7 +1560,7 @@ mod tests {
             Point2::new(50.0, 50.0),
             Duration::from_secs(1),
         ))];
-        let (mut scene, _rx) = scene(targets, Duration::ZERO);
+        let (mut scene, _rx, _feedback_tx) = scene(targets, Duration::ZERO);
         let t0 = Instant::now();
 
         let (_, records) = capture_logs(tracing::Level::TRACE, || {
@@ -1599,8 +1599,13 @@ mod tests {
             TargetSpec::from((Point2::new(960.0, 540.0), Duration::from_millis(400))),
             TargetSpec::from((Point2::new(1440.0, 810.0), Duration::from_millis(400))),
         ];
-        let display = TargetDisplay::spawn(&output, Duration::from_millis(200), targets, false)
-            .expect("spawn succeeds");
+        let (display, _feedback) = TargetDisplay::spawn(
+            &output,
+            Duration::from_millis(200),
+            targets,
+            FinishPolicy::Immediate,
+        )
+        .expect("spawn succeeds");
 
         let mut shown = Vec::new();
         let mut hidden = Vec::new();
