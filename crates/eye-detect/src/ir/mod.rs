@@ -25,7 +25,11 @@ use crate::options::parse_options;
 pub struct IrClassicOptions {
     pub max_pair_gap_ms: f64,
     pub background_size: usize,
-    pub threshold_percentile: f64,
+    /// Seed threshold: `median(th) + threshold_k_mad * 1.4826 * MAD(th)`, floored by
+    /// `min_threshold`.
+    pub threshold_k_mad: f64,
+    /// Grow threshold as a fraction of the seed threshold (hysteresis).
+    pub threshold_hysteresis: f64,
     pub min_threshold: u8,
     pub pupil_area_px: [u32; 2],
     pub min_aspect: f64,
@@ -55,7 +59,8 @@ impl Default for IrClassicOptions {
         Self {
             max_pair_gap_ms: 100.0,
             background_size: 15,
-            threshold_percentile: 99.9,
+            threshold_k_mad: 6.0,
+            threshold_hysteresis: 1.0,
             min_threshold: 30,
             pupil_area_px: [4, 120],
             min_aspect: 0.3,
@@ -1042,6 +1047,14 @@ mod tests {
     fn test_from_config_rejects_unknown_option() {
         let mut table = toml::Table::new();
         table.insert("not_a_real_option".into(), 1.into());
+        let err = IrClassicDetector::from_config(&table, &nominal_rig()).unwrap_err();
+        assert!(matches!(err, StageError::Config(_)));
+    }
+
+    #[test]
+    fn test_from_config_rejects_threshold_percentile() {
+        let mut table = toml::Table::new();
+        table.insert("threshold_percentile".into(), 99.9.into());
         let err = IrClassicDetector::from_config(&table, &nominal_rig()).unwrap_err();
         assert!(matches!(err, StageError::Config(_)));
     }

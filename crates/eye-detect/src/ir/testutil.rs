@@ -201,12 +201,12 @@ fn round_clamp(v: f64) -> u8 {
     v.round().clamp(0.0, 255.0) as u8
 }
 
-struct Xorshift64Star {
+pub(crate) struct Xorshift64Star {
     state: u64,
 }
 
 impl Xorshift64Star {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self { state: seed }
     }
 
@@ -224,7 +224,7 @@ impl Xorshift64Star {
         ((next >> 11) as f64 + 0.5) / (1u64 << 53) as f64
     }
 
-    fn next_gaussian(&mut self) -> f64 {
+    pub(crate) fn next_gaussian(&mut self) -> f64 {
         let u1 = self.next_uniform();
         let u2 = self.next_uniform();
         (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()

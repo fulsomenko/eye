@@ -72,26 +72,42 @@ fn opening(diff: GrayView<'_>, size: usize) -> Vec<u8> {
     window_reduce_cols(&dilated_rows, w, h, half, true)
 }
 
-fn threshold_level(th: &[u8], percentile: f64, min_threshold: u8) -> u8 {
+fn level_at_count(hist: &[u32; 256], target: u32) -> u8 {
+    let mut cum = 0u32;
+    for (level, &count) in hist.iter().enumerate() {
+        cum += count;
+        if cum > target {
+            return level as u8;
+        }
+    }
+    255
+}
+
+fn threshold_levels(th: &[u8], k_mad: f64, hysteresis: f64, min_threshold: u8) -> (u8, u8) {
     let mut hist = [0u32; 256];
     for &v in th {
         hist[v as usize] += 1;
     }
-    let n = th.len() as f64;
-    let target = percentile / 100.0 * n;
-    let mut cum = 0u64;
-    let mut p = 255u8;
+    let n = th.len() as u32;
+    let median = level_at_count(&hist, n / 2);
+
+    let mut dev_hist = [0u32; 256];
     for (level, &count) in hist.iter().enumerate() {
-        cum += u64::from(count);
-        if cum as f64 >= target {
-            p = level as u8;
-            break;
+        if count == 0 {
+            continue;
         }
+        let dev = (level as i32 - i32::from(median)).unsigned_abs() as usize;
+        dev_hist[dev.min(255)] += count;
     }
-    min_threshold.max(p.saturating_add(1))
+    let mad = level_at_count(&dev_hist, n / 2);
+
+    let raw = f64::from(median) + k_mad * 1.4826 * f64::from(mad);
+    let t_hi = min_threshold.max(raw.round().clamp(0.0, 255.0) as u8);
+    let t_lo = (f64::from(t_hi) * hysteresis).round().clamp(0.0, 255.0) as u8;
+    (t_hi, t_lo)
 }
 
-fn label_components(th: &[u8], w: u32, h: u32, t: u8) -> Vec<Vec<usize>> {
+fn label_components(th: &[u8], w: u32, h: u32, t_hi: u8, t_lo: u8) -> Vec<Vec<usize>> {
     let mut labels = vec![0u32; th.len()];
     let mut components: Vec<Vec<usize>> = Vec::new();
     let mut next_label = 1u32;
@@ -100,7 +116,7 @@ fn label_components(th: &[u8], w: u32, h: u32, t: u8) -> Vec<Vec<usize>> {
     for y in 0..h {
         for x in 0..w {
             let idx = (y * w + x) as usize;
-            if th[idx] < t || labels[idx] != 0 {
+            if th[idx] < t_hi || labels[idx] != 0 {
                 continue;
             }
             let label = next_label;
@@ -121,7 +137,7 @@ fn label_components(th: &[u8], w: u32, h: u32, t: u8) -> Vec<Vec<usize>> {
                         }
                         let (nx, ny) = (nx as u32, ny as u32);
                         let nidx = (ny * w + nx) as usize;
-                        if labels[nidx] == 0 && th[nidx] >= t {
+                        if labels[nidx] == 0 && th[nidx] >= t_lo {
                             labels[nidx] = label;
                             pixels.push(nidx);
                             stack.push((nx, ny));
@@ -191,9 +207,14 @@ pub(crate) fn candidates(
         .zip(&bg)
         .map(|(&d, &b)| d.saturating_sub(b))
         .collect();
-    let t = threshold_level(&th, options.threshold_percentile, options.min_threshold);
+    let (t_hi, t_lo) = threshold_levels(
+        &th,
+        options.threshold_k_mad,
+        options.threshold_hysteresis,
+        options.min_threshold,
+    );
 
-    let mut components: Vec<(Vec<usize>, u8)> = label_components(&th, w, h, t)
+    let mut components: Vec<(Vec<usize>, u8)> = label_components(&th, w, h, t_hi, t_lo)
         .into_iter()
         .map(|pixels| {
             let peak = pixels.iter().map(|&i| th[i]).max().unwrap_or(0);
@@ -342,7 +363,8 @@ pub(crate) fn candidates(
     };
 
     tracing::debug!(
-        threshold = u64::from(t),
+        threshold = u64::from(t_hi),
+        threshold_lo = u64::from(t_lo),
         components = counts.components_total,
         truncated = counts.truncated,
         rejected_area = counts.area,
@@ -395,6 +417,10 @@ mod tests {
         match rec.fields["threshold"] {
             Value::U64(t) => assert!(t >= 30, "threshold {t}"),
             ref other => panic!("expected U64 threshold, got {other:?}"),
+        }
+        match rec.fields["threshold_lo"] {
+            Value::U64(t_lo) => assert!(t_lo >= 15, "threshold_lo {t_lo}"),
+            ref other => panic!("expected U64 threshold_lo, got {other:?}"),
         }
         for key in [
             "rejected_area",
@@ -486,5 +512,115 @@ mod tests {
         assert_eq!(rec.fields[field::REASON], Value::Str("area".into()));
         assert_eq!(rec.fields["value"], Value::F64(3.0));
         assert_eq!(rec.fields["min"], Value::F64(4.0));
+    }
+
+    #[test]
+    fn test_threshold_levels_on_flat_image_is_min_threshold() {
+        let th = vec![0u8; 230_400];
+        assert_eq!(threshold_levels(&th, 6.0, 0.5, 30), (30, 15));
+    }
+
+    #[test]
+    fn test_threshold_levels_follow_noise_floor() {
+        use crate::ir::testutil::Xorshift64Star;
+
+        let make = |sigma: f64| -> Vec<u8> {
+            let mut rng = Xorshift64Star::new(7);
+            (0..230_400)
+                .map(|_| {
+                    (20.0 + sigma * rng.next_gaussian())
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                })
+                .collect()
+        };
+
+        let th4 = make(4.0);
+        let (t_hi4, t_lo4) = threshold_levels(&th4, 6.0, 0.5, 30);
+        assert!((43..=51).contains(&t_hi4), "t_hi4 {t_hi4}");
+        assert_eq!(t_lo4, (f64::from(t_hi4) * 0.5).round() as u8);
+
+        let th8 = make(8.0);
+        let (t_hi8, t_lo8) = threshold_levels(&th8, 6.0, 0.5, 30);
+        assert!((60..=70).contains(&t_hi8), "t_hi8 {t_hi8}");
+        assert_eq!(t_lo8, (f64::from(t_hi8) * 0.5).round() as u8);
+
+        assert!(
+            t_hi8 >= t_hi4 + 10,
+            "t_hi8 {t_hi8} should exceed t_hi4 {t_hi4} by at least 10"
+        );
+    }
+
+    #[test]
+    fn test_motion_edge_does_not_raise_threshold_above_pupils() {
+        let mut scene = SyntheticIr::default_scene();
+        for eye in &mut scene.eyes {
+            eye.pupil_level = 70;
+        }
+        let line_level = scene.skin_level + 60;
+        scene.specular = (0..400)
+            .map(|i| (Point2::new(120.0 + f64::from(i), 20.0), 0.5, line_level))
+            .collect();
+        let (lit, dark) = scene.render();
+        let diff = crate::image::saturating_diff(lit.view(), dark.view()).unwrap();
+        let (cands, counts) = candidates(diff.view(), &IrClassicOptions::default());
+        assert_eq!(
+            cands.len(),
+            2,
+            "expected both dim pupils to survive the motion-edge line, rejected_area={}, rejected_aspect={}, rejected_contrast={}, rejected_iris_ratio={}",
+            counts.area,
+            counts.aspect,
+            counts.contrast,
+            counts.iris_ratio
+        );
+    }
+
+    #[test]
+    fn test_hysteresis_keeps_full_pupil_area() {
+        let mut scene = SyntheticIr::default_scene();
+        scene.eyes.truncate(1);
+        scene.eyes[0].pupil_level = 66;
+        scene.noise_sigma = 0.0;
+        let (lit, dark) = scene.render();
+        let diff = crate::image::saturating_diff(lit.view(), dark.view()).unwrap();
+
+        let options = IrClassicOptions {
+            threshold_hysteresis: 0.5,
+            ..IrClassicOptions::default()
+        };
+        let (cands, _counts) = candidates(diff.view(), &options);
+        assert_eq!(cands.len(), 1);
+        let hysteresis_area = cands[0].area as usize;
+
+        let (w, h) = (diff.width(), diff.height());
+        let bg = opening(diff.view(), options.background_size);
+        let th: Vec<u8> = diff
+            .data()
+            .iter()
+            .zip(&bg)
+            .map(|(&d, &b)| d.saturating_sub(b))
+            .collect();
+        let (t_hi, t_lo) = threshold_levels(
+            &th,
+            options.threshold_k_mad,
+            options.threshold_hysteresis,
+            options.min_threshold,
+        );
+
+        let area_at = |t: u8| -> usize {
+            label_components(&th, w, h, t, t)
+                .iter()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(0)
+        };
+        let area_lo = area_at(t_lo);
+        let area_hi = area_at(t_hi);
+
+        assert_eq!(hysteresis_area, area_lo);
+        assert!(
+            area_lo > area_hi,
+            "area_lo {area_lo} should exceed area_hi {area_hi}"
+        );
     }
 }
