@@ -386,26 +386,33 @@ impl fmt::Debug for Pipeline {
     }
 }
 
-/// Covariance intersection (Julier and Uhlmann 1997) in mm. Points with a badly conditioned
-/// `cov_mm` are dropped; none left gives `None`; one point is returned unchanged; more than one
-/// are folded left to right through `intersect_pair`.
+/// Information-form fusion in mm: `W_i = C_i^-1`, `C = (sum W_i)^-1`, `mu = C sum W_i mu_i`.
+/// Points with a non-finite or singular `cov_mm` are dropped; none left gives `None`; one point
+/// is returned unchanged.
 pub fn fuse_points(points: &[GazePoint], screen: &ScreenModel) -> Option<GazePoint> {
-    let usable: Vec<&GazePoint> = points
+    let usable: Vec<(&GazePoint, Matrix2<f64>)> = points
         .iter()
-        .filter(|p| well_conditioned(&p.cov_mm))
+        .filter(|p| p.cov_mm.iter().all(|v| v.is_finite()))
+        .filter_map(|p| p.cov_mm.try_inverse().map(|w| (p, w)))
         .collect();
     match usable.as_slice() {
         [] => None,
-        [p] => Some((*p).clone()),
+        [(p, _)] => Some((*p).clone()),
         many => {
-            let mut mu = many[0].mm.coords;
-            let mut cov = many[0].cov_mm;
-            for p in &many[1..] {
-                (mu, cov) = intersect_pair((&mu, &cov), (&p.mm.coords, &p.cov_mm))?;
-            }
-            let mm = Point2::from(mu);
+            let info: Matrix2<f64> = many.iter().map(|(_, w)| w).sum();
+            let cov = info.try_inverse()?;
+            let mm = Point2::from(
+                cov * many
+                    .iter()
+                    .map(|(p, w)| w * p.mm.coords)
+                    .sum::<Vector2<f64>>(),
+            );
             Some(GazePoint {
-                timestamp: many.iter().map(|p| p.timestamp).max().expect("non-empty"),
+                timestamp: many
+                    .iter()
+                    .map(|(p, _)| p.timestamp)
+                    .max()
+                    .expect("non-empty"),
                 output: screen.output.clone(),
                 px_physical: mm_to_px_physical(screen, &mm),
                 px_logical: mm_to_px_logical(screen, &mm),
@@ -417,63 +424,6 @@ pub fn fuse_points(points: &[GazePoint], screen: &ScreenModel) -> Option<GazePoi
     }
 }
 
-/// Covariance intersection of two estimates: `C^-1 = w A^-1 + (1-w) B^-1`, with `w` the value in
-/// `[0, 1]` that minimizes `trace(C)`, found by golden-section search and then snapped to an
-/// exact boundary when one input is strictly tighter (the search itself only approaches 0 or 1).
-fn intersect_pair(
-    a: (&Vector2<f64>, &Matrix2<f64>),
-    b: (&Vector2<f64>, &Matrix2<f64>),
-) -> Option<(Vector2<f64>, Matrix2<f64>)> {
-    let (mu_a, cov_a) = a;
-    let (mu_b, cov_b) = b;
-    let inv_a = cov_a.try_inverse()?;
-    let inv_b = cov_b.try_inverse()?;
-    let trace_at = |w: f64| -> f64 {
-        (inv_a * w + inv_b * (1.0 - w))
-            .try_inverse()
-            .map_or(f64::INFINITY, |c| c.trace())
-    };
-
-    const GOLDEN: f64 = 0.618_033_988_749_895;
-    let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
-    for _ in 0..24 {
-        let c = hi - GOLDEN * (hi - lo);
-        let d = lo + GOLDEN * (hi - lo);
-        let (fc, fd) = (trace_at(c), trace_at(d));
-        if (fc - fd).abs() <= 1e-12 {
-            lo = c;
-            hi = d;
-        } else if fc < fd {
-            hi = d;
-        } else {
-            lo = c;
-        }
-    }
-    let w_search = (lo + hi) / 2.0;
-    let w = [w_search, 0.0, 1.0]
-        .into_iter()
-        .min_by(|&x, &y| trace_at(x).total_cmp(&trace_at(y)))
-        .expect("non-empty");
-
-    let info = inv_a * w + inv_b * (1.0 - w);
-    let cov = info.try_inverse()?;
-    let mu = cov * (inv_a * w * mu_a + inv_b * (1.0 - w) * mu_b);
-    Some((mu, cov))
-}
-
-/// `false` for a non-finite, non-positive or badly conditioned (`lambda_min / lambda_max <
-/// 1e-6`) symmetric 2x2. Eigenvalues of `[[a, b], [b, d]]` are `(a+d)/2 +- hypot((a-d)/2, b)`.
-fn well_conditioned(cov: &Matrix2<f64>) -> bool {
-    if !cov.iter().all(|v| v.is_finite()) {
-        return false;
-    }
-    let (a, b, d) = (cov[(0, 0)], cov[(0, 1)], cov[(1, 1)]);
-    let mean = (a + d) / 2.0;
-    let radius = ((a - d) / 2.0).hypot(b);
-    let (lambda_min, lambda_max) = (mean - radius, mean + radius);
-    lambda_min > 0.0 && lambda_min / lambda_max >= 1e-6
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -481,7 +431,6 @@ mod tests {
 
     use approx::assert_relative_eq;
     use eye_core::Illumination;
-    use eye_geometry::synth::SplitMix64;
 
     use super::*;
     use crate::registry::PassThroughFilter;
@@ -1063,77 +1012,17 @@ mod tests {
     }
 
     #[test]
-    fn test_fuse_two_equal_covariances_keeps_covariance_and_averages() {
-        let a = testkit::point(100.0, 50.0, Matrix2::identity() * 0.8);
-        let b = testkit::point(102.0, 50.0, Matrix2::identity() * 0.8);
+    fn test_fuse_two_points_inverse_covariance_weighted() {
+        let a = testkit::point(100.0, 50.0, Matrix2::identity());
+        let b = testkit::point(110.0, 50.0, Matrix2::identity() * 4.0);
         let fused = fuse_points(&[a, b], &testkit::screen()).expect("two valid points fuse");
-        assert_relative_eq!(fused.mm.x, 101.0, epsilon = 1e-9);
-        assert_relative_eq!(fused.mm.y, 50.0, epsilon = 1e-9);
-        assert_relative_eq!(fused.cov_mm, Matrix2::identity() * 0.8, epsilon = 1e-9);
+        assert_relative_eq!(fused.mm.x, 102.0, epsilon = 1e-12);
+        assert_relative_eq!(fused.cov_mm, Matrix2::identity() * 0.8, epsilon = 1e-12);
         assert_eq!(
             fused.px_logical.x,
-            mm_to_px_logical(&testkit::screen(), &Point2::new(101.0, 50.0)).x
+            mm_to_px_logical(&testkit::screen(), &Point2::new(102.0, 50.0)).x
         );
         assert_eq!(fused.output.as_str(), "eDP-1");
-    }
-
-    #[test]
-    fn test_fuse_unequal_covariances_takes_the_tighter() {
-        let a = testkit::point(100.0, 100.0, Matrix2::identity());
-        let b = testkit::point(110.0, 100.0, Matrix2::identity() * 100.0);
-        let fused = fuse_points(&[a, b], &testkit::screen()).expect("two valid points fuse");
-        assert_relative_eq!(fused.mm.x, 100.0, epsilon = 1e-6);
-        assert_relative_eq!(fused.mm.y, 100.0, epsilon = 1e-6);
-        assert_relative_eq!(fused.cov_mm, Matrix2::identity(), epsilon = 1e-9);
-    }
-
-    #[test]
-    fn test_fuse_drops_badly_conditioned_covariance() {
-        let bad = testkit::point(50.0, 0.0, Matrix2::new(1e-9, 0.0, 0.0, 1.0));
-        let good = testkit::point(0.0, 0.0, Matrix2::identity());
-        let fused = fuse_points(&[bad, good.clone()], &testkit::screen())
-            .expect("the well-conditioned point survives");
-        assert_eq!(fused, good);
-    }
-
-    #[test]
-    fn test_ci_trace_is_minimal_at_returned_w() {
-        let mut rng = SplitMix64::new(0xC1_7E57);
-        for _ in 0..200 {
-            let mu_a = Vector2::new(rng.gaussian() * 10.0, rng.gaussian() * 10.0);
-            let mu_b = Vector2::new(rng.gaussian() * 10.0, rng.gaussian() * 10.0);
-            let cov_a = random_spd(&mut rng);
-            let cov_b = random_spd(&mut rng);
-            let (_, returned_cov) = intersect_pair((&mu_a, &cov_a), (&mu_b, &cov_b))
-                .expect("well-conditioned random SPD pair intersects");
-            let returned_trace = returned_cov.trace();
-            let inv_a = cov_a.try_inverse().expect("random SPD is invertible");
-            let inv_b = cov_b.try_inverse().expect("random SPD is invertible");
-            for i in 0..=100 {
-                let w = f64::from(i) / 100.0;
-                let info = inv_a * w + inv_b * (1.0 - w);
-                let trace_w = info
-                    .try_inverse()
-                    .expect("convex combination of SPD is SPD")
-                    .trace();
-                assert!(
-                    returned_trace <= trace_w + 1e-9,
-                    "returned trace {returned_trace} exceeds trace {trace_w} at w={w}"
-                );
-            }
-        }
-    }
-
-    /// Random symmetric positive-definite 2x2: `M M^T + 0.1 I` keeps eigenvalues well away from
-    /// zero so every draw passes `well_conditioned`.
-    fn random_spd(rng: &mut SplitMix64) -> Matrix2<f64> {
-        let m = Matrix2::new(
-            rng.gaussian(),
-            rng.gaussian(),
-            rng.gaussian(),
-            rng.gaussian(),
-        );
-        m * m.transpose() + Matrix2::identity() * 0.1
     }
 
     #[test]
