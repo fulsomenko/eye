@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use eye_core::log::field;
-use eye_core::observation::SCHEME_MEDIAPIPE_478;
+use eye_core::observation::{SCHEME_MEDIAPIPE_478, mediapipe478};
 use eye_core::stage::{GazeEstimator, StageError};
 use eye_core::{
     CameraId, CameraModel, FaceObservation, GazeRay, Measured, Observations, Rig, Side, Timestamp,
@@ -22,8 +22,6 @@ use serde::Deserialize;
 use crate::EstimateError;
 use crate::log::{side_str, trace_ray};
 use crate::options::parse_options;
-
-pub const MEDIAPIPE_LANDMARKS: usize = 478;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -143,7 +141,7 @@ impl LandmarkEstimator {
     }
 
     fn head_pose(&self, id: &CameraId, cam: &CameraModel, face: &FaceObservation) -> Option<Pose> {
-        if face.landmarks.len() != MEDIAPIPE_LANDMARKS {
+        if face.landmarks.len() != mediapipe478::COUNT {
             tracing::debug!(
                 { field::REASON } = "landmark_count",
                 landmarks = face.landmarks.len() as u64,
@@ -197,8 +195,14 @@ impl LandmarkEstimator {
         at: Timestamp,
     ) -> Option<LandmarkEye> {
         let (inner_idx, outer_idx) = match side {
-            Side::Right => (133usize, 33usize),
-            Side::Left => (362usize, 263usize),
+            Side::Right => (
+                mediapipe478::RIGHT_EYE_MEDIAL,
+                mediapipe478::RIGHT_EYE_LATERAL,
+            ),
+            Side::Left => (
+                mediapipe478::LEFT_EYE_MEDIAL,
+                mediapipe478::LEFT_EYE_LATERAL,
+            ),
         };
         let e_head = eyeball_centre_in_head(
             &MEDIAPIPE_RIGID.point(inner_idx)?,
@@ -745,6 +749,58 @@ mod tests {
             );
             assert_abs_diff_eq!(eye_kappa.ray.direction, expected, epsilon = 1e-9);
         }
+    }
+
+    #[test]
+    fn test_eye_corner_indices_resolve_in_rigid_template() {
+        for idx in [
+            mediapipe478::RIGHT_EYE_MEDIAL,
+            mediapipe478::RIGHT_EYE_LATERAL,
+            mediapipe478::LEFT_EYE_MEDIAL,
+            mediapipe478::LEFT_EYE_LATERAL,
+        ] {
+            assert!(
+                MEDIAPIPE_RIGID.point(idx).is_some(),
+                "index {idx} missing from rigid template"
+            );
+        }
+    }
+
+    #[test]
+    fn test_head_pose_rejects_non_mediapipe_count() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let mut obs = synthetic_rgb_observation(
+            &rig,
+            &screen_from_head,
+            1.0,
+            Point2::new(155.0, 85.0),
+            0.0,
+            0.0,
+            1,
+        );
+        obs.face
+            .as_mut()
+            .expect("face is present")
+            .landmarks
+            .truncate(mediapipe478::COUNT - 1);
+        let mut estimator = LandmarkEstimator::new(LandmarkOptions::default());
+
+        let (frame, logs) = capture_logs(tracing::Level::DEBUG, || {
+            estimator
+                .estimate_frame(&obs, &rig)
+                .expect("estimate succeeds")
+        });
+
+        assert!(frame.is_none());
+        let rec = logs
+            .iter()
+            .find(|r| r.message == "head pose rejected")
+            .expect("landmark_count logged");
+        assert_eq!(
+            rec.fields[field::REASON],
+            Value::Str("landmark_count".into())
+        );
     }
 
     #[test]

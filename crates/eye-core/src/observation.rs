@@ -10,6 +10,18 @@ pub const SCHEME_IR_PUPIL_PAIR: &str = "ir-pupil-pair";
 /// [`FaceObservation::scheme`] of the MediaPipe Face Landmarker (478 points, iris 468..=477).
 pub const SCHEME_MEDIAPIPE_478: &str = "mediapipe-478";
 
+/// Layout of the MediaPipe Face Landmarker output named by [`SCHEME_MEDIAPIPE_478`].
+pub mod mediapipe478 {
+    pub const COUNT: usize = 478;
+    pub const RIGHT_EYE_LATERAL: usize = 33;
+    pub const RIGHT_EYE_MEDIAL: usize = 133;
+    pub const LEFT_EYE_LATERAL: usize = 263;
+    pub const LEFT_EYE_MEDIAL: usize = 362;
+    /// Centre first.
+    pub const RIGHT_IRIS: [usize; 5] = [468, 469, 470, 471, 472];
+    pub const LEFT_IRIS: [usize; 5] = [473, 474, 475, 476, 477];
+}
+
 /// A value with its isotropic 1-sigma uncertainty in the value's unit (px for image features;
 /// for an [`Ellipse2`] the sigma of its centre).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -227,6 +239,28 @@ mod tests {
 
     fn center_fixture() -> Point2<f64> {
         Point2::new(320.5, 180.25)
+    }
+
+    #[test]
+    fn test_landmark_scheme_count_matches_iris_range() {
+        assert_eq!(mediapipe478::LEFT_IRIS[4] + 1, mediapipe478::COUNT);
+        let first_iris = mediapipe478::RIGHT_IRIS[0];
+        for idx in [
+            mediapipe478::RIGHT_EYE_LATERAL,
+            mediapipe478::RIGHT_EYE_MEDIAL,
+            mediapipe478::LEFT_EYE_LATERAL,
+            mediapipe478::LEFT_EYE_MEDIAL,
+        ] {
+            assert!(idx < first_iris, "corner index {idx} overlaps iris range");
+        }
+        let right: std::collections::HashSet<_> = mediapipe478::RIGHT_IRIS.iter().collect();
+        let left: std::collections::HashSet<_> = mediapipe478::LEFT_IRIS.iter().collect();
+        assert!(right.is_disjoint(&left));
+        assert_eq!(
+            mediapipe478::RIGHT_IRIS[4] + 1,
+            mediapipe478::LEFT_IRIS[0],
+            "iris ranges are contiguous"
+        );
     }
 
     #[test]

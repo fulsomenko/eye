@@ -15,7 +15,7 @@ use crate::DetectError;
 use crate::mediapipe::blazeface::FaceDetectorOutput;
 
 pub const LANDMARK_INPUT: usize = 256;
-pub const NUM_LANDMARKS: usize = 478;
+pub const NUM_LANDMARKS: usize = eye_core::observation::mediapipe478::COUNT;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LandmarkOutput {

@@ -1,6 +1,6 @@
 use std::f64::consts::PI;
 
-use eye_core::observation::{SCHEME_IR_PUPIL_PAIR, SCHEME_MEDIAPIPE_478};
+use eye_core::observation::{SCHEME_IR_PUPIL_PAIR, SCHEME_MEDIAPIPE_478, mediapipe478};
 use eye_core::{
     CameraId, CameraModel, Ellipse2, EyeCorners, EyeObservation, FaceObservation, Measured,
     Observations, OutputId, Rig, ScreenModel, Side, Timestamp,
@@ -10,8 +10,6 @@ use eye_geometry::eyeball::{EyeParams, eyeball_centre_in_head};
 use eye_geometry::face_template::MEDIAPIPE_RIGID;
 use eye_geometry::synth::SplitMix64;
 use nalgebra::{Isometry3, Point2, Point3, Translation3, UnitQuaternion, Vector2, Vector3};
-
-use crate::landmark::MEDIAPIPE_LANDMARKS;
 
 pub(crate) fn test_rig() -> Rig {
     let ir = CameraModel {
@@ -252,7 +250,7 @@ pub(crate) fn synthetic_rgb_observation(
     };
 
     let head_origin_px = project(&screen_from_head.transform_point(&Point3::origin()));
-    let mut landmarks = vec![head_origin_px; MEDIAPIPE_LANDMARKS];
+    let mut landmarks = vec![head_origin_px; mediapipe478::COUNT];
     for &(i, p) in MEDIAPIPE_RIGID.points {
         let scaled_head_point = Point3::from(Point3::new(p[0], p[1], p[2]).coords * scale);
         let pixel = project(&screen_from_head.transform_point(&scaled_head_point));
@@ -266,8 +264,16 @@ pub(crate) fn synthetic_rgb_observation(
     let centres = synthetic_eye_centres(screen_from_head, scale, &params);
 
     let eyes = [
-        (Side::Right, 33usize, 133usize),
-        (Side::Left, 263usize, 362usize),
+        (
+            Side::Right,
+            mediapipe478::RIGHT_EYE_LATERAL,
+            mediapipe478::RIGHT_EYE_MEDIAL,
+        ),
+        (
+            Side::Left,
+            mediapipe478::LEFT_EYE_LATERAL,
+            mediapipe478::LEFT_EYE_MEDIAL,
+        ),
     ]
     .into_iter()
     .zip(centres)

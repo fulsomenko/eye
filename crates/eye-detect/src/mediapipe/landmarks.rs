@@ -5,15 +5,7 @@ use crate::DetectError;
 use crate::mediapipe::roi::RotatedRect;
 use crate::mediapipe::{LANDMARK_INPUT, MediaPipeOptions, NUM_LANDMARKS};
 
-pub mod index {
-    pub const RIGHT_EYE_LATERAL: usize = 33;
-    pub const RIGHT_EYE_MEDIAL: usize = 133;
-    pub const LEFT_EYE_LATERAL: usize = 263;
-    pub const LEFT_EYE_MEDIAL: usize = 362;
-    /// Centre first.
-    pub const RIGHT_IRIS: [usize; 5] = [468, 469, 470, 471, 472];
-    pub const LEFT_IRIS: [usize; 5] = [473, 474, 475, 476, 477];
-}
+pub use eye_core::observation::mediapipe478 as index;
 
 pub fn unproject_landmarks(
     raw: &[f32],
