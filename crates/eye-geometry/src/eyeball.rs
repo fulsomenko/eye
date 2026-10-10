@@ -5,7 +5,7 @@
 use std::f64::consts::PI;
 
 use eye_core::{CameraModel, GazeRay, Measured, Side, Timestamp};
-use nalgebra::{Point2, Point3, Unit, UnitQuaternion, Vector2, Vector3, Vector5};
+use nalgebra::{Point2, Point3, SVector, Unit, UnitQuaternion, Vector2, Vector3, Vector5};
 
 use crate::GeometryError;
 use crate::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
@@ -175,6 +175,64 @@ pub fn gaze_ray(
     let cov_in = block_diag::<3, 2, 5>(&centre.cov, &isotropic2(pupil_px.sigma()));
     let (angles, angular_cov) =
         propagate_fn(g, &th, &cov_in).ok_or(GeometryError::Degenerate("gaze ray"))?;
+    Ok(GazeRay {
+        side: Some(side),
+        timestamp: at,
+        origin: centre.position,
+        direction: direction_from_yaw_pitch(&angles),
+        angular_cov,
+        origin_cov: centre.cov,
+        head_rotation: screen_from_viewer.copied(),
+    })
+}
+
+/// Glint-referenced ray: the cornea centre lies on the glint ray at `rotation_to_cornea_mm()`
+/// from `centre`, the pupil on the pupil ray at `cornea_to_pupil_mm()` from the cornea centre.
+/// If the glint ray misses the cornea sphere, `ray_sphere_near` returns the nearest point on it
+/// instead, so the ray degrades rather than failing.
+#[allow(clippy::too_many_arguments)]
+pub fn gaze_ray_pccr(
+    side: Side,
+    centre: &EyeCentre,
+    camera: &CameraModel,
+    pupil_px: &Measured<Point2<f64>>,
+    glint_px: &Measured<Point2<f64>>,
+    params: &EyeParams,
+    screen_from_viewer: Option<&UnitQuaternion<f64>>,
+    at: Timestamp,
+) -> Result<GazeRay, GeometryError> {
+    let viewer = screen_from_viewer
+        .copied()
+        .unwrap_or_else(UnitQuaternion::identity);
+    let g = |th: &SVector<f64, 7>| -> Option<Vector2<f64>> {
+        let e = Point3::new(th[0], th[1], th[2]);
+        let (o, u) = pixel_ray(camera, &Point2::new(th[3], th[4])).ok()?;
+        let (_, v) = pixel_ray(camera, &Point2::new(th[5], th[6])).ok()?;
+        let c = cornea_centre_from_coaxial_glint(&o, &v, &e, params);
+        let p = ray_sphere_near(&o, &u, &c, params.cornea_to_pupil_mm());
+        let opt = optical_axis(&c, &p)?;
+        Some(yaw_pitch_from_direction(&visual_axis(
+            &opt,
+            &params.kappa,
+            side,
+            &viewer,
+        )))
+    };
+    let pupil = pupil_px.value();
+    let glint = glint_px.value();
+    let th = SVector::<f64, 7>::from_row_slice(&[
+        centre.position.x,
+        centre.position.y,
+        centre.position.z,
+        pupil.x,
+        pupil.y,
+        glint.x,
+        glint.y,
+    ]);
+    let cov5 = block_diag::<3, 2, 5>(&centre.cov, &isotropic2(pupil_px.sigma()));
+    let cov_in = block_diag::<5, 2, 7>(&cov5, &isotropic2(glint_px.sigma()));
+    let (angles, angular_cov) =
+        propagate_fn(g, &th, &cov_in).ok_or(GeometryError::Degenerate("gaze ray pccr"))?;
     Ok(GazeRay {
         side: Some(side),
         timestamp: at,
@@ -579,5 +637,301 @@ mod tests {
             epsilon = 1e-9
         );
         assert!((c - cam_centre).norm() < (e - cam_centre).norm());
+    }
+
+    fn synth_pccr_pixels(
+        cam: &CameraModel,
+        params: &EyeParams,
+        e: &Point3<f64>,
+        axis: &Unit<Vector3<f64>>,
+    ) -> (Point2<f64>, Point2<f64>) {
+        let o_cam = Point3::from(cam.screen_from_camera.translation.vector);
+        let p = e + axis.into_inner() * params.rotation_to_pupil_mm;
+        let k = e + axis.into_inner() * params.rotation_to_cornea_mm();
+        let glint_screen = k + (o_cam - k).normalize() * params.cornea_radius_mm;
+
+        let pupil_cam = cam.screen_from_camera.inverse_transform_point(&p);
+        let glint_cam = cam
+            .screen_from_camera
+            .inverse_transform_point(&glint_screen);
+        let intrinsics = Intrinsics::from_camera_model(cam);
+        (
+            intrinsics.project(&pupil_cam).unwrap(),
+            intrinsics.project(&glint_cam).unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_gaze_ray_pccr_recovers_true_axis_noise_free() {
+        let cam = fixture_camera();
+        let params = zero_kappa_params();
+        let e = Point3::new(185.0, 60.0, -500.0);
+        let target = Point3::new(100.0, 50.0, 0.0);
+        let axis = Unit::new_normalize(target - e);
+        let (pupil_pixel, glint_pixel) = synth_pccr_pixels(&cam, &params, &e, &axis);
+
+        let centre = EyeCentre {
+            position: e,
+            cov: Matrix3::zeros(),
+        };
+        let pupil_px = Measured::new(pupil_pixel, 1e-9).unwrap();
+        let glint_px = Measured::new(glint_pixel, 1e-9).unwrap();
+
+        let ray = gaze_ray_pccr(
+            Side::Right,
+            &centre,
+            &cam,
+            &pupil_px,
+            &glint_px,
+            &params,
+            None,
+            Timestamp::from_nanos(42),
+        )
+        .unwrap();
+
+        assert_abs_diff_eq!(ray.direction, axis, epsilon = 1e-9);
+
+        let t = -ray.origin.z / ray.direction.z;
+        let hit = ray.origin + ray.direction.into_inner() * t;
+        assert_abs_diff_eq!(hit, target, epsilon = 1e-6);
+        assert_eq!(ray.timestamp, Timestamp::from_nanos(42));
+        assert_eq!(ray.head_rotation, None);
+    }
+
+    #[test]
+    fn test_gaze_ray_pccr_lateral_centre_sensitivity_is_second_order() {
+        let cam = fixture_camera();
+        let params = zero_kappa_params();
+        let e = Point3::new(185.0, 60.0, -500.0);
+        let target = Point3::new(100.0, 50.0, 0.0);
+        let axis = Unit::new_normalize(target - e);
+        let (pupil_pixel, glint_pixel) = synth_pccr_pixels(&cam, &params, &e, &axis);
+        let r_v = UnitQuaternion::identity();
+
+        let lateral_cov = Matrix3::from_diagonal(&Vector3::new(1.0, 0.0, 0.0));
+        let centre = EyeCentre {
+            position: e,
+            cov: lateral_cov,
+        };
+        let pupil_px = Measured::new(pupil_pixel, 1e-9).unwrap();
+        let glint_px = Measured::new(glint_pixel, 1e-9).unwrap();
+
+        let pccr_ray = gaze_ray_pccr(
+            Side::Right,
+            &centre,
+            &cam,
+            &pupil_px,
+            &glint_px,
+            &params,
+            Some(&r_v),
+            Timestamp::from_nanos(0),
+        )
+        .unwrap();
+        let pccr_sigma_yaw = pccr_ray.angular_cov[(0, 0)].sqrt();
+        assert!(
+            pccr_sigma_yaw < 0.1f64.to_radians(),
+            "pccr sigma_yaw {} rad",
+            pccr_sigma_yaw
+        );
+
+        let pupil_sphere_ray = gaze_ray(
+            Side::Right,
+            &centre,
+            &cam,
+            &pupil_px,
+            &params,
+            Some(&r_v),
+            Timestamp::from_nanos(0),
+        )
+        .unwrap();
+        let pupil_sphere_sigma_yaw = pupil_sphere_ray.angular_cov[(0, 0)].sqrt();
+        assert_abs_diff_eq!(
+            pupil_sphere_sigma_yaw,
+            1.0 / 10.46,
+            epsilon = 0.15 * (1.0 / 10.46)
+        );
+    }
+
+    #[test]
+    fn test_gaze_ray_pccr_depth_sensitivity_below_0_3_deg() {
+        let cam = fixture_camera();
+        let params = zero_kappa_params();
+        let e = Point3::new(185.0, 60.0, -500.0);
+        let target = Point3::new(100.0, 50.0, 0.0);
+        let axis = Unit::new_normalize(target - e);
+        let (pupil_pixel, glint_pixel) = synth_pccr_pixels(&cam, &params, &e, &axis);
+
+        let depth_cov = Matrix3::from_diagonal(&Vector3::new(0.0, 0.0, 121.0));
+        let centre = EyeCentre {
+            position: e,
+            cov: depth_cov,
+        };
+        let pupil_px = Measured::new(pupil_pixel, 1e-9).unwrap();
+        let glint_px = Measured::new(glint_pixel, 1e-9).unwrap();
+
+        let ray = gaze_ray_pccr(
+            Side::Right,
+            &centre,
+            &cam,
+            &pupil_px,
+            &glint_px,
+            &params,
+            None,
+            Timestamp::from_nanos(0),
+        )
+        .unwrap();
+        let sigma = (ray.angular_cov[(0, 0)] + ray.angular_cov[(1, 1)]).sqrt();
+        assert!(sigma < 0.3f64.to_radians(), "sigma {} rad", sigma);
+    }
+
+    #[test]
+    fn test_gaze_ray_pccr_pixel_sensitivity_is_one_over_k_d() {
+        let cam = fixture_camera();
+        let params = zero_kappa_params();
+        let e = Point3::new(185.0, 60.0, -500.0);
+        let target = Point3::new(100.0, 50.0, 0.0);
+        let axis = Unit::new_normalize(target - e);
+        let (pupil_pixel, glint_pixel) = synth_pccr_pixels(&cam, &params, &e, &axis);
+
+        let centre = EyeCentre {
+            position: e,
+            cov: Matrix3::zeros(),
+        };
+        let expected = (500.0 / 457.0) / params.cornea_to_pupil_mm();
+
+        let pupil_px = Measured::new(pupil_pixel, 1.0).unwrap();
+        let glint_px = Measured::new(glint_pixel, 1e-9).unwrap();
+        let ray = gaze_ray_pccr(
+            Side::Right,
+            &centre,
+            &cam,
+            &pupil_px,
+            &glint_px,
+            &params,
+            None,
+            Timestamp::from_nanos(0),
+        )
+        .unwrap();
+        let sigma_yaw = ray.angular_cov[(0, 0)].sqrt();
+        assert_abs_diff_eq!(sigma_yaw, expected, epsilon = 0.15 * expected);
+
+        let pupil_px_quiet = Measured::new(pupil_pixel, 1e-9).unwrap();
+        let glint_px_noisy = Measured::new(glint_pixel, 1.0).unwrap();
+        let ray_swapped = gaze_ray_pccr(
+            Side::Right,
+            &centre,
+            &cam,
+            &pupil_px_quiet,
+            &glint_px_noisy,
+            &params,
+            None,
+            Timestamp::from_nanos(0),
+        )
+        .unwrap();
+        let sigma_yaw_swapped = ray_swapped.angular_cov[(0, 0)].sqrt();
+        assert_abs_diff_eq!(sigma_yaw_swapped, expected, epsilon = 0.15 * expected);
+    }
+
+    #[test]
+    fn test_gaze_ray_pccr_cov_matches_monte_carlo() {
+        let cam = fixture_camera();
+        let params = zero_kappa_params();
+        let e = Point3::new(185.0, 60.0, -500.0);
+        let target = Point3::new(100.0, 50.0, 0.0);
+        let axis = Unit::new_normalize(target - e);
+        let (pupil_pixel, glint_pixel) = synth_pccr_pixels(&cam, &params, &e, &axis);
+
+        let pupil_sigma_px = 0.3;
+        let glint_sigma_px = 0.3;
+        let e_cov = Matrix3::from_diagonal(&Vector3::new(1.0, 1.0, 25.0));
+        let centre = EyeCentre {
+            position: e,
+            cov: e_cov,
+        };
+        let pupil_px = Measured::new(pupil_pixel, pupil_sigma_px).unwrap();
+        let glint_px = Measured::new(glint_pixel, glint_sigma_px).unwrap();
+        let predicted = gaze_ray_pccr(
+            Side::Right,
+            &centre,
+            &cam,
+            &pupil_px,
+            &glint_px,
+            &params,
+            None,
+            Timestamp::from_nanos(0),
+        )
+        .unwrap()
+        .angular_cov;
+
+        let n = 5_000;
+        let mut rng = SplitMix64::new(9);
+        let mut samples = Vec::with_capacity(n);
+        let mut sum = Vector2::zeros();
+        for _ in 0..n {
+            let noisy_e = Point3::new(
+                e.x + 1.0 * rng.gaussian(),
+                e.y + 1.0 * rng.gaussian(),
+                e.z + 5.0 * rng.gaussian(),
+            );
+            let noisy_pupil = Point2::new(
+                pupil_pixel.x + pupil_sigma_px * rng.gaussian(),
+                pupil_pixel.y + pupil_sigma_px * rng.gaussian(),
+            );
+            let noisy_glint = Point2::new(
+                glint_pixel.x + glint_sigma_px * rng.gaussian(),
+                glint_pixel.y + glint_sigma_px * rng.gaussian(),
+            );
+            let trial_centre = EyeCentre {
+                position: noisy_e,
+                cov: Matrix3::zeros(),
+            };
+            let trial_pupil_px = Measured::new(noisy_pupil, 1e-12).unwrap();
+            let trial_glint_px = Measured::new(noisy_glint, 1e-12).unwrap();
+            let ray = gaze_ray_pccr(
+                Side::Right,
+                &trial_centre,
+                &cam,
+                &trial_pupil_px,
+                &trial_glint_px,
+                &params,
+                None,
+                Timestamp::from_nanos(0),
+            )
+            .unwrap();
+            let angles = yaw_pitch_from_direction(&ray.direction);
+            sum += angles;
+            samples.push(angles);
+        }
+        let mean = sum / n as f64;
+        let mut empirical = nalgebra::Matrix2::zeros();
+        for a in &samples {
+            let d = a - mean;
+            empirical += d * d.transpose();
+        }
+        empirical /= (n - 1) as f64;
+
+        for k in 0..2 {
+            let tol = 0.10 * predicted[(k, k)].abs();
+            assert!(
+                (empirical[(k, k)] - predicted[(k, k)]).abs() <= tol,
+                "diag {k}: empirical {} predicted {}",
+                empirical[(k, k)],
+                predicted[(k, k)]
+            );
+        }
+        for a in 0..2 {
+            for b in 0..2 {
+                if a == b {
+                    continue;
+                }
+                let tol = 0.05 * (predicted[(a, a)] * predicted[(b, b)]).sqrt();
+                assert!(
+                    (empirical[(a, b)] - predicted[(a, b)]).abs() <= tol,
+                    "offdiag ({a},{b}): empirical {} predicted {}",
+                    empirical[(a, b)],
+                    predicted[(a, b)]
+                );
+            }
+        }
     }
 }
