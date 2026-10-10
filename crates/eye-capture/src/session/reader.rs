@@ -63,7 +63,7 @@ pub(crate) fn load_frame(
     id: &CameraId,
     record: &IndexRecord,
 ) -> Result<Frame, CaptureError> {
-    let path = frame_path(dir, &camera.id, record.seq, camera.format);
+    let path = frame_path(dir, camera.id.as_str(), record.seq, camera.format);
     let bytes = fs::read(&path).map_err(|source| CaptureError::RecordingIo {
         path: path.clone(),
         source,
@@ -143,7 +143,7 @@ impl Recording {
                     ),
                 });
             }
-            last_by_camera.insert(&record.camera, (record.seq, record.timestamp_ns));
+            last_by_camera.insert(record.camera.as_str(), (record.seq, record.timestamp_ns));
         }
 
         let targets_path = dir.join(TARGETS_FILE);
@@ -177,7 +177,7 @@ impl Recording {
     }
 
     pub fn camera(&self, id: &str) -> Option<&RecordedCamera> {
-        self.meta.cameras.iter().find(|c| c.id == id)
+        self.meta.cameras.iter().find(|c| c.id.as_str() == id)
     }
 
     pub fn index(&self) -> &[IndexRecord] {
@@ -195,18 +195,13 @@ impl Recording {
     }
 
     pub fn read_frame(&self, record: &IndexRecord) -> Result<Frame, CaptureError> {
-        let camera = self
-            .camera(&record.camera)
-            .ok_or_else(|| CaptureError::RecordingFormat {
-                path: self.dir.clone(),
-                reason: format!("no camera {} in session.toml", record.camera),
-            })?;
-        load_frame(
-            &self.dir,
-            camera,
-            &CameraId::from(camera.id.as_str()),
-            record,
-        )
+        let camera =
+            self.camera(record.camera.as_str())
+                .ok_or_else(|| CaptureError::RecordingFormat {
+                    path: self.dir.clone(),
+                    reason: format!("no camera {} in session.toml", record.camera),
+                })?;
+        load_frame(&self.dir, camera, &camera.id, record)
     }
 
     pub fn source(&self, camera: &str, pacing: Pacing) -> Result<ReplaySource, CaptureError> {
@@ -229,7 +224,7 @@ impl Recording {
         let records: Vec<IndexRecord> = self
             .index
             .iter()
-            .filter(|r| r.camera == camera)
+            .filter(|r| r.camera.as_str() == camera)
             .cloned()
             .collect();
         Ok(ReplaySource::new(
@@ -247,11 +242,11 @@ impl Recording {
             self.meta
                 .cameras
                 .iter()
-                .position(|c| c.id == camera)
+                .position(|c| c.id.as_str() == camera)
                 .unwrap_or(usize::MAX)
         };
         let mut out: Vec<&IndexRecord> = self.index.iter().collect();
-        out.sort_by_key(|r| (r.timestamp_ns, order(&r.camera)));
+        out.sort_by_key(|r| (r.timestamp_ns, order(r.camera.as_str())));
         out
     }
 }
@@ -277,7 +272,7 @@ mod tests {
             emitter: Some(EmitterState::On),
             cameras: vec![
                 RecordedCamera {
-                    id: "rgb".to_string(),
+                    id: CameraId::from("rgb"),
                     device: Some("/dev/video0".to_string()),
                     format: StoredFormat::Mjpeg,
                     width: 1280,
@@ -285,7 +280,7 @@ mod tests {
                     frame_interval_ns: 33_333_333,
                 },
                 RecordedCamera {
-                    id: "ir".to_string(),
+                    id: CameraId::from("ir"),
                     device: Some("/dev/video2".to_string()),
                     format: StoredFormat::Gray8,
                     width: 640,
@@ -563,7 +558,7 @@ mod tests {
         let mut meta_both = meta();
         meta_both.cameras = vec![
             RecordedCamera {
-                id: "rgb".to_string(),
+                id: CameraId::from("rgb"),
                 device: None,
                 format: StoredFormat::Mjpeg,
                 width: 1280,
@@ -571,7 +566,7 @@ mod tests {
                 frame_interval_ns: 68_000_000,
             },
             RecordedCamera {
-                id: "ir".to_string(),
+                id: CameraId::from("ir"),
                 device: None,
                 format: StoredFormat::Gray8,
                 width: 640,
@@ -663,6 +658,19 @@ mod tests {
     }
 
     #[test]
+    fn test_read_frame_reuses_recorded_camera_id() {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, _) = write_session(root.path(), 1);
+        let recording = Recording::open(&dir).unwrap();
+        let record = &recording.index()[0];
+        let frame = recording.read_frame(record).unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &frame.header().camera.0,
+            &recording.camera("ir").unwrap().id.0
+        ));
+    }
+
+    #[test]
     fn test_logs_recording_opened_at_info() {
         let root = tempfile::tempdir().unwrap();
         let (dir, _) = write_session(root.path(), 3);
@@ -694,7 +702,7 @@ mod tests {
         let recording = Recording::open(&dir).unwrap();
         for camera in &recording.meta().cameras.clone() {
             let mut source = recording
-                .source(&camera.id, Pacing::AsFastAsPossible)
+                .source(camera.id.as_str(), Pacing::AsFastAsPossible)
                 .unwrap();
             let expected = recording
                 .index()

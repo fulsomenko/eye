@@ -424,7 +424,7 @@ impl FrameSource for LiveStampedSource {
         let (mut header, data) = frame.into_parts();
         header.timestamp = Timestamp(Timestamp::now().0.saturating_sub(self.age));
         Frame::new(header, data).map_err(|e| CaptureError::Io {
-            camera: self.inner.info.id.to_string(),
+            camera: self.inner.info.id.clone(),
             source: std::io::Error::other(e.to_string()),
         })
     }

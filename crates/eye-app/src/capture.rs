@@ -229,7 +229,7 @@ mod tests {
         fn next_frame(&mut self) -> Result<eye_core::Frame, CaptureError> {
             std::thread::sleep(Duration::from_millis(5));
             Err(CaptureError::Timeout {
-                camera: self.camera.id.to_string(),
+                camera: self.camera.id.clone(),
                 timeout: Duration::from_millis(5),
             })
         }
@@ -257,7 +257,7 @@ mod tests {
                 Ok(frame("ir", self.seq))
             } else {
                 Err(CaptureError::Disconnected {
-                    camera: self.camera.id.to_string(),
+                    camera: self.camera.id.clone(),
                 })
             }
         }

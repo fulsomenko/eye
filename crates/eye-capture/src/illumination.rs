@@ -173,20 +173,6 @@ impl IlluminationTagger {
         }
     }
 
-    /// Brightness-tags Gray8 frames in place; other formats are left untouched.
-    pub fn tag_frame(&mut self, frame: &mut Frame) {
-        let h = frame.header();
-        if h.format != PixelFormat::Gray8 {
-            return;
-        }
-        let (seq, mean) = (
-            h.seq,
-            mean_brightness(frame.data(), h.width, h.height, self.cfg.sample_step),
-        );
-        let illumination = self.tag(seq, mean);
-        frame.set_illumination(illumination);
-    }
-
     fn next_state(&self, evidence: Evidence) -> TaggerState {
         use TaggerState::*;
         let flat_out = self.flat_run >= self.cfg.flat_frames;
@@ -315,7 +301,7 @@ impl<S: FrameSource> TaggedSource<S> {
     /// Brightness tagging only. `CaptureError::Config` when `cfg.validate()` fails.
     pub fn new(inner: S, cfg: TaggerConfig) -> Result<Self, CaptureError> {
         cfg.validate().map_err(|reason| CaptureError::Config {
-            camera: inner.camera().id.to_string(),
+            camera: inner.camera().id.clone(),
             reason,
         })?;
         Ok(Self {
@@ -772,7 +758,7 @@ mod tests {
             ..Default::default()
         };
         let err = TaggedSource::new(src, cfg).unwrap_err();
-        assert!(matches!(err, CaptureError::Config { ref camera, .. } if camera == "ir"));
+        assert!(matches!(err, CaptureError::Config { ref camera, .. } if camera.as_str() == "ir"));
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use eye_core::{Timestamp, log::field};
+use eye_core::{CameraId, Timestamp, log::field};
 use v4l::{Device, buffer::Type, io::traits::CaptureStream};
 
 use crate::CaptureError;
@@ -87,7 +87,7 @@ impl UvcMetaStream {
 
 impl IlluminationMeta for UvcMetaStream {
     fn next_record(&mut self) -> Result<MetaRecord, CaptureError> {
-        let camera = self.path.display().to_string();
+        let camera = CameraId::new(self.path.display().to_string());
         let (buf, meta) = match CaptureStream::next(&mut self.stream) {
             Ok(next) => next,
             Err(e) if e.kind() == io::ErrorKind::TimedOut => {

@@ -19,21 +19,21 @@ pub enum CaptureError {
     #[error("{path}: pixel format {format} cannot be captured")]
     UnsupportedFormat { path: PathBuf, format: String },
     #[error("camera {camera}: buffer timestamps are not CLOCK_MONOTONIC (flags {flags:#010x})")]
-    NotMonotonic { camera: String, flags: u32 },
+    NotMonotonic { camera: CameraId, flags: u32 },
     #[error("camera {camera}: no frame within {timeout:?}")]
-    Timeout { camera: String, timeout: Duration },
+    Timeout { camera: CameraId, timeout: Duration },
     #[error("camera {camera}: device disconnected")]
-    Disconnected { camera: String },
+    Disconnected { camera: CameraId },
     #[error("camera {camera}: {source}")]
     Io {
-        camera: String,
+        camera: CameraId,
         #[source]
         source: std::io::Error,
     },
     #[error("end of stream")]
     EndOfStream,
     #[error("camera {camera}: invalid options: {reason}")]
-    Config { camera: String, reason: String },
+    Config { camera: CameraId, reason: String },
     #[error("invalid session id {id:?}")]
     InvalidSessionId { id: String },
     #[error("cameras [{}]: {reason}", cameras.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", "))]
@@ -51,4 +51,29 @@ pub enum CaptureError {
     RecordingFormat { path: PathBuf, reason: String },
     #[error(transparent)]
     Core(#[from] eye_core::CoreError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_capture_error_display_keeps_camera_prefix_with_typed_id() {
+        assert_eq!(
+            CaptureError::Timeout {
+                camera: CameraId::from("ir"),
+                timeout: Duration::from_millis(50),
+            }
+            .to_string(),
+            "camera ir: no frame within 50ms"
+        );
+        assert_eq!(
+            CaptureError::Config {
+                camera: CameraId::from("ir"),
+                reason: "x".into(),
+            }
+            .to_string(),
+            "camera ir: invalid options: x"
+        );
+    }
 }

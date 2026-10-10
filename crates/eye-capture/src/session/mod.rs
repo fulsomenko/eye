@@ -33,7 +33,7 @@ pub enum EmitterState {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordedCamera {
-    pub id: String,
+    pub id: CameraId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
     pub format: StoredFormat,
@@ -49,11 +49,11 @@ impl RecordedCamera {
     ) -> Result<Self, crate::CaptureError> {
         let format =
             StoredFormat::try_from(info.format).map_err(|f| crate::CaptureError::Config {
-                camera: info.id.to_string(),
+                camera: info.id.clone(),
                 reason: format!("pixel format {f:?} cannot be recorded"),
             })?;
         Ok(Self {
-            id: info.id.to_string(),
+            id: info.id.clone(),
             device: device.map(|d| d.display().to_string()),
             format,
             width: info.width,
@@ -64,7 +64,7 @@ impl RecordedCamera {
 
     pub fn to_info(&self) -> CameraInfo {
         CameraInfo {
-            id: CameraId::from(self.id.as_str()),
+            id: self.id.clone(),
             format: self.format.into(),
             width: self.width,
             height: self.height,
@@ -98,7 +98,7 @@ pub struct SessionMeta {
 #[serde(deny_unknown_fields)]
 pub struct IndexRecord {
     pub seq: u64,
-    pub camera: String,
+    pub camera: CameraId,
     pub timestamp_ns: u64,
     pub illumination: Illumination,
 }
@@ -131,7 +131,7 @@ mod tests {
             emitter: Some(EmitterState::On),
             cameras: vec![
                 RecordedCamera {
-                    id: "rgb".to_string(),
+                    id: CameraId::from("rgb"),
                     device: Some("/dev/video0".to_string()),
                     format: StoredFormat::Mjpeg,
                     width: 1280,
@@ -139,7 +139,7 @@ mod tests {
                     frame_interval_ns: 33_333_333,
                 },
                 RecordedCamera {
-                    id: "ir".to_string(),
+                    id: CameraId::from("ir"),
                     device: Some("/dev/video2".to_string()),
                     format: StoredFormat::Gray8,
                     width: 640,
@@ -208,7 +208,7 @@ mod tests {
     fn test_index_record_json_is_exact() {
         let record = IndexRecord {
             seq: 42,
-            camera: "ir".to_string(),
+            camera: CameraId::from("ir"),
             timestamp_ns: 123_456_789,
             illumination: Illumination::IrLit,
         };

@@ -202,7 +202,7 @@ mod tests {
             let dropped = AtomicU64::new(0);
             let stop = AtomicBool::new(false);
             let mut source = testkit::script_source(vec![Err(CaptureError::Disconnected {
-                camera: "ir".to_string(),
+                camera: CameraId::from("ir"),
             })]);
             capture_loop(&mut source, &tx, &evict, &stop, &dropped);
         });

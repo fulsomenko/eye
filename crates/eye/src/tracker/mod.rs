@@ -437,7 +437,7 @@ mod tests {
         let mut frames: Vec<Result<eye_core::Frame, CaptureError>> = Vec::new();
         for seq in 0..10u64 {
             frames.push(Err(CaptureError::Timeout {
-                camera: "ir".to_string(),
+                camera: CameraId::from("ir"),
                 timeout: Duration::from_millis(1),
             }));
             frames.push(Ok(testkit::frame("ir", seq, seq, Illumination::IrLit)));
@@ -462,7 +462,7 @@ mod tests {
             Ok(testkit::frame("ir", 1, 1, Illumination::IrLit)),
             Ok(testkit::frame("ir", 2, 2, Illumination::IrLit)),
             Err(CaptureError::Disconnected {
-                camera: "ir".to_string(),
+                camera: CameraId::from("ir"),
             }),
         ];
         let mut t = start(
@@ -588,7 +588,7 @@ mod tests {
         let frames = vec![
             Ok(testkit::frame("ir", 0, 0, Illumination::IrLit)),
             Err(CaptureError::Disconnected {
-                camera: "ir".to_string(),
+                camera: CameraId::from("ir"),
             }),
         ];
         let t = start(

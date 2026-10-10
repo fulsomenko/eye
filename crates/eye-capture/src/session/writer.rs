@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use eye_core::{Frame, log::field};
+use eye_core::{CameraId, Frame, log::field};
 
 use super::{
     FRAMES_DIR, INDEX_FILE, IndexRecord, RecordedCamera, SESSION_FILE, SessionMeta, TARGETS_FILE,
@@ -17,7 +17,7 @@ use crate::{CaptureError, format::StoredFormat};
 #[derive(Debug)]
 pub struct SessionWriter {
     dir: PathBuf,
-    cameras: HashMap<String, RecordedCamera>,
+    cameras: HashMap<CameraId, RecordedCamera>,
     index: BufWriter<File>,
     targets: BufWriter<File>,
     frame_count: u64,
@@ -34,7 +34,7 @@ fn io_err(path: &Path) -> impl Fn(io::Error) -> CaptureError + '_ {
 impl SessionWriter {
     pub fn create(root: &Path, meta: &SessionMeta) -> Result<Self, CaptureError> {
         for camera in &meta.cameras {
-            if !valid_component(&camera.id) {
+            if !valid_component(camera.id.as_str()) {
                 return Err(CaptureError::RecordingFormat {
                     path: root.join(meta.session_id.as_str()),
                     reason: format!("invalid camera id {:?}", camera.id),
@@ -47,7 +47,7 @@ impl SessionWriter {
         fs::create_dir(&dir).map_err(io_err(&dir))?;
 
         for camera in &meta.cameras {
-            let camera_dir = dir.join(FRAMES_DIR).join(&camera.id);
+            let camera_dir = dir.join(FRAMES_DIR).join(camera.id.as_str());
             fs::create_dir_all(&camera_dir).map_err(io_err(&camera_dir))?;
         }
 
@@ -125,7 +125,7 @@ impl SessionWriter {
                 h.seq, cam.id
             )));
         }
-        let path = frame_path(&self.dir, &cam.id, h.seq, format);
+        let path = frame_path(&self.dir, cam.id.as_str(), h.seq, format);
         let bytes: Cow<[u8]> = match format {
             StoredFormat::Mjpeg => Cow::Borrowed(frame.data()),
             StoredFormat::Gray8 => {
@@ -220,7 +220,7 @@ mod tests {
             emitter: Some(EmitterState::On),
             cameras: vec![
                 RecordedCamera {
-                    id: "rgb".to_string(),
+                    id: CameraId::from("rgb"),
                     device: Some("/dev/video0".to_string()),
                     format: StoredFormat::Mjpeg,
                     width: 1280,
@@ -228,7 +228,7 @@ mod tests {
                     frame_interval_ns: 33_333_333,
                 },
                 RecordedCamera {
-                    id: "ir".to_string(),
+                    id: CameraId::from("ir"),
                     device: Some("/dev/video2".to_string()),
                     format: StoredFormat::Gray8,
                     width: 640,
@@ -438,7 +438,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
 
         let mut bad_camera = meta();
-        bad_camera.cameras[0].id = "a/b".to_string();
+        bad_camera.cameras[0].id = CameraId::from("a/b");
         let err = SessionWriter::create(root.path(), &bad_camera).unwrap_err();
         assert!(matches!(err, CaptureError::RecordingFormat { .. }));
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);

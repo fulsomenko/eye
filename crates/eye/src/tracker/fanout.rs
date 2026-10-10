@@ -522,7 +522,7 @@ mod tests {
         let (mut thread, _rx) = thread(vec![]);
         let (tx, rx) = crossbeam_channel::unbounded();
         tx.send(CaptureMsg::Failed(CaptureError::Disconnected {
-            camera: "ir".to_string(),
+            camera: CameraId::from("ir"),
         }))
         .expect("receiver is alive");
         thread.captures.push((CameraId::from("ir"), rx));

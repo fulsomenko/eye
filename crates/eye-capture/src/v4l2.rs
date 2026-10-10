@@ -65,7 +65,6 @@ pub struct V4l2Source {
     timeout: Duration,
     stream: v4l::io::mmap::Stream<'static>,
     seq: SeqWidener,
-    started: bool,
     timeout_state: TimeoutState,
 }
 
@@ -75,8 +74,8 @@ struct TimeoutState {
 }
 
 impl TimeoutState {
-    fn on_timeout(&mut self, started: bool) {
-        self.pending_dequeue = started;
+    fn on_timeout(&mut self) {
+        self.pending_dequeue = true;
     }
 
     fn needs_dequeue(&self) -> bool {
@@ -186,7 +185,6 @@ impl V4l2Source {
             timeout,
             stream,
             seq: SeqWidener::default(),
-            started: false,
             timeout_state: TimeoutState::default(),
         })
     }
@@ -218,7 +216,7 @@ impl V4l2Options {
             .clone()
             .try_into()
             .map_err(|e: toml::de::Error| CaptureError::Config {
-                camera: id.to_string(),
+                camera: id.clone(),
                 reason: e.to_string(),
             })
     }
@@ -244,50 +242,59 @@ impl FrameSource for V4l2Source {
 
     fn next_frame(&mut self) -> Result<Frame, CaptureError> {
         const ENODEV: i32 = 19;
-        let camera = self.info.id.to_string();
         loop {
             if self.timeout_state.needs_dequeue() {
                 match CaptureStream::dequeue(&mut self.stream) {
                     Ok(_) => {
                         self.timeout_state.on_dequeued();
                         tracing::debug!(
-                            { field::CAMERA } = camera.as_str(),
+                            { field::CAMERA } = self.info.id.as_str(),
                             "recovered pending dequeue after timeout, dropping frame"
                         );
                     }
                     Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                        return Err(timeout_error(camera, self.timeout));
+                        return Err(timeout_error(self.info.id.clone(), self.timeout));
                     }
                     Err(e) if e.raw_os_error() == Some(ENODEV) => {
-                        return Err(CaptureError::Disconnected { camera });
+                        return Err(CaptureError::Disconnected {
+                            camera: self.info.id.clone(),
+                        });
                     }
-                    Err(source) => return Err(CaptureError::Io { camera, source }),
+                    Err(source) => {
+                        return Err(CaptureError::Io {
+                            camera: self.info.id.clone(),
+                            source,
+                        });
+                    }
                 }
                 continue;
             }
 
             let (buf, meta) = match CaptureStream::next(&mut self.stream) {
-                Ok(next) => {
-                    self.started = true;
-                    next
-                }
+                Ok(next) => next,
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                    self.started = true;
-                    self.timeout_state.on_timeout(self.started);
-                    return Err(timeout_error(camera, self.timeout));
+                    self.timeout_state.on_timeout();
+                    return Err(timeout_error(self.info.id.clone(), self.timeout));
                 }
                 Err(e) if e.raw_os_error() == Some(ENODEV) => {
-                    return Err(CaptureError::Disconnected { camera });
+                    return Err(CaptureError::Disconnected {
+                        camera: self.info.id.clone(),
+                    });
                 }
-                Err(source) => return Err(CaptureError::Io { camera, source }),
+                Err(source) => {
+                    return Err(CaptureError::Io {
+                        camera: self.info.id.clone(),
+                        source,
+                    });
+                }
             };
             check_clock(meta.flags).map_err(|flags| CaptureError::NotMonotonic {
-                camera: camera.clone(),
+                camera: self.info.id.clone(),
                 flags,
             })?;
             if meta.flags.contains(Flags::ERROR) {
                 tracing::warn!(
-                    { field::CAMERA } = camera.as_str(),
+                    { field::CAMERA } = self.info.id.as_str(),
                     { field::SEQ } = meta.sequence,
                     "driver flagged a corrupt buffer"
                 );
@@ -300,7 +307,7 @@ impl FrameSource for V4l2Source {
             };
             let Some(data) = payload else {
                 tracing::warn!(
-                    { field::CAMERA } = camera.as_str(),
+                    { field::CAMERA } = self.info.id.as_str(),
                     { field::SEQ } = meta.sequence,
                     used,
                     "dropping short or invalid frame"
@@ -333,7 +340,7 @@ impl FrameSource for V4l2Source {
     }
 }
 
-fn timeout_error(camera: String, timeout: Duration) -> CaptureError {
+fn timeout_error(camera: CameraId, timeout: Duration) -> CaptureError {
     tracing::warn!(
         { field::CAMERA } = camera.as_str(),
         timeout_ms = timeout.as_millis() as u64,
@@ -518,7 +525,10 @@ mod tests {
         "#;
         let table: toml::Table = toml_str.parse().unwrap();
         let result = V4l2Source::from_config(CameraId::from("ir"), &table);
-        assert!(matches!(result, Err(CaptureError::Config { ref camera, .. }) if camera == "ir"));
+        assert!(matches!(
+            result,
+            Err(CaptureError::Config { ref camera, .. }) if camera.as_str() == "ir"
+        ));
     }
 
     #[test]
@@ -572,14 +582,11 @@ mod tests {
     }
 
     #[test]
-    fn test_pending_dequeue_is_set_only_after_start() {
+    fn test_timeout_sets_pending_dequeue_until_dequeued() {
         let mut state = TimeoutState::default();
         assert!(!state.needs_dequeue());
 
-        state.on_timeout(false);
-        assert!(!state.needs_dequeue());
-
-        state.on_timeout(true);
+        state.on_timeout();
         assert!(state.needs_dequeue());
 
         state.on_dequeued();

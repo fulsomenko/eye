@@ -293,7 +293,7 @@ pub fn replay_session_with_rig(
     for record in recording
         .merged_index()
         .into_iter()
-        .filter(|r| config.camera(&r.camera).is_some())
+        .filter(|r| config.camera(r.camera.as_str()).is_some())
     {
         let frame = recording.read_frame(record).map_err(capture)?;
         if let Some(set) = pipeline.pair(frame) {

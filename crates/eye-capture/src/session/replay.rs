@@ -48,7 +48,7 @@ impl ReplaySource {
                 .clone()
                 .try_into()
                 .map_err(|e: toml::de::Error| CaptureError::Config {
-                    camera: id.to_string(),
+                    camera: id.clone(),
                     reason: e.to_string(),
                 })?;
         let camera = opts.camera.unwrap_or_else(|| id.to_string());
@@ -152,7 +152,7 @@ mod tests {
             emitter: Some(EmitterState::On),
             cameras: vec![
                 RecordedCamera {
-                    id: "rgb".to_string(),
+                    id: CameraId::from("rgb"),
                     device: None,
                     format: StoredFormat::Mjpeg,
                     width: 1280,
@@ -160,7 +160,7 @@ mod tests {
                     frame_interval_ns: 33_333_333,
                 },
                 RecordedCamera {
-                    id: "ir".to_string(),
+                    id: CameraId::from("ir"),
                     device: None,
                     format: StoredFormat::Gray8,
                     width: 640,
