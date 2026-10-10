@@ -164,7 +164,7 @@ impl Letterbox {
 }
 
 pub fn letterbox_to_tensor(
-    image: &RgbImage,
+    image: &RgbImage<'_>,
     n: usize,
     range: (f32, f32),
     out: &mut [f32],
@@ -311,11 +311,7 @@ mod tests {
         assert_abs_diff_eq!(letterbox.pad_x, 0.0, epsilon = 1e-12);
         assert_abs_diff_eq!(letterbox.pad_y, 28.0, epsilon = 1e-12);
 
-        let image = RgbImage {
-            width: 1280,
-            height: 720,
-            data: vec![128u8; 1280 * 720 * 3],
-        };
+        let image = RgbImage::owned(1280, 720, vec![128u8; 1280 * 720 * 3]);
         let mut out = vec![0.0f32; 128 * 128 * 3];
         letterbox_to_tensor(&image, 128, (-1.0, 1.0), &mut out);
 

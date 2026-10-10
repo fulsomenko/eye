@@ -60,13 +60,9 @@ pub fn decode_mjpeg_gray(bytes: &[u8]) -> Result<GrayImage, DetectError> {
     Ok(GrayImage::new(w, h, data)?)
 }
 
-pub fn decode_mjpeg_rgb(bytes: &[u8]) -> Result<RgbImage, DetectError> {
+pub fn decode_mjpeg_rgb(bytes: &[u8]) -> Result<RgbImage<'static>, DetectError> {
     let (width, height, data) = decode(bytes, ColorSpace::RGB)?;
-    Ok(RgbImage {
-        width,
-        height,
-        data,
-    })
+    Ok(RgbImage::owned(width, height, data))
 }
 
 #[cfg(test)]

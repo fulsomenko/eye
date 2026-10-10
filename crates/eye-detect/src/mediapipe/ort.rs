@@ -292,11 +292,7 @@ mod tests {
         let runtime = OrtRuntime::load(&dir, 2).unwrap();
         let options = MediaPipeOptions::default();
         let mut detector = MediaPipeDetector::new(NAME, runtime, options);
-        let image = crate::image::RgbImage {
-            width: 1280,
-            height: 720,
-            data: vec![0u8; 1280 * 720 * 3],
-        };
+        let image = crate::image::RgbImage::owned(1280, 720, vec![0u8; 1280 * 720 * 3]);
         let camera = eye_core::CameraId::from("cam0");
         let result = detector.detect_image(&camera, &image).unwrap();
         assert!(result.is_none());

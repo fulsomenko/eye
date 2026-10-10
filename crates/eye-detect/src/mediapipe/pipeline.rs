@@ -45,7 +45,7 @@ impl<R: MediaPipeRuntime> MediaPipeDetector<R> {
     pub fn detect_image(
         &mut self,
         camera: &CameraId,
-        image: &RgbImage,
+        image: &RgbImage<'_>,
     ) -> Result<Option<FaceObservation>, DetectError> {
         self.detect_image_retrying(camera, image, true)
     }
@@ -53,7 +53,7 @@ impl<R: MediaPipeRuntime> MediaPipeDetector<R> {
     fn detect_image_retrying(
         &mut self,
         camera: &CameraId,
-        image: &RgbImage,
+        image: &RgbImage<'_>,
         allow_retry: bool,
     ) -> Result<Option<FaceObservation>, DetectError> {
         let (roi, from_track) = match self.tracked.get(camera).copied() {
@@ -117,7 +117,7 @@ impl<R: MediaPipeRuntime> MediaPipeDetector<R> {
         }))
     }
 
-    fn detect_roi(&mut self, image: &RgbImage) -> Result<Option<RotatedRect>, DetectError> {
+    fn detect_roi(&mut self, image: &RgbImage<'_>) -> Result<Option<RotatedRect>, DetectError> {
         let letterbox =
             letterbox_to_tensor(image, DETECTOR_INPUT, (-1.0, 1.0), &mut self.detector_input);
         let raw = self.runtime.run_face_detector(&self.detector_input)?;
@@ -259,12 +259,8 @@ mod tests {
         raw
     }
 
-    fn sample_image() -> RgbImage {
-        RgbImage {
-            width: 1280,
-            height: 720,
-            data: vec![128u8; 1280 * 720 * 3],
-        }
+    fn sample_image() -> RgbImage<'static> {
+        RgbImage::owned(1280, 720, vec![128u8; 1280 * 720 * 3])
     }
 
     #[test]

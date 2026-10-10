@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use eye_core::{
     CoreError, Frame, PixelFormat,
     image::{GrayImage, GrayView},
@@ -7,20 +9,28 @@ use nalgebra::Point2;
 use crate::{DetectError, mjpeg::decode_mjpeg_rgb};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RgbImage {
+pub struct RgbImage<'a> {
     pub width: u32,
     pub height: u32,
-    pub data: Vec<u8>,
+    pub data: Cow<'a, [u8]>,
 }
 
-impl RgbImage {
-    pub fn from_frame(frame: &Frame) -> Result<Self, DetectError> {
+impl<'a> RgbImage<'a> {
+    pub fn owned(width: u32, height: u32, data: Vec<u8>) -> RgbImage<'static> {
+        RgbImage {
+            width,
+            height,
+            data: Cow::Owned(data),
+        }
+    }
+
+    pub fn from_frame(frame: &'a Frame) -> Result<Self, DetectError> {
         let header = frame.header();
         match header.format {
             PixelFormat::Rgb8 => Ok(RgbImage {
                 width: header.width,
                 height: header.height,
-                data: frame.data().to_vec(),
+                data: Cow::Borrowed(frame.data()),
             }),
             PixelFormat::Mjpeg => {
                 let decoded = decode_mjpeg_rgb(frame.data())?;
@@ -86,7 +96,7 @@ impl Roi {
     }
 }
 
-pub fn rgb_to_gray(rgb: &RgbImage) -> Result<GrayImage, DetectError> {
+pub fn rgb_to_gray(rgb: &RgbImage<'_>) -> Result<GrayImage, DetectError> {
     let gray: Vec<u8> = rgb
         .data
         .as_chunks::<3>()
@@ -163,11 +173,7 @@ mod tests {
 
     #[test]
     fn test_rgb_to_gray_uses_bt601_weights() {
-        let rgb = RgbImage {
-            width: 4,
-            height: 1,
-            data: vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255],
-        };
+        let rgb = RgbImage::owned(4, 1, vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]);
         let gray = rgb_to_gray(&rgb).unwrap();
         assert_eq!(gray.data(), &[77, 149, 29, 255]);
     }
@@ -201,11 +207,7 @@ mod tests {
         for i in 0..9u8 {
             data.extend_from_slice(&[i, i, i]);
         }
-        let rgb = RgbImage {
-            width: 3,
-            height: 3,
-            data,
-        };
+        let rgb = RgbImage::owned(3, 3, data);
         for c in 0..3 {
             assert_abs_diff_eq!(
                 rgb.sample(1.5, 1.5, c),
@@ -217,11 +219,7 @@ mod tests {
 
     #[test]
     fn test_rgb_sample_midway_between_centres_averages() {
-        let rgb = RgbImage {
-            width: 2,
-            height: 1,
-            data: vec![0, 0, 0, 100, 0, 0],
-        };
+        let rgb = RgbImage::owned(2, 1, vec![0, 0, 0, 100, 0, 0]);
         assert_abs_diff_eq!(rgb.sample(1.0, 0.5, 0), 50.0, epsilon = 1e-12);
         assert_abs_diff_eq!(rgb.sample(1.5, 0.5, 0), 100.0, epsilon = 1e-12);
     }
@@ -288,6 +286,34 @@ mod tests {
     }
 
     #[test]
+    fn test_from_frame_borrows_rgb8_pixels() {
+        let f = frame(
+            PixelFormat::Rgb8,
+            2,
+            2,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        );
+        let image = RgbImage::from_frame(&f).unwrap();
+        assert!(matches!(image.data, std::borrow::Cow::Borrowed(_)));
+        assert!(std::ptr::eq(image.data.as_ptr(), f.data().as_ptr()));
+    }
+
+    #[test]
+    fn test_from_frame_owns_decoded_mjpeg() {
+        use image::{ExtendedColorType, codecs::jpeg::JpegEncoder};
+
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(&mut jpeg, 95)
+            .encode(&vec![0u8; 32 * 32 * 3], 32, 32, ExtendedColorType::Rgb8)
+            .unwrap();
+
+        let f = frame(PixelFormat::Mjpeg, 32, 32, jpeg);
+        let image = RgbImage::from_frame(&f).unwrap();
+        assert!(matches!(image.data, std::borrow::Cow::Owned(_)));
+        assert_eq!(image.data.len(), 32 * 32 * 3);
+    }
+
+    #[test]
     fn test_rgb_from_gray_frame_is_unsupported_format() {
         let f = frame(PixelFormat::Gray8, 2, 1, vec![0, 0]);
         let err = RgbImage::from_frame(&f).unwrap_err();
@@ -324,7 +350,7 @@ mod tests {
             x in 0.0f64..8.0,
             y in 0.0f64..8.0,
         ) {
-            let rgb = RgbImage { width: 8, height: 8, data: data.clone() };
+            let rgb = RgbImage::owned(8, 8, data.clone());
             for c in 0..3 {
                 let channel_values: Vec<u8> = data.iter().skip(c).step_by(3).copied().collect();
                 let min = f64::from(*channel_values.iter().min().unwrap());

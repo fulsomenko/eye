@@ -4,7 +4,7 @@ use crate::image::RgbImage;
 use crate::mediapipe::roi::RotatedRect;
 
 pub fn warp_roi_to_tensor(
-    image: &RgbImage,
+    image: &RgbImage<'_>,
     roi: &RotatedRect,
     n: usize,
     range: (f32, f32),
@@ -29,7 +29,7 @@ mod tests {
 
     use super::*;
 
-    fn checker_image(n: u32) -> RgbImage {
+    fn checker_image(n: u32) -> RgbImage<'static> {
         let mut data = vec![0u8; (n * n) as usize * 3];
         for y in 0..n {
             for x in 0..n {
@@ -40,11 +40,7 @@ mod tests {
                 data[idx + 2] = v;
             }
         }
-        RgbImage {
-            width: n,
-            height: n,
-            data,
-        }
+        RgbImage::owned(n, n, data)
     }
 
     #[test]
@@ -78,11 +74,7 @@ mod tests {
                 data[idx + 2] = 255;
             }
         }
-        let image = RgbImage {
-            width: 1280,
-            height: 720,
-            data,
-        };
+        let image = RgbImage::owned(1280, 720, data);
         let roi = RotatedRect {
             center: Point2::new(640.0, 360.0),
             size: 300.0,
