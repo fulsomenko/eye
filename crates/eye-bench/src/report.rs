@@ -132,6 +132,7 @@ impl BenchReport {
                 cols.push(opt(s(&m.angular_error_deg, |s| s.p95), deg));
                 cols.push(opt(m.accuracy_deg, deg));
                 cols.push(opt(m.precision_rms_s2s_deg, deg));
+                cols.push(opt(m.nees, one));
                 cols.push(opt(s(&m.px_error_logical, |s| s.mean), one));
                 for g in &self.params.grids {
                     cols.push(opt(region(m, *g).and_then(|r| r.hit_rate), pct));
@@ -144,7 +145,7 @@ impl BenchReport {
                 cols.push("error".into());
                 cols.extend(std::iter::repeat_n(
                     "n/a".to_owned(),
-                    9 + self.params.grids.len(),
+                    10 + self.params.grids.len(),
                 ));
             }
         }
@@ -171,6 +172,7 @@ fn header_line(grids: &[[u32; 2]]) -> String {
         "err p95 deg".to_owned(),
         "acc deg".to_owned(),
         "prec deg".to_owned(),
+        "nees".to_owned(),
         "err mean px".to_owned(),
     ];
     for [c, r] in grids {
@@ -184,7 +186,7 @@ fn header_line(grids: &[[u32; 2]]) -> String {
 
 fn align_line(grids: &[[u32; 2]]) -> String {
     let mut cols = vec!["---"; 4];
-    cols.extend(std::iter::repeat_n("---:", 9 + grids.len()));
+    cols.extend(std::iter::repeat_n("---:", 10 + grids.len()));
     format!("|{}|", cols.join("|"))
 }
 
@@ -329,6 +331,7 @@ mod tests {
             accuracy_deg: Some(2.95),
             precision_rms_s2s_deg: Some(0.42),
             precision_pooled_rms_s2s_deg: Some(0.42),
+            nees: Some(2.0),
             regions: vec![
                 RegionHit {
                     cols: 3,
@@ -501,7 +504,7 @@ mod tests {
         let report = BenchReport::new(MetricParams::default(), rows);
         let v = env!("CARGO_PKG_VERSION");
         let expected = format!(
-            "# eye bench report\n\neye {v}. Grids 3x3, 4x4; boundary margin 20 px; dropout bin 200 ms.\n`proc ms` is pipeline processing time per FrameSet, not end-to-end latency (see `eye run --stats`).\n\n| pipeline | calib | session | status | samples | err mean deg | err p95 deg | acc deg | prec deg | err mean px | 3x3 hit | 4x4 hit | proc p50 ms | proc p95 ms | dropout |\n|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n| ir-classic | none | 20261008T090000Z | ok | 812 | 3.41 | 7.90 | 2.95 | 0.42 | 184.2 | 88.9 % | 66.7 % | 4.0 | 6.1 | 4.2 % |\n"
+            "# eye bench report\n\neye {v}. Grids 3x3, 4x4; boundary margin 20 px; dropout bin 200 ms.\n`proc ms` is pipeline processing time per FrameSet, not end-to-end latency (see `eye run --stats`).\n\n| pipeline | calib | session | status | samples | err mean deg | err p95 deg | acc deg | prec deg | nees | err mean px | 3x3 hit | 4x4 hit | proc p50 ms | proc p95 ms | dropout |\n|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n| ir-classic | none | 20261008T090000Z | ok | 812 | 3.41 | 7.90 | 2.95 | 0.42 | 2.0 | 184.2 | 88.9 % | 66.7 % | 4.0 | 6.1 | 4.2 % |\n"
         );
         assert_eq!(report.to_markdown(), expected);
     }
@@ -538,7 +541,7 @@ mod tests {
         let md = report.to_markdown();
         let line = md.lines().find(|l| l.starts_with("| p |")).unwrap();
         let na_count = line.matches("n/a").count();
-        assert_eq!(na_count, 11);
+        assert_eq!(na_count, 12);
         assert!(line.contains("| error |"));
         assert!(md.contains("## Errors\n\n- p / none / s: boom\n"));
     }

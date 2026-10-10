@@ -12,13 +12,14 @@ use eye_calibration::error::CalibrationError;
 use eye_calibration::protocol::{FixationWindow, ProtocolConfig, TargetProtocol};
 use eye_calibration::store::{read_rig, rig_from_table};
 use eye_capture::session::{RecordedCamera, Recording, SessionMeta};
+use eye_core::angles::yaw_pitch_from_direction;
 use eye_core::log::{field, span};
 use eye_core::{CameraInfo, Frame, FrameSet, GazePoint, OutputId, Rig, Timestamp};
-use nalgebra::{Point3, Vector3};
+use nalgebra::{Point3, Unit, Vector3};
 
 use crate::error::BenchError;
 use crate::matrix::{BenchMatrix, PipelineSpec, RigSource};
-use crate::metrics::{EvalInput, EvalPoint, EvalWindow, Summary, compute};
+use crate::metrics::{EvalInput, EvalPoint, EvalWindow, RayResidual, Summary, compute, lift};
 use crate::report::BenchReport;
 use crate::row::{BenchRow, CalibrationMode, RowKind, RowOutcome};
 
@@ -379,11 +380,28 @@ pub fn eval_input<'a>(
             error_deg = crate::metrics::angle_deg(&eye_mm, &point.mm, &w.target_mm),
             "sample"
         );
+        let target_mm3 = lift(&w.target_mm);
+        let rays: Vec<RayResidual> = batch
+            .rays
+            .iter()
+            .filter_map(|ray| {
+                ray.angular_cov.try_inverse()?;
+                let to_target = Unit::new_normalize(target_mm3 - ray.origin);
+                let residual_rad =
+                    yaw_pitch_from_direction(&ray.direction) - yaw_pitch_from_direction(&to_target);
+                Some(RayResidual {
+                    side: ray.side,
+                    residual_rad,
+                    angular_cov: ray.angular_cov,
+                })
+            })
+            .collect();
         out[i].points.push(EvalPoint {
             timestamp: point.timestamp,
             eye_mm,
             gaze_mm: point.mm,
             gaze_px_logical: point.px_logical,
+            rays,
         });
     }
     EvalInput {
@@ -922,6 +940,66 @@ mod tests {
         assert_relative_eq!(eye_mm.x, eye().x, epsilon = 1e-9);
         assert_relative_eq!(eye_mm.y, eye().y, epsilon = 1e-9);
         assert_relative_eq!(eye_mm.z, eye().z, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_eval_input_fills_ray_residuals() {
+        let rig = crate::testing::synthetic_rig();
+        let window = FixationWindow {
+            index: 0,
+            cell: (0, 0),
+            onset: Timestamp::from_nanos(0),
+            start: Timestamp::from_nanos(0),
+            end: Timestamp::from_nanos(1_000_000_000),
+            target_mm: Point2::new(155.0, 85.0),
+            target_px_logical: Point2::new(960.0, 540.0),
+        };
+        let windows = vec![window];
+        let batch = RayBatch {
+            timestamp: Timestamp::from_nanos(500_000_000),
+            rays: vec![
+                GazeRay {
+                    side: None,
+                    timestamp: Timestamp::from_nanos(500_000_000),
+                    origin: Point3::new(120.0, 85.0, -500.0),
+                    direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
+                    origin_cov: Matrix3::zeros(),
+                    angular_cov: Matrix2::identity() * 1e-6,
+                    head_rotation: None,
+                },
+                GazeRay {
+                    side: None,
+                    timestamp: Timestamp::from_nanos(500_000_000),
+                    origin: Point3::new(190.0, 85.0, -500.0),
+                    direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
+                    origin_cov: Matrix3::zeros(),
+                    angular_cov: Matrix2::identity() * 1e-6,
+                    head_rotation: None,
+                },
+            ],
+        };
+        let point = GazePoint {
+            timestamp: Timestamp::from_nanos(500_000_000),
+            output: OutputId::from("eDP-1"),
+            mm: Point2::new(155.0, 85.0),
+            px_physical: Point2::new(0.0, 0.0),
+            px_logical: Point2::new(960.0, 540.0),
+            cov_mm: Matrix2::zeros(),
+            confidence: 1.0,
+        };
+        let input = eval_input(&rig, &windows, [(&batch, &point)], Vec::new());
+        let rays = &input.windows[0].points[0].rays;
+        assert_eq!(rays.len(), 2);
+        let target_mm3 = Point3::new(155.0, 85.0, 0.0);
+        for (ray, residual) in batch.rays.iter().zip(rays) {
+            let to_target = Unit::new_normalize(target_mm3 - ray.origin);
+            let expected =
+                yaw_pitch_from_direction(&ray.direction) - yaw_pitch_from_direction(&to_target);
+            assert_relative_eq!(residual.residual_rad.x, expected.x, epsilon = 1e-12);
+            assert_relative_eq!(residual.residual_rad.y, expected.y, epsilon = 1e-12);
+            assert_eq!(residual.side, ray.side);
+            assert_eq!(residual.angular_cov, ray.angular_cov);
+        }
     }
 
     #[test]

@@ -1,10 +1,19 @@
 //! Pure scoring functions over recorded gaze/target samples. No I/O.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
-use eye_core::{Timestamp, grid::Grid};
-use nalgebra::{Point2, Point3, Vector2, Vector3};
+use eye_core::{Side, Timestamp, grid::Grid};
+use nalgebra::{Matrix2, Point2, Point3, Vector2, Vector3};
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RayResidual {
+    pub side: Option<Side>,
+    /// `yaw_pitch(direction) - yaw_pitch(target - origin)`, rad.
+    pub residual_rad: Vector2<f64>,
+    pub angular_cov: Matrix2<f64>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EvalPoint {
@@ -13,6 +22,9 @@ pub struct EvalPoint {
     pub eye_mm: Point3<f64>,
     pub gaze_mm: Point2<f64>,
     pub gaze_px_logical: Point2<f64>,
+    /// Uncorrected rays of the FrameSet, with their residual against this point's window
+    /// target. Empty for a synthetic point with no underlying rays.
+    pub rays: Vec<RayResidual>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -133,6 +145,7 @@ pub struct SessionMetrics {
     pub accuracy_deg: Option<f64>,
     pub precision_rms_s2s_deg: Option<f64>,
     pub precision_pooled_rms_s2s_deg: Option<f64>,
+    pub nees: Option<f64>,
     /// One entry per valid grid of `MetricParams::grids`, same order.
     pub regions: Vec<RegionHit>,
     pub processing_ms: Option<Summary>,
@@ -140,7 +153,7 @@ pub struct SessionMetrics {
     pub output_rate_hz: Option<f64>,
 }
 
-fn lift(p: &Point2<f64>) -> Point3<f64> {
+pub(crate) fn lift(p: &Point2<f64>) -> Point3<f64> {
     Point3::new(p.x, p.y, 0.0)
 }
 
@@ -259,6 +272,44 @@ fn precision_pooled(windows: &[EvalWindow]) -> Option<f64> {
     (n > 0).then(|| (sum_sq / n as f64).sqrt())
 }
 
+/// D-A2: per (window, side) group with n >= 2 rays, `d2_i = r_i^T C_i^-1 r_i` of the demeaned
+/// residual, group value `mean(d2) * n / (n - 1)`; the session value is the n-weighted mean
+/// over groups.
+fn nees(windows: &[EvalWindow]) -> Option<f64> {
+    let mut groups: HashMap<(usize, Option<Side>), Vec<&RayResidual>> = HashMap::new();
+    for (i, w) in windows.iter().enumerate() {
+        for p in &w.points {
+            for ray in &p.rays {
+                groups.entry((i, ray.side)).or_default().push(ray);
+            }
+        }
+    }
+    let (mut weighted_sum, mut total_n) = (0.0, 0usize);
+    for rays in groups.values() {
+        let n = rays.len();
+        if n < 2 {
+            continue;
+        }
+        let mean: Vector2<f64> =
+            rays.iter().map(|r| r.residual_rad).sum::<Vector2<f64>>() / n as f64;
+        let sum_d2: f64 = rays
+            .iter()
+            .map(|r| {
+                let d = r.residual_rad - mean;
+                let inv = r
+                    .angular_cov
+                    .try_inverse()
+                    .expect("eval_input filled only invertible covariances");
+                (d.transpose() * inv * d)[(0, 0)]
+            })
+            .sum();
+        let group_value = (sum_d2 / n as f64) * (n as f64 / (n as f64 - 1.0));
+        weighted_sum += group_value * n as f64;
+        total_n += n;
+    }
+    (total_n > 0).then(|| weighted_sum / total_n as f64)
+}
+
 fn region(windows: &[EvalWindow], grid: Grid, margin: f64) -> RegionHit {
     let (mut evaluated, mut excluded, mut hits, mut samples, mut sample_hits) = (0, 0, 0, 0, 0);
     for w in windows {
@@ -366,6 +417,7 @@ pub fn compute(input: &EvalInput, params: &MetricParams) -> SessionMetrics {
         accuracy_deg: accuracy(windows),
         precision_rms_s2s_deg: precision(windows),
         precision_pooled_rms_s2s_deg: precision_pooled(windows),
+        nees: nees(windows),
         regions,
         processing_ms: summary(processing_ms),
         dropout_rate: dropout(windows, params.dropout_bin),
@@ -394,6 +446,7 @@ mod tests {
             eye_mm: eye(),
             gaze_mm: mm,
             gaze_px_logical: Point2::new(mm.x * 1920.0 / 310.0, mm.y * 1080.0 / 170.0),
+            rays: vec![],
         }
     }
 
@@ -404,6 +457,7 @@ mod tests {
             eye_mm: eye(),
             gaze_mm: mm,
             gaze_px_logical: px,
+            rays: vec![],
         }
     }
 
@@ -518,12 +572,14 @@ mod tests {
             eye_mm: Point3::new(150.0, 85.0, -500.0),
             gaze_mm: gaze,
             gaze_px_logical: Point2::new(gaze.x * 1920.0 / 310.0, gaze.y * 1080.0 / 170.0),
+            rays: vec![],
         };
         let p2 = EvalPoint {
             timestamp: Timestamp(Duration::from_millis(80)),
             eye_mm: Point3::new(160.0, 85.0, -500.0),
             gaze_mm: gaze,
             gaze_px_logical: Point2::new(gaze.x * 1920.0 / 310.0, gaze.y * 1080.0 / 170.0),
+            rays: vec![],
         };
         let input = EvalInput {
             windows: vec![win(0, 800, Point2::new(960.0, 540.0), vec![p1, p2])],
@@ -613,6 +669,98 @@ mod tests {
         let metrics = compute(&input, &MetricParams::default());
         assert_abs_diff_eq!(metrics.precision_rms_s2s_deg.unwrap(), 0.0, epsilon = 1e-12);
         assert!(metrics.precision_pooled_rms_s2s_deg.unwrap() > 1.0);
+    }
+
+    fn lcg_next(state: &mut u64) -> f64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*state >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn gaussian_pair(state: &mut u64) -> (f64, f64) {
+        let u1 = lcg_next(state).max(1e-12);
+        let u2 = lcg_next(state);
+        let r = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f64::consts::PI * u2;
+        (r * theta.cos(), r * theta.sin())
+    }
+
+    fn nees_window(rays: Vec<RayResidual>) -> EvalWindow {
+        let mut w = win(0, 1000, Point2::new(960.0, 540.0), vec![]);
+        w.points.push(EvalPoint {
+            timestamp: Timestamp(Duration::from_millis(0)),
+            eye_mm: eye(),
+            gaze_mm: Point2::new(155.0, 85.0),
+            gaze_px_logical: Point2::new(960.0, 540.0),
+            rays,
+        });
+        w
+    }
+
+    #[test]
+    fn test_nees_is_two_for_consistent_gaussian_residuals() {
+        let cov = Matrix2::new(1e-4, 0.0, 0.0, 4e-4);
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let rays: Vec<RayResidual> = (0..2000)
+            .map(|_| {
+                let (z0, z1) = gaussian_pair(&mut state);
+                RayResidual {
+                    side: None,
+                    residual_rad: Vector2::new(z0 * 1e-4f64.sqrt(), z1 * 4e-4f64.sqrt()),
+                    angular_cov: cov,
+                }
+            })
+            .collect();
+        let value = nees(&[nees_window(rays)]).unwrap();
+        assert!((1.85..=2.15).contains(&value), "nees = {value}");
+    }
+
+    #[test]
+    fn test_nees_is_eight_when_sigma_is_halved() {
+        let full_cov = Matrix2::new(1e-4, 0.0, 0.0, 4e-4);
+        let quarter_cov = full_cov / 4.0;
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let rays: Vec<RayResidual> = (0..2000)
+            .map(|_| {
+                let (z0, z1) = gaussian_pair(&mut state);
+                RayResidual {
+                    side: None,
+                    residual_rad: Vector2::new(z0 * 1e-4f64.sqrt(), z1 * 4e-4f64.sqrt()),
+                    angular_cov: quarter_cov,
+                }
+            })
+            .collect();
+        let value = nees(&[nees_window(rays)]).unwrap();
+        assert!((7.4..=8.6).contains(&value), "nees = {value}");
+    }
+
+    #[test]
+    fn test_nees_demeans_per_window_and_side() {
+        let cov = Matrix2::identity() * 1e-6;
+        let deviations = [
+            Vector2::new(1e-7, 1e-7),
+            Vector2::new(-1e-7, -1e-7),
+            Vector2::new(1e-7, -1e-7),
+            Vector2::new(-1e-7, 1e-7),
+        ];
+        let window_at_offset = |offset: Vector2<f64>| {
+            let rays: Vec<RayResidual> = deviations
+                .iter()
+                .map(|d| RayResidual {
+                    side: None,
+                    residual_rad: offset + d,
+                    angular_cov: cov,
+                })
+                .collect();
+            nees_window(rays)
+        };
+        let windows = vec![
+            window_at_offset(Vector2::new(0.1, 0.1)),
+            window_at_offset(Vector2::new(-0.1, 0.1)),
+        ];
+        let value = nees(&windows).unwrap();
+        assert!(value < 1.0, "nees = {value}, expected near 0 not ~1e4");
     }
 
     #[test]
@@ -808,6 +956,7 @@ mod tests {
                 eye_mm: eye(),
                 gaze_mm: Point2::new(155.0, 85.0),
                 gaze_px_logical: Point2::new(960.0, 540.0),
+                rays: vec![],
             })
             .collect();
         let input = EvalInput {
@@ -847,6 +996,7 @@ mod tests {
         assert_eq!(metrics.accuracy_deg, None);
         assert_eq!(metrics.precision_rms_s2s_deg, None);
         assert_eq!(metrics.precision_pooled_rms_s2s_deg, None);
+        assert_eq!(metrics.nees, None);
         assert_eq!(metrics.processing_ms, None);
         assert_eq!(metrics.dropout_rate, None);
         assert_eq!(metrics.output_rate_hz, None);

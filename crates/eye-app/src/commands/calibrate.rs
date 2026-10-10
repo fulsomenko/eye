@@ -1008,6 +1008,7 @@ mod tests {
             accuracy_deg: None,
             precision_rms_s2s_deg: None,
             precision_pooled_rms_s2s_deg: None,
+            nees: None,
             regions: vec![RegionHit {
                 cols: 3,
                 rows: 3,

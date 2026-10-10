@@ -304,6 +304,7 @@ mod tests {
                 accuracy_deg: None,
                 precision_rms_s2s_deg: None,
                 precision_pooled_rms_s2s_deg: None,
+                nees: None,
                 regions: vec![],
                 processing_ms: None,
                 dropout_rate: None,

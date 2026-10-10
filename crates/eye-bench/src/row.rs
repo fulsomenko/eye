@@ -32,6 +32,7 @@ pub enum RowKind {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
+#[allow(clippy::large_enum_variant)]
 pub enum RowOutcome {
     Ok { metrics: SessionMetrics },
     Error { message: String },
