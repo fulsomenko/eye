@@ -10,6 +10,7 @@ mod rig;
 mod sink;
 mod time;
 
+pub mod angles;
 pub mod grid;
 pub mod image;
 pub mod log;

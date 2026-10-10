@@ -19,8 +19,7 @@ pub struct GazeRay {
     /// Eye centre.
     pub origin: Point3<f64>,
     pub direction: Unit<Vector3<f64>>,
-    /// Covariance of `(yaw, pitch)` as defined by `eye_geometry::angles`
-    /// (`yaw = atan2(d.x, d.z)`, `pitch = atan2(-d.y, hypot(d.x, d.z))`), rad².
+    /// Covariance of `(yaw, pitch)` as defined by [`crate::angles`], rad².
     pub angular_cov: Matrix2<f64>,
     /// Covariance of `origin`, mm².
     pub origin_cov: Matrix3<f64>,

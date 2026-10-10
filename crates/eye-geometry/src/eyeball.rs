@@ -4,11 +4,11 @@
 
 use std::f64::consts::PI;
 
+use eye_core::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
 use eye_core::{CameraModel, GazeRay, Measured, Side, Timestamp};
 use nalgebra::{Point2, Point3, SVector, Unit, UnitQuaternion, Vector2, Vector3, Vector5};
 
 use crate::GeometryError;
-use crate::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
 use crate::camera::pixel_ray;
 use crate::uncertainty::{Cov3, block_diag, isotropic2, propagate_fn};
 

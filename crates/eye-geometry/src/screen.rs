@@ -1,10 +1,10 @@
 //! Screen intersection: turns a `GazeRay` (reference/screen frame, R1) into a `GazePoint` on
 //! the panel, and owns the mm <-> physical px <-> logical px conversions for `ScreenModel`.
 
+use eye_core::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
 use eye_core::{GazePoint, GazeRay, ScreenModel, Timestamp};
 use nalgebra::{Point2, Point3, Unit, Vector2, Vector3, Vector5};
 
-use crate::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
 use crate::uncertainty::{Cov2, block_diag, propagate_fn};
 
 /// Scale for `confidence_from_cov`: `exp(-sigma_major / CONFIDENCE_SCALE_MM)`.
