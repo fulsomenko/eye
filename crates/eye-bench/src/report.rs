@@ -6,7 +6,16 @@ use crate::error::BenchError;
 use crate::metrics::{MetricParams, RegionHit, SessionMetrics, Summary};
 use crate::row::{BenchRow, RowKind, RowOutcome};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Where a pipeline (or the profile) config came from and a fingerprint of its contents.
+/// `config`/`config_fingerprint` are `None` for the builtin default or an unreadable file.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PipelineProvenance {
+    pub name: String,
+    pub config: Option<String>,
+    pub config_fingerprint: Option<String>,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct BenchReport {
@@ -14,6 +23,10 @@ pub struct BenchReport {
     pub eye_version: String,
     pub params: MetricParams,
     pub rows: Vec<BenchRow>,
+    pub git_rev: Option<String>,
+    pub matrix: Option<String>,
+    pub pipelines: Vec<PipelineProvenance>,
+    pub profile: Option<PipelineProvenance>,
 }
 
 impl BenchReport {
@@ -32,7 +45,17 @@ impl BenchReport {
             eye_version: env!("CARGO_PKG_VERSION").into(),
             params,
             rows,
+            git_rev: None,
+            matrix: None,
+            pipelines: Vec::new(),
+            profile: None,
         }
+    }
+
+    pub fn with_provenance(mut self, git_rev: Option<String>, matrix: Option<String>) -> Self {
+        self.git_rev = git_rev;
+        self.matrix = matrix;
+        self
     }
 
     #[allow(clippy::result_large_err)]
@@ -55,6 +78,12 @@ impl BenchReport {
         out.push_str(
             "`proc ms` is pipeline processing time per FrameSet, not end-to-end latency (see `eye run --stats`).\n\n",
         );
+        out.push_str(&provenance_line(self));
+        out.push('\n');
+        if let Some(section) = pipelines_section(self) {
+            out.push_str(&section);
+            out.push('\n');
+        }
         out.push_str(&header_line(&self.params.grids));
         out.push('\n');
         out.push_str(&align_line(&self.params.grids));
@@ -151,6 +180,34 @@ impl BenchReport {
         }
         format!("| {} |", cols.join(" | "))
     }
+}
+
+fn provenance_line(report: &BenchReport) -> String {
+    let rig = report
+        .rows
+        .first()
+        .map(|r| r.rig_source.as_str())
+        .unwrap_or("n/a");
+    let git = report.git_rev.as_deref().unwrap_or("n/a");
+    let matrix = report.matrix.as_deref().unwrap_or("n/a");
+    format!("rig = {rig}; git {git}; matrix {matrix}\n")
+}
+
+fn pipelines_section(report: &BenchReport) -> Option<String> {
+    if report.pipelines.is_empty() && report.profile.is_none() {
+        return None;
+    }
+    let mut out = String::new();
+    out.push_str("pipelines:\n");
+    for p in report.pipelines.iter().chain(report.profile.iter()) {
+        out.push_str(&format!(
+            "- {}: config {}; fingerprint {}\n",
+            p.name,
+            p.config.as_deref().unwrap_or("builtin default"),
+            p.config_fingerprint.as_deref().unwrap_or("n/a"),
+        ));
+    }
+    Some(out)
 }
 
 fn grids_label(grids: &[[u32; 2]]) -> String {
@@ -462,7 +519,7 @@ mod tests {
         let report = BenchReport::new(MetricParams::default(), rows);
         let json = report.to_json().unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["rows"][0]["status"], "ok");
         assert_eq!(
             value["rows"][0]["metrics"]["angular_error_deg"]["mean"],
@@ -504,7 +561,7 @@ mod tests {
         let report = BenchReport::new(MetricParams::default(), rows);
         let v = env!("CARGO_PKG_VERSION");
         let expected = format!(
-            "# eye bench report\n\neye {v}. Grids 3x3, 4x4; boundary margin 20 px; dropout bin 200 ms.\n`proc ms` is pipeline processing time per FrameSet, not end-to-end latency (see `eye run --stats`).\n\n| pipeline | calib | session | status | samples | err mean deg | err p95 deg | acc deg | prec deg | nees | err mean px | 3x3 hit | 4x4 hit | proc p50 ms | proc p95 ms | dropout |\n|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n| ir-classic | none | 20261008T090000Z | ok | 812 | 3.41 | 7.90 | 2.95 | 0.42 | 2.0 | 184.2 | 88.9 % | 66.7 % | 4.0 | 6.1 | 4.2 % |\n"
+            "# eye bench report\n\neye {v}. Grids 3x3, 4x4; boundary margin 20 px; dropout bin 200 ms.\n`proc ms` is pipeline processing time per FrameSet, not end-to-end latency (see `eye run --stats`).\n\nrig = session; git n/a; matrix n/a\n\n| pipeline | calib | session | status | samples | err mean deg | err p95 deg | acc deg | prec deg | nees | err mean px | 3x3 hit | 4x4 hit | proc p50 ms | proc p95 ms | dropout |\n|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n| ir-classic | none | 20261008T090000Z | ok | 812 | 3.41 | 7.90 | 2.95 | 0.42 | 2.0 | 184.2 | 88.9 % | 66.7 % | 4.0 | 6.1 | 4.2 % |\n"
         );
         assert_eq!(report.to_markdown(), expected);
     }

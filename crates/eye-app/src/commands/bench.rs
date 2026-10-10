@@ -7,6 +7,7 @@ use eye_bench::report::BenchReport;
 use eye_bench::row::{CalibrationMode, RowKind, RowOutcome};
 use eye_bench::runner::run_matrix_with_store;
 
+use crate::cli::GIT_REV;
 use crate::ctx::Ctx;
 use crate::paths::utc_stamp;
 
@@ -109,6 +110,10 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         &matrix,
         &eye::registry::Registry::with_defaults(),
         &|output| store.load_rig(output),
+    )
+    .with_provenance(
+        Some(GIT_REV.to_string()),
+        args.matrix.as_ref().map(|p| p.display().to_string()),
     );
     let dir = report_dir(ctx.output.clone(), SystemTime::now());
     report.write_to(&dir)?;

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use eye::config::{Config, EnvOverrides};
 use eye::pipeline::{Pipeline, PipelineError, RayBatch, RayStep};
 use eye::registry::Registry;
-use eye_calibration::correction::rig_fingerprint;
+use eye_calibration::correction::{rig_fingerprint, text_fingerprint};
 use eye_calibration::error::CalibrationError;
 use eye_calibration::protocol::{FixationWindow, ProtocolConfig, TargetProtocol};
 use eye_calibration::store::{read_rig, rig_from_table};
@@ -20,7 +20,7 @@ use nalgebra::{Point3, Unit, Vector3};
 use crate::error::BenchError;
 use crate::matrix::{BenchMatrix, PipelineSpec, RigSource};
 use crate::metrics::{EvalInput, EvalPoint, EvalWindow, RayResidual, Summary, compute, lift};
-use crate::report::BenchReport;
+use crate::report::{BenchReport, PipelineProvenance};
 use crate::row::{BenchRow, CalibrationMode, RowKind, RowOutcome};
 
 #[derive(Debug)]
@@ -824,7 +824,37 @@ pub fn run_matrix_with_store(
     for spec in &matrix.pipelines {
         rows.extend(rows_for_pipeline(spec, matrix, registry, store));
     }
-    BenchReport::new(matrix.evaluation.metrics.clone(), rows)
+    let mut report = BenchReport::new(matrix.evaluation.metrics.clone(), rows);
+    report.pipelines = matrix
+        .pipelines
+        .iter()
+        .map(|spec| pipeline_provenance(&spec.name, spec.config.as_deref()))
+        .collect();
+    report.profile = matrix
+        .evaluation
+        .profile
+        .as_deref()
+        .map(|path| pipeline_provenance("profile", Some(path)));
+    report
+}
+
+fn pipeline_provenance(name: &str, config: Option<&Path>) -> PipelineProvenance {
+    let fingerprint = config.and_then(|path| match std::fs::read_to_string(path) {
+        Ok(text) => Some(text_fingerprint(&text)),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "pipeline config unreadable for fingerprint"
+            );
+            None
+        }
+    });
+    PipelineProvenance {
+        name: name.to_string(),
+        config: config.map(|p| p.display().to_string()),
+        config_fingerprint: fingerprint,
+    }
 }
 
 #[cfg(test)]
@@ -1638,6 +1668,75 @@ mod tests {
         };
         assert!(metrics.angular_error_deg.as_ref().unwrap().mean < 0.1);
         assert!(row.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_report_json_carries_git_rev_and_pipeline_fingerprints() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            code_frames: true,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let toml_path = dir.path().join("kappa.toml");
+        let config_text = kappa_ray_toml(&FOUR_BY_FOUR_CENTRES, [3.0, -1.0], None);
+        std::fs::write(&toml_path, &config_text).unwrap();
+        let profile = fitted_profile_for(&session_dir);
+        let profile_path = dir.path().join("profile.toml");
+        eye_calibration::profiles::write_profile(&profile_path, &profile).unwrap();
+        let profile_text = std::fs::read_to_string(&profile_path).unwrap();
+
+        let matrix = BenchMatrix {
+            recordings: vec![session_dir],
+            pipelines: vec![PipelineSpec {
+                name: "kappa".to_string(),
+                config: Some(toml_path.clone()),
+            }],
+            evaluation: crate::matrix::Evaluation {
+                calibration: vec![CalibrationMode::Profile],
+                profile: Some(profile_path.clone()),
+                ..Default::default()
+            },
+        };
+        let report = run_matrix(&matrix, &fake_registry()).with_provenance(
+            Some("deadbeef".to_string()),
+            Some("bench/baseline/dual.bench.toml".to_string()),
+        );
+
+        assert_eq!(report.git_rev, Some("deadbeef".to_string()));
+        assert_eq!(
+            report.matrix,
+            Some("bench/baseline/dual.bench.toml".to_string())
+        );
+        assert_eq!(report.pipelines.len(), 1);
+        assert_eq!(report.pipelines[0].name, "kappa");
+        assert_eq!(
+            report.pipelines[0].config,
+            Some(toml_path.display().to_string())
+        );
+        assert_eq!(
+            report.pipelines[0].config_fingerprint,
+            Some(eye_calibration::correction::text_fingerprint(&config_text))
+        );
+        let profile_provenance = report.profile.as_ref().expect("profile provenance set");
+        assert_eq!(profile_provenance.name, "profile");
+        assert_eq!(
+            profile_provenance.config,
+            Some(profile_path.display().to_string())
+        );
+        assert_eq!(
+            profile_provenance.config_fingerprint,
+            Some(eye_calibration::correction::text_fingerprint(&profile_text))
+        );
+
+        let json = report.to_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["git_rev"], "deadbeef");
+        assert_eq!(
+            value["pipelines"][0]["config_fingerprint"],
+            eye_calibration::correction::text_fingerprint(&config_text)
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-recordings = ["/home/max/fulsomenko/eye/recordings/20261008T212300Z", "/home/max/fulsomenko/eye/recordings/20261008T212331Z", "/home/max/fulsomenko/eye/recordings/20261008T212403Z"]
+recordings = ["../../recordings/20261008T212300Z", "../../recordings/20261008T212331Z", "../../recordings/20261008T212403Z"]
 
 [[pipeline]]
 name = "ir"

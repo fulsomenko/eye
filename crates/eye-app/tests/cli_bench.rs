@@ -140,6 +140,83 @@ fn test_fused_pccr_config_parses() {
 }
 
 #[test]
+fn test_baseline_matrices_resolve_relative_paths() {
+    let baseline_dir = std::path::Path::new("../../bench/baseline");
+    let repo_root = baseline_dir
+        .join("../..")
+        .canonicalize()
+        .expect("canonicalizes repo root");
+
+    let mut matrix_paths: Vec<std::path::PathBuf> = std::fs::read_dir(baseline_dir)
+        .expect("reads bench/baseline")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.to_string_lossy().ends_with(".bench.toml"))
+        .collect();
+    matrix_paths.sort();
+    assert!(
+        !matrix_paths.is_empty(),
+        "expected at least one bench.toml under bench/baseline"
+    );
+
+    for path in &matrix_paths {
+        let text = std::fs::read_to_string(path).expect("reads matrix toml");
+        let raw: toml::Value = toml::from_str(&text).expect("parses matrix toml");
+
+        let raw_recordings = raw["recordings"].as_array().expect("recordings array");
+        for entry in raw_recordings {
+            let entry = entry.as_str().expect("recording entries are strings");
+            assert!(
+                !std::path::Path::new(entry).is_absolute(),
+                "{path:?}: recording entry {entry:?} must be relative"
+            );
+        }
+        if let Some(profile) = raw.get("evaluation").and_then(|e| e.get("profile")) {
+            let profile = profile.as_str().expect("evaluation.profile is a string");
+            assert!(
+                !std::path::Path::new(profile).is_absolute(),
+                "{path:?}: evaluation.profile {profile:?} must be relative"
+            );
+        }
+
+        let matrix = BenchMatrix::from_path(path).expect("loads bench matrix");
+        for recording in &matrix.recordings {
+            let cwd = std::env::current_dir().expect("current dir");
+            let absolute = normalize_lexically(&cwd.join(recording));
+            assert!(
+                absolute.starts_with(&repo_root),
+                "{path:?}: resolved recording {recording:?} (normalized {absolute:?}) must be under the repo root {repo_root:?}"
+            );
+        }
+        for pipeline in &matrix.pipelines {
+            if let Some(config) = &pipeline.config {
+                assert!(
+                    config.exists(),
+                    "{path:?}: pipeline {:?} config {config:?} must exist on disk",
+                    pipeline.name
+                );
+            }
+        }
+    }
+}
+
+/// Collapses `.` and `..` components without touching the filesystem (the recordings a
+/// committed matrix points at need not exist in every checkout).
+fn normalize_lexically(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+#[test]
 #[ignore = "needs EYE_RECORDING and the MediaPipe models (detect-model-fetch)"]
 fn test_bench_real_recording() {
     let tmp = tempfile::tempdir().expect("tempdir");
