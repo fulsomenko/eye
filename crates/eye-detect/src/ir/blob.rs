@@ -560,6 +560,54 @@ mod tests {
         assert_eq!(threshold_levels(&th, 6.0, 0.5, 30), (30, 15));
     }
 
+    fn recorded_tophat() -> Vec<u8> {
+        let mut th: Vec<u8> = [2u8, 5, 8].iter().copied().cycle().take(30_000).collect();
+        th.extend(std::iter::repeat_n(86u8, 40));
+        th
+    }
+
+    #[test]
+    fn test_ir_classic_default_k_mad_is_12() {
+        assert_eq!(IrClassicOptions::default().threshold_k_mad, 12.0);
+    }
+
+    #[test]
+    fn test_default_k_threshold_on_recorded_statistics_is_58() {
+        let o = IrClassicOptions::default();
+        let (t_hi, _) = threshold_levels(
+            &recorded_tophat(),
+            o.threshold_k_mad,
+            o.threshold_hysteresis,
+            o.min_threshold,
+        );
+        assert_eq!(t_hi, 58, "5 + 12 x 1.4826 x 3 = 58.37, rounds to 58");
+    }
+
+    #[test]
+    fn test_default_k_threshold_stays_below_old_percentile_floor() {
+        let o = IrClassicOptions::default();
+        let (t_hi, _) = threshold_levels(
+            &recorded_tophat(),
+            o.threshold_k_mad,
+            o.threshold_hysteresis,
+            o.min_threshold,
+        );
+        assert!(
+            t_hi > 32 && t_hi < 63,
+            "t_hi {t_hi} should stay above the k=6 threshold 32 and below the lowest old percentile threshold 63"
+        );
+    }
+
+    #[test]
+    fn test_high_k_threshold_exceeds_dim_pupil_peak() {
+        let th = recorded_tophat();
+        let (t_hi, _) = threshold_levels(&th, 24.0, 0.5, 30);
+        assert_eq!(
+            t_hi, 112,
+            "k=24 threshold {t_hi} should exceed the dim pupil peak 86, i.e. it would not seed it"
+        );
+    }
+
     #[test]
     fn test_threshold_levels_follow_noise_floor() {
         use crate::ir::testutil::Xorshift64Star;

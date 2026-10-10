@@ -67,7 +67,7 @@ impl Default for IrClassicOptions {
         Self {
             max_pair_gap_ms: 100.0,
             background_size: 15,
-            threshold_k_mad: 6.0,
+            threshold_k_mad: 12.0,
             threshold_hysteresis: 1.0,
             min_threshold: 30,
             pupil_area_px: [4, 120],
