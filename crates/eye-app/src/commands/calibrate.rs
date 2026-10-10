@@ -927,14 +927,15 @@ mod tests {
     #[test]
     fn test_fit_recording_fills_provenance() {
         let dir = tempfile::tempdir().unwrap();
+        let protocol = ProtocolConfig::default();
         let spec = SyntheticSession {
             targets: FOUR_BY_FOUR_CENTRES.to_vec(),
             code_frames: true,
+            protocol: Some(protocol),
             ..Default::default()
         };
         let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
         let config = kappa_ray_config(&FOUR_BY_FOUR_CENTRES, [3.0, -1.0], None);
-        let protocol = ProtocolConfig::default();
         let result = fit_recording(
             &session_dir,
             &config,

@@ -266,18 +266,22 @@ pub fn replay_session_with_rig(
                 })
         })
         .collect::<Result<Vec<CameraInfo>, _>>()?;
-    let protocol = match meta.protocol {
-        Some(recorded) => {
-            if recorded != *fallback {
-                tracing::info!(source = "recording", "protocol");
-            }
-            recorded
-        }
-        None => {
-            tracing::info!(source = "fallback", "protocol");
-            *fallback
-        }
+    let (protocol, source) = match meta.protocol {
+        Some(recorded) => (recorded, "recording"),
+        None => match ProtocolConfig::from_target_records(recording.targets(), fallback) {
+            Some(derived) => (derived, "derived"),
+            None => (*fallback, "fallback"),
+        },
     };
+    tracing::info!(
+        source,
+        dwell_ms = protocol.dwell_ms,
+        settle_ms = protocol.settle_ms,
+        window_ms = protocol.window_ms,
+        grid_cols = u64::from(protocol.grid[0]),
+        grid_rows = u64::from(protocol.grid[1]),
+        "protocol"
+    );
     let windows = TargetProtocol::new(protocol)
         .map_err(|e| BenchError::Calibration(Box::new(e)))?
         .fixation_windows(recording.targets(), rig.screen())
@@ -1039,6 +1043,67 @@ mod tests {
             rec.fields.get("source"),
             Some(&eye_log::Value::Str("fallback".to_string()))
         );
+    }
+
+    #[test]
+    fn test_replay_session_derives_protocol_from_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            protocol: None,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let config = fixed_ray_config([155.0, 85.0, -500.0], [161.458333, 94.444444]);
+        let wrong_fallback = ProtocolConfig {
+            grid: [4, 4],
+            lead_in_ms: 1000,
+            dwell_ms: 1500,
+            settle_ms: 900,
+            window_ms: 500,
+        };
+        let replayed =
+            replay_session(&session_dir, &config, &fake_registry(), &wrong_fallback).unwrap();
+        assert_eq!(replayed.run.protocol.settle_ms, 600);
+        assert_eq!(replayed.run.protocol.window_ms, 800);
+        let window = &replayed.run.windows[0];
+        assert_eq!(
+            window.start,
+            Timestamp(window.onset.0 + Duration::from_millis(600))
+        );
+        assert_eq!(
+            window.end,
+            Timestamp(window.start.0 + Duration::from_millis(800))
+        );
+    }
+
+    #[test]
+    fn test_logs_protocol_source_derived_at_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            protocol: None,
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let config = fixed_ray_config([155.0, 85.0, -500.0], [161.458333, 94.444444]);
+        let fallback = ProtocolConfig::default();
+
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::INFO, || {
+            replay_session(&session_dir, &config, &fake_registry(), &fallback).unwrap();
+        });
+        let rec = records
+            .iter()
+            .find(|r| r.message == "protocol")
+            .expect("no 'protocol' record for the derived case");
+        assert_eq!(rec.level, eye_log::Level::Info);
+        assert_eq!(
+            rec.fields.get("source"),
+            Some(&eye_log::Value::Str("derived".to_string()))
+        );
+        assert_eq!(rec.fields.get("dwell_ms"), Some(&eye_log::Value::U64(1500)));
+        assert_eq!(rec.fields.get("settle_ms"), Some(&eye_log::Value::U64(600)));
+        assert_eq!(rec.fields.get("window_ms"), Some(&eye_log::Value::U64(800)));
     }
 
     #[test]

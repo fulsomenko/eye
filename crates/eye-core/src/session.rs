@@ -114,6 +114,165 @@ impl Default for ProtocolConfig {
     }
 }
 
+impl ProtocolConfig {
+    /// D-A4: dwell = median(hidden_ns - shown_ns) over records with `hidden_ns`, snapped to the nearest
+    /// 100 ms (`((median_ms / 100.0).round() * 100.0) as u64`, so the ~23 ms of frame-pacing jitter on
+    /// every legacy recording derives exactly 1500), settle = round(0.4 dwell), window = round(8/15 dwell)
+    /// (the ratios of `Self::default()`), grid from the count of distinct `(mm[0].to_bits(), mm[1].to_bits())`
+    /// positions: 9 -> [3, 3], 16 -> [4, 4]. `lead_in_ms` from `fallback`.
+    /// `None` when fewer than two records carry `hidden_ns` or the position count is neither 9 nor 16.
+    pub fn from_target_records(
+        records: &[TargetRecord],
+        fallback: &ProtocolConfig,
+    ) -> Option<ProtocolConfig> {
+        let mut diffs: Vec<u64> = records
+            .iter()
+            .filter_map(|r| r.hidden_ns.map(|hidden| hidden.saturating_sub(r.shown_ns)))
+            .collect();
+        if diffs.len() < 2 {
+            return None;
+        }
+        diffs.sort_unstable();
+        let mid = diffs.len() / 2;
+        let median_ns = if diffs.len().is_multiple_of(2) {
+            (diffs[mid - 1] + diffs[mid]) as f64 / 2.0
+        } else {
+            diffs[mid] as f64
+        };
+        let median_ms = median_ns / 1_000_000.0;
+        let dwell_ms = ((median_ms / 100.0).round() * 100.0) as u64;
+        let settle_ms = (dwell_ms as f64 * 0.4).round() as u64;
+        let window_ms = (dwell_ms as f64 * 8.0 / 15.0).round() as u64;
+
+        let mut positions: Vec<(u64, u64)> = records
+            .iter()
+            .map(|r| (r.mm[0].to_bits(), r.mm[1].to_bits()))
+            .collect();
+        positions.sort_unstable();
+        positions.dedup();
+        let grid = match positions.len() {
+            9 => [3, 3],
+            16 => [4, 4],
+            _ => return None,
+        };
+
+        Some(ProtocolConfig {
+            grid,
+            lead_in_ms: fallback.lead_in_ms,
+            dwell_ms,
+            settle_ms,
+            window_ms,
+        })
+    }
+}
+
+#[cfg(test)]
+mod protocol_config_from_target_records_tests {
+    use super::*;
+
+    fn record_at(seq: u64, shown_ns: u64, hidden_ns: Option<u64>, mm: [f64; 2]) -> TargetRecord {
+        TargetRecord {
+            seq,
+            shown_ns,
+            hidden_ns,
+            clock: TargetClock::Commit,
+            output: OutputId::from("eDP-1"),
+            px_logical: [0.0, 0.0],
+            mm,
+        }
+    }
+
+    fn records(n: u64, dwell_ns: u64) -> Vec<TargetRecord> {
+        (0..n)
+            .map(|i| {
+                let shown_ns = i * 2_000_000_000;
+                record_at(i, shown_ns, Some(shown_ns + dwell_ns), [i as f64, 0.0])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_from_target_records_reproduces_default_for_1500_dwell() {
+        let derived = ProtocolConfig::from_target_records(
+            &records(16, 1_500_000_000),
+            &ProtocolConfig::default(),
+        )
+        .expect("16 records with hidden_ns and 16 distinct positions derive a protocol");
+        assert_eq!(
+            derived,
+            ProtocolConfig {
+                grid: [4, 4],
+                lead_in_ms: 1000,
+                dwell_ms: 1500,
+                settle_ms: 600,
+                window_ms: 800,
+            }
+        );
+    }
+
+    #[test]
+    fn test_from_target_records_rounds_jittered_dwell_to_default() {
+        let derived = ProtocolConfig::from_target_records(
+            &records(16, 1_523_000_000),
+            &ProtocolConfig::default(),
+        )
+        .expect("jittered dwell still derives");
+        assert_eq!(
+            derived,
+            ProtocolConfig {
+                grid: [4, 4],
+                lead_in_ms: 1000,
+                dwell_ms: 1500,
+                settle_ms: 600,
+                window_ms: 800,
+            }
+        );
+    }
+
+    #[test]
+    fn test_from_target_records_scales_for_2500_dwell() {
+        let derived = ProtocolConfig::from_target_records(
+            &records(9, 2_500_000_000),
+            &ProtocolConfig::default(),
+        )
+        .expect("9 records with hidden_ns and 9 distinct positions derive a protocol");
+        assert_eq!(
+            derived,
+            ProtocolConfig {
+                grid: [3, 3],
+                lead_in_ms: 1000,
+                dwell_ms: 2500,
+                settle_ms: 1000,
+                window_ms: 1333,
+            }
+        );
+    }
+
+    #[test]
+    fn test_from_target_records_needs_hidden_and_known_grid() {
+        let fallback = ProtocolConfig::default();
+
+        let without_hidden: Vec<TargetRecord> = (0..16)
+            .map(|i| record_at(i, i * 2_000_000_000, None, [i as f64, 0.0]))
+            .collect();
+        assert_eq!(
+            ProtocolConfig::from_target_records(&without_hidden, &fallback),
+            None
+        );
+
+        let ten_positions: Vec<TargetRecord> = (0..10)
+            .map(|i| {
+                let shown_ns = i * 2_000_000_000;
+                record_at(i, shown_ns, Some(shown_ns + 1_500_000_000), [i as f64, 0.0])
+            })
+            .collect();
+        assert_eq!(
+            ProtocolConfig::from_target_records(&ten_positions, &fallback),
+            None
+        );
+    }
+}
+
 #[cfg(test)]
 mod protocol_config_tests {
     use super::*;
