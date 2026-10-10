@@ -117,7 +117,7 @@ impl AppendSender {
         Ok(())
     }
 
-    /// Call exactly once per `Hidden` event received, whether or not it led to an `append`.
+    /// Sent by the pump once per `Hidden` it delivered, after the observer returned.
     pub fn settle(&self) {
         let _ = self.0.send(AppendMsg::Settled);
     }

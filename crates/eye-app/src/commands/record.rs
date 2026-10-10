@@ -219,9 +219,11 @@ pub struct NoopObserver;
 
 impl PumpObserver for NoopObserver {}
 
+#[allow(clippy::too_many_arguments)]
 pub fn pump(
     frames: &Receiver<CaptureMsg>,
     targets: &Receiver<TargetEvent>,
+    settle: Option<&AppendSender>,
     deadline: &Receiver<Instant>,
     shutdown: &Receiver<()>,
     to_record: &dyn Fn(&TargetShown, Option<Timestamp>) -> TargetRecord,
@@ -248,6 +250,9 @@ pub fn pump(
                 }
                 Ok(TargetEvent::Hidden { index, at, .. }) => {
                     observer.on_hidden(index, at);
+                    if let Some(settle) = settle {
+                        settle.settle();
+                    }
                     if pending.as_ref().is_some_and(|s| s.index == index)
                         && let Some(shown) = pending.take()
                     {
@@ -336,12 +341,14 @@ fn record_targets(
     } else {
         TargetDisplay::spawn(&output, protocol.lead_in(), specs, track_append)?
     };
+    let settle = track_append.then(|| display.appender());
     if track_append {
         observer.attach_append(display.appender());
     }
     let end = pump(
         capture.frames(),
         display.events(),
+        settle.as_ref(),
         &crossbeam_channel::never(),
         shutdown,
         to_record,
@@ -422,6 +429,7 @@ pub fn record_session(
             pump(
                 capture.frames(),
                 &crossbeam_channel::never(),
+                None,
                 &deadline,
                 shutdown,
                 &to_record,
@@ -500,6 +508,7 @@ mod tests {
     use eye_calibration::store::rig_to_table;
     use eye_core::session::TargetClock;
     use eye_core::{CameraId, CameraModel, FrameHeader, Illumination, OutputId, PixelFormat};
+    use eye_overlay::targets::AppendMsg;
     use eye_platform::{Compositor, SessionInfo, SessionType};
     use nalgebra::{Isometry3, Point2, Vector2};
 
@@ -686,6 +695,7 @@ mod tests {
         let end = pump(
             &frames_rx,
             &targets_rx,
+            None,
             &crossbeam_channel::never(),
             &crossbeam_channel::never(),
             &to_record,
@@ -722,6 +732,7 @@ mod tests {
         let end = pump(
             &frames_rx,
             &targets_rx,
+            None,
             &deadline,
             &crossbeam_channel::never(),
             &to_record,
@@ -747,6 +758,7 @@ mod tests {
         let end = pump(
             &frames_rx,
             &targets_rx,
+            None,
             &crossbeam_channel::never(),
             &shutdown_rx,
             &to_record,
@@ -769,6 +781,7 @@ mod tests {
         let err = pump(
             &frames_rx,
             &targets_rx,
+            None,
             &crossbeam_channel::never(),
             &crossbeam_channel::never(),
             &to_record,
@@ -793,6 +806,7 @@ mod tests {
         let end = pump(
             &frames_rx,
             &targets_rx,
+            None,
             &deadline,
             &crossbeam_channel::never(),
             &to_record,
@@ -823,6 +837,7 @@ mod tests {
         let err = pump(
             &frames_rx,
             &targets_rx,
+            None,
             &crossbeam_channel::never(),
             &crossbeam_channel::never(),
             &to_record,
@@ -863,6 +878,7 @@ mod tests {
         let err = pump(
             &frames_rx,
             &targets_rx,
+            None,
             &crossbeam_channel::never(),
             &crossbeam_channel::never(),
             &to_record,
@@ -890,6 +906,7 @@ mod tests {
         let err = pump(
             &frames_rx,
             &targets_rx,
+            None,
             &crossbeam_channel::never(),
             &crossbeam_channel::never(),
             &to_record,
@@ -899,6 +916,143 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.to_string(), "camera ir failed: gone");
+    }
+
+    #[test]
+    fn test_pump_acks_every_hidden_even_if_observer_does_not() {
+        let (_frames_tx, frames_rx) = crossbeam_channel::unbounded::<CaptureMsg>();
+        let (targets_tx, targets_rx) = crossbeam_channel::unbounded();
+        targets_tx.send(TargetEvent::Shown(shown(0, 10))).unwrap();
+        targets_tx
+            .send(TargetEvent::Hidden {
+                index: 0,
+                at: Timestamp::from_nanos(20),
+                clock: TargetClock::Presentation,
+            })
+            .unwrap();
+        targets_tx.send(TargetEvent::Shown(shown(1, 30))).unwrap();
+        targets_tx
+            .send(TargetEvent::Hidden {
+                index: 1,
+                at: Timestamp::from_nanos(40),
+                clock: TargetClock::Presentation,
+            })
+            .unwrap();
+        targets_tx.send(TargetEvent::Finished).unwrap();
+
+        let (append_tx, append_rx) = crossbeam_channel::unbounded();
+        let settle = AppendSender::new(append_tx);
+
+        let mut sink = FakeSink::new();
+        let end = pump(
+            &frames_rx,
+            &targets_rx,
+            Some(&settle),
+            &crossbeam_channel::never(),
+            &crossbeam_channel::never(),
+            &to_record,
+            &mut sink,
+            &mut NoopObserver,
+        )
+        .unwrap();
+
+        assert_eq!(end, PumpEnd::Finished);
+        let acks: Vec<_> = append_rx.try_iter().collect();
+        assert_eq!(acks.iter().filter(|m| **m == AppendMsg::Settled).count(), 2);
+        assert!(!acks.iter().any(|m| matches!(m, AppendMsg::Append(_))));
+    }
+
+    #[test]
+    fn test_pump_without_settle_sender_sends_nothing() {
+        let (_frames_tx, frames_rx) = crossbeam_channel::unbounded::<CaptureMsg>();
+        let (targets_tx, targets_rx) = crossbeam_channel::unbounded();
+        targets_tx.send(TargetEvent::Shown(shown(0, 10))).unwrap();
+        targets_tx
+            .send(TargetEvent::Hidden {
+                index: 0,
+                at: Timestamp::from_nanos(20),
+                clock: TargetClock::Presentation,
+            })
+            .unwrap();
+        targets_tx.send(TargetEvent::Finished).unwrap();
+
+        let (_append_tx, append_rx) = crossbeam_channel::unbounded::<AppendMsg>();
+
+        let mut sink = FakeSink::new();
+        let end = pump(
+            &frames_rx,
+            &targets_rx,
+            None,
+            &crossbeam_channel::never(),
+            &crossbeam_channel::never(),
+            &to_record,
+            &mut sink,
+            &mut NoopObserver,
+        )
+        .unwrap();
+
+        assert_eq!(end, PumpEnd::Finished);
+        assert_eq!(append_rx.try_iter().count(), 0);
+    }
+
+    struct AppendingObserver {
+        sender: AppendSender,
+    }
+
+    impl PumpObserver for AppendingObserver {
+        fn on_hidden(&mut self, _index: usize, _at: Timestamp) {
+            self.sender
+                .append(TargetSpec {
+                    px_logical: Point2::new(1.0, 1.0),
+                    timing: eye_core::session::TargetTiming {
+                        settle: Duration::from_millis(100),
+                        window: Duration::from_millis(150),
+                        dwell: Duration::from_millis(250),
+                    },
+                    retry: true,
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_pump_settles_after_observer_append() {
+        let (_frames_tx, frames_rx) = crossbeam_channel::unbounded::<CaptureMsg>();
+        let (targets_tx, targets_rx) = crossbeam_channel::unbounded();
+        targets_tx.send(TargetEvent::Shown(shown(0, 10))).unwrap();
+        targets_tx
+            .send(TargetEvent::Hidden {
+                index: 0,
+                at: Timestamp::from_nanos(20),
+                clock: TargetClock::Presentation,
+            })
+            .unwrap();
+        targets_tx.send(TargetEvent::Finished).unwrap();
+
+        let (append_tx, append_rx) = crossbeam_channel::unbounded();
+        let settle = AppendSender::new(append_tx.clone());
+        let mut observer = AppendingObserver {
+            sender: AppendSender::new(append_tx),
+        };
+
+        let mut sink = FakeSink::new();
+        let end = pump(
+            &frames_rx,
+            &targets_rx,
+            Some(&settle),
+            &crossbeam_channel::never(),
+            &crossbeam_channel::never(),
+            &to_record,
+            &mut sink,
+            &mut observer,
+        )
+        .unwrap();
+
+        assert_eq!(end, PumpEnd::Finished);
+        let acks: Vec<_> = append_rx.try_iter().collect();
+        assert_eq!(acks.len(), 2);
+        assert!(matches!(acks[0], AppendMsg::Append(_)));
+        assert_eq!(acks[1], AppendMsg::Settled);
     }
 
     #[test]

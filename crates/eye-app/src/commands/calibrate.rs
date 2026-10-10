@@ -454,9 +454,6 @@ impl PumpObserver for LiveFeedback {
             .map(|w| (w.target_mm, w.target_px_logical));
         self.completed += 1;
         self.refit(index, last_target);
-        if let Some(sender) = &self.append {
-            sender.settle();
-        }
     }
 }
 
@@ -1322,7 +1319,8 @@ mod tests {
         let (fb_tx, fb_rx) = crossbeam_channel::unbounded();
         live.attach_feedback(FeedbackSender::new(fb_tx));
         let (append_tx, append_rx) = crossbeam_channel::unbounded();
-        live.attach_append(AppendSender::new(append_tx));
+        live.attach_append(AppendSender::new(append_tx.clone()));
+        let settle = AppendSender::new(append_tx);
 
         let (frames_tx, frames_rx) = crossbeam_channel::bounded::<CaptureMsg>(0);
         let (targets_tx, targets_rx) = crossbeam_channel::bounded::<TargetEvent>(0);
@@ -1341,6 +1339,7 @@ mod tests {
         let end = pump(
             &frames_rx,
             &targets_rx,
+            Some(&settle),
             &crossbeam_channel::never(),
             &crossbeam_channel::never(),
             &to_record,
@@ -1354,7 +1353,7 @@ mod tests {
     }
 
     /// Drains `rx` and keeps only the `TargetSpec`s it was told to re-present, discarding the
-    /// `Settled` acks `on_hidden` now sends after every refit.
+    /// `Settled` acks the pump sends after every `Hidden`.
     fn drain_appended(
         rx: &crossbeam_channel::Receiver<eye_overlay::targets::AppendMsg>,
     ) -> Vec<TargetSpec> {
