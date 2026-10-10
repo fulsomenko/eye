@@ -105,6 +105,17 @@ pub fn overlay_mode(output: &OutputConfig) -> OverlayMode {
     }
 }
 
+pub fn overlay_options(output: &OutputConfig, screen: &eye_core::ScreenModel) -> OverlayOptions {
+    let mut options = OverlayOptions::new(screen.output.clone(), overlay_mode(output), screen);
+    options.interpolation = eye_overlay::point::Interpolation::from_millis(output.easing_ms);
+    options.hide = eye_overlay::point::HideRules {
+        margin_px: output.hide_margin_px,
+        min_confidence: output.hide_below_confidence,
+    };
+    options.style = eye_overlay::point::PointStyle::default();
+    options
+}
+
 /// `--no-profile`: skips the store entirely. Otherwise the stored profile (or `None`) plus
 /// warnings for a missing profile, a different rig fingerprint and a different estimator.
 pub fn select_profile(
@@ -290,18 +301,7 @@ pub fn run(ctx: &Ctx, args: Args) -> anyhow::Result<()> {
         &report.cameras,
         EmitterGuard::enable,
     )?;
-    let mut overlay_options = OverlayOptions::new(
-        rig.screen().output.clone(),
-        overlay_mode(&config.output),
-        rig.screen(),
-    );
-    overlay_options.interpolation =
-        eye_overlay::point::Interpolation::from_millis(config.output.easing_ms);
-    overlay_options.hide = eye_overlay::point::HideRules {
-        margin_px: config.output.hide_margin_px,
-        min_confidence: config.output.hide_below_confidence,
-    };
-    let overlay = LayerShellOverlay::spawn(overlay_options)?;
+    let overlay = LayerShellOverlay::spawn(overlay_options(&config.output, rig.screen()))?;
     let present = overlay.present_stats();
     let tracker = Tracker::from_config_with(
         &Registry::with_defaults(),
@@ -430,6 +430,36 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(overlay_mode(&output), OverlayMode::Point);
+    }
+
+    #[test]
+    fn test_overlay_options_maps_every_output_knob() {
+        let screen = eye_core::ScreenModel {
+            output: eye_core::OutputId::from("eDP-1"),
+            size_mm: nalgebra::Vector2::new(310.0, 170.0),
+            size_px: (3840, 2160),
+            scale: 2.0,
+        };
+        let output = OutputConfig {
+            mode: OutputMode::Region,
+            grid: [4, 2],
+            easing_ms: 120,
+            hide_margin_px: 10.0,
+            hide_below_confidence: 0.5,
+            ..Default::default()
+        };
+        let options = overlay_options(&output, &screen);
+        assert_eq!(options.mode, OverlayMode::Region { cols: 4, rows: 2 });
+        assert_eq!(options.interpolation.max_lag, Duration::from_millis(120));
+        assert_eq!(
+            options.hide,
+            eye_overlay::point::HideRules {
+                margin_px: 10.0,
+                min_confidence: 0.5,
+            }
+        );
+        assert_eq!(options.output, screen.output);
+        assert_eq!(options.style, eye_overlay::point::PointStyle::default());
     }
 
     #[test]

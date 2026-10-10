@@ -126,11 +126,18 @@ pub enum OutputMode {
     Region,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutputKind {
+    #[default]
+    LayerShell,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OutputConfig {
     /// Overlay backend; only "layer-shell" exists.
-    pub kind: String,
+    pub kind: OutputKind,
     /// Output name; `None` = the rig's screen output.
     pub target: Option<String>,
     pub mode: OutputMode,
@@ -149,7 +156,7 @@ pub struct OutputConfig {
 impl Default for OutputConfig {
     fn default() -> Self {
         Self {
-            kind: "layer-shell".to_string(),
+            kind: OutputKind::LayerShell,
             target: None,
             mode: OutputMode::Point,
             grid: [4, 4],
@@ -338,9 +345,6 @@ impl Config {
             return Err(ConfigError::ZeroChannelCapacity);
         }
 
-        if self.output.kind != "layer-shell" {
-            return Err(ConfigError::InvalidOutput("kind must be \"layer-shell\""));
-        }
         if self.output.grid[0] == 0 || self.output.grid[1] == 0 {
             return Err(ConfigError::InvalidOutput("grid must be at least 1x1"));
         }
@@ -435,7 +439,7 @@ mod tests {
         assert_eq!(
             config.output,
             OutputConfig {
-                kind: "layer-shell".to_string(),
+                kind: OutputKind::LayerShell,
                 target: Some("eDP-1".to_string()),
                 mode: OutputMode::Point,
                 grid: [4, 4],
@@ -575,7 +579,7 @@ mod tests {
         assert_eq!(
             config.output,
             OutputConfig {
-                kind: "layer-shell".to_string(),
+                kind: OutputKind::LayerShell,
                 target: None,
                 mode: OutputMode::Point,
                 grid: [4, 4],
@@ -681,17 +685,22 @@ mod tests {
     }
 
     #[test]
-    fn test_output_kind_must_be_layer_shell() {
+    fn test_output_kind_rejects_unknown_backend() {
+        let err = toml::from_str::<OutputConfig>("kind = \"x11\"").unwrap_err();
+        assert!(err.to_string().contains("unknown variant"), "{err}");
+        assert_eq!(
+            toml::from_str::<OutputConfig>("kind = \"layer-shell\"")
+                .unwrap()
+                .kind,
+            OutputKind::LayerShell
+        );
+
         let toml_str = format!(
-            "{}\n[output]\nkind = \"bogus\"\n",
+            "{}\n[output]\nkind = \"x11\"\n",
             minimal_camera_and_estimate_with_detect()
         );
-        let config = Config::from_toml_str(&toml_str).expect("parses");
-        let err = config.validate().expect_err("bad output kind errors");
-        assert!(matches!(
-            err,
-            ConfigError::InvalidOutput("kind must be \"layer-shell\"")
-        ));
+        let err = Config::from_toml_str(&toml_str).expect_err("unknown backend errors");
+        assert!(err.to_string().contains("unknown variant"), "{err}");
     }
 
     #[test]

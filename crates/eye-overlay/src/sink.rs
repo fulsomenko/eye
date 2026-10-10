@@ -9,7 +9,7 @@ use nalgebra::Vector2;
 use crate::ellipse::logical_px_per_mm;
 use crate::error::OverlayError;
 use crate::handle::OverlayHandle;
-use crate::point::{HideRules, Interpolation, PointScene};
+use crate::point::{HideRules, Interpolation, PointScene, PointStyle};
 use crate::region::RegionScene;
 use crate::stats::PresentStats;
 use crate::surface::{SurfaceOptions, spawn};
@@ -28,6 +28,7 @@ pub struct OverlayOptions {
     pub color: [u8; 3],
     pub interpolation: Interpolation,
     pub hide: HideRules,
+    pub style: PointStyle,
 }
 
 impl OverlayOptions {
@@ -39,6 +40,7 @@ impl OverlayOptions {
             color: [255, 64, 64],
             interpolation: Interpolation::default(),
             hide: HideRules::default(),
+            style: PointStyle::default(),
         }
     }
 }
@@ -66,6 +68,7 @@ impl LayerShellOverlay {
                     options.interpolation,
                 )
                 .with_hide_rules(options.hide)
+                .with_style(options.style)
                 .with_present_stats(present.clone()),
             )?,
             OverlayMode::Region { cols, rows } => {
