@@ -13,11 +13,12 @@ use eye_core::{
 };
 use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
 use eye_geometry::eyeball::{
-    EyeCentre, EyeParams, gaze_ray, gaze_ray_pccr, optical_axis, visual_axis,
+    EyeCentre, EyeParams, gaze_ray, gaze_ray_centre_jacobian, gaze_ray_pccr, optical_axis,
+    visual_axis,
 };
 use eye_geometry::triangulation::{Triangulated, View, triangulate};
 use eye_geometry::uncertainty::{block_diag, propagate_fn};
-use nalgebra::{Matrix3, Point3, Unit, UnitQuaternion, Vector2, Vector3, Vector6};
+use nalgebra::{Matrix2, Matrix3, Point3, Unit, UnitQuaternion, Vector2, Vector3, Vector6};
 use serde::Deserialize;
 
 use crate::EstimateError;
@@ -170,12 +171,22 @@ impl BiasState {
     }
 }
 
-/// `d^2 = delta^T (Sigma_c + Sigma_r)^-1 delta` over (yaw, pitch); `None` if the sum is
-/// singular.
-pub fn mahalanobis2(candidate: &GazeRay, reference: &GazeRay) -> Option<f64> {
+/// `d^2 = delta^T Var(candidate - reference)^-1 delta` over (yaw, pitch); `None` if that
+/// covariance is singular. `shared_cov` is `Cov(candidate, reference)`, non-`None` only when
+/// both rays derive their direction from the same measured eye centre: `Var(candidate -
+/// reference) = Sigma_c + Sigma_r - shared_cov - shared_cov^T` then, instead of the independent
+/// `Sigma_c + Sigma_r`.
+pub fn mahalanobis2(
+    candidate: &GazeRay,
+    reference: &GazeRay,
+    shared_cov: Option<&Matrix2<f64>>,
+) -> Option<f64> {
     let delta = yaw_pitch_from_direction(&candidate.direction)
         - yaw_pitch_from_direction(&reference.direction);
-    let cov = candidate.angular_cov + reference.angular_cov;
+    let mut cov = candidate.angular_cov + reference.angular_cov;
+    if let Some(shared) = shared_cov {
+        cov -= shared + shared.transpose();
+    }
     let inv = cov.try_inverse()?;
     Some((delta.transpose() * inv * delta).x)
 }
@@ -203,8 +214,13 @@ struct CrossChainIrTime<'a> {
 }
 
 /// `fuse_inverse_covariance` with the singular case logged.
-fn fuse_or_log(side: Side, rgb: &GazeRay, ir: &GazeRay) -> Option<GazeRay> {
-    let fused = fuse_inverse_covariance(rgb, ir);
+fn fuse_or_log(
+    side: Side,
+    rgb: &GazeRay,
+    ir: &GazeRay,
+    shared_cov: Option<&Matrix2<f64>>,
+) -> Option<GazeRay> {
+    let fused = fuse_inverse_covariance(rgb, ir, shared_cov);
     if fused.is_none() {
         tracing::debug!(
             { field::REASON } = "singular_cov",
@@ -229,6 +245,9 @@ pub struct FusedEstimator {
     prev_frame: Option<LandmarkFrame>,
     bias: HashMap<(FusedSource, Side), BiasState>,
     decisions: Vec<GateDecision>,
+    /// Per side, `Cov(IrOnly, RgbOnly)` induced by the landmark eye centre both rays' directions
+    /// share this frame (`ir = "pupil"`, seeded); absent when the two don't share a centre.
+    shared_centre: HashMap<Side, Matrix2<f64>>,
 }
 
 impl FusedEstimator {
@@ -253,6 +272,7 @@ impl FusedEstimator {
             prev_frame: None,
             bias: HashMap::new(),
             decisions: Vec::new(),
+            shared_centre: HashMap::new(),
             options,
         }
     }
@@ -284,6 +304,7 @@ impl FusedEstimator {
             .collect();
         ir_pairs.sort_by_key(|o| o.timestamp);
 
+        self.shared_centre.clear();
         let out = match rgb_obs {
             Some(rgb) => self.dual_or_rgb_candidates(rgb, &ir_pairs, rig)?,
             None => self.ir_only_candidates(obs, rig)?,
@@ -378,6 +399,29 @@ impl FusedEstimator {
             None => self.ir.estimate(ir_pairs, rig)?,
         };
 
+        if let (IrChain::Pupil(e), Some(f)) = (&self.ir, &frame)
+            && let Some(rgb_cam) = rig.camera(f.camera.as_str())
+        {
+            let params = self.eye_params();
+            for eye in &f.eyes {
+                if let Some(ir_jacobian) = e.last_centre_jacobian(eye.side)
+                    && let Some(rgb_jacobian) = gaze_ray_centre_jacobian(
+                        eye.side,
+                        &eye.centre,
+                        rgb_cam,
+                        &eye.iris_px,
+                        &params,
+                        Some(&f.viewer),
+                    )
+                {
+                    self.shared_centre.insert(
+                        eye.side,
+                        ir_jacobian * eye.centre.cov * rgb_jacobian.transpose(),
+                    );
+                }
+            }
+        }
+
         let mut out = Vec::new();
         for ray in &i_rays {
             if let Some(side) = ray.side {
@@ -425,7 +469,9 @@ impl FusedEstimator {
                 let Some(i_ray) = i_rays.iter().find(|r| r.side == Some(side)) else {
                     continue;
                 };
-                if let Some(fused) = fuse_or_log(side, &eye.ray, i_ray) {
+                // `shared_centre` stores Cov(IrOnly, RgbOnly); `fuse_or_log(rgb, ir, _)` wants Cov(rgb, ir).
+                let shared_cov = self.shared_centre.get(&side).map(Matrix2::transpose);
+                if let Some(fused) = fuse_or_log(side, &eye.ray, i_ray, shared_cov.as_ref()) {
                     trace_ray(FusedSource::InverseCovariance.as_str(), &fused);
                     out.push((side, FusedSource::InverseCovariance, fused));
                 }
@@ -755,6 +801,7 @@ impl FusedEstimator {
             eligible.push((FusedSource::RgbOnly, reference.clone()));
         }
 
+        let shared_cov = self.shared_centre.get(&side).copied();
         let mut accepted_ir: Option<GazeRay> = None;
         let mut ir_bias_mean = Vector2::zeros();
         for (source, ray) in &raw {
@@ -788,7 +835,12 @@ impl FusedEstimator {
             } else {
                 ray.clone()
             };
-            let d2 = mahalanobis2(&candidate, reference);
+            let cov_cr = if *source == FusedSource::IrOnly {
+                shared_cov.as_ref()
+            } else {
+                None
+            };
+            let d2 = mahalanobis2(&candidate, reference, cov_cr);
             let accepted = d2.is_some_and(|d| d <= self.options.gate_chi2);
 
             self.decisions.push(GateDecision {
@@ -807,10 +859,12 @@ impl FusedEstimator {
             }
         }
 
+        // `shared_cov` is Cov(IrOnly, RgbOnly); `fuse_inverse_covariance(rgb, ir, _)` wants Cov(rgb, ir).
+        let shared_cov_rgb_ir = shared_cov.map(|cov| cov.transpose());
         if let (Some(reference), Some(ir)) = (&reference, &accepted_ir)
-            && let Some(ic) = fuse_inverse_covariance(reference, ir)
+            && let Some(ic) = fuse_inverse_covariance(reference, ir, shared_cov_rgb_ir.as_ref())
         {
-            let d2 = mahalanobis2(&ic, reference);
+            let d2 = mahalanobis2(&ic, reference, None);
             self.decisions.push(GateDecision {
                 side,
                 source: FusedSource::InverseCovariance,
@@ -890,14 +944,46 @@ impl GazeEstimator for FusedEstimator {
     }
 }
 
-/// Inverse-covariance fusion of two INDEPENDENT rays of the same eye; `None` if a covariance is
-/// singular.
-pub fn fuse_inverse_covariance(a: &GazeRay, b: &GazeRay) -> Option<GazeRay> {
-    let (ia, ib) = (a.angular_cov.try_inverse()?, b.angular_cov.try_inverse()?);
-    let angular_cov = (ia + ib).try_inverse()?;
-    let theta = angular_cov
-        * (ia * yaw_pitch_from_direction(&a.direction)
-            + ib * yaw_pitch_from_direction(&b.direction));
+/// Minimum-variance linear fusion of two correlated `(yaw, pitch)` measurements of the same
+/// quantity (`Cov(a, b) = cab`): `fused = theta_a + gain * (theta_b - theta_a)`, with `gain`
+/// the regression of `a`'s error onto the `a - b` innovation (`Var(a - b) = d`). `None` if `d`
+/// is singular; reduces to the plain inverse-covariance average when `cab` is zero.
+fn fuse_correlated(
+    a: &GazeRay,
+    b: &GazeRay,
+    cab: &Matrix2<f64>,
+) -> Option<(Matrix2<f64>, Vector2<f64>)> {
+    let ca = a.angular_cov;
+    let cb = b.angular_cov;
+    let d = (ca + cb - cab - cab.transpose()).try_inverse()?;
+    let gain = (ca - cab) * d;
+    let theta_a = yaw_pitch_from_direction(&a.direction);
+    let theta_b = yaw_pitch_from_direction(&b.direction);
+    let theta = theta_a + gain * (theta_b - theta_a);
+    let angular_cov = ca - gain * (ca - cab).transpose();
+    Some(((angular_cov + angular_cov.transpose()) * 0.5, theta))
+}
+
+/// Inverse-covariance fusion of two rays of the same eye; `None` if a covariance is singular.
+/// `shared_cov` is `Cov(a, b)`: `None` fuses `a` and `b` as independent measurements; `Some`
+/// runs the generalised least-squares combination that accounts for the correlation instead
+/// (both rays derive their direction from the same measured eye centre).
+pub fn fuse_inverse_covariance(
+    a: &GazeRay,
+    b: &GazeRay,
+    shared_cov: Option<&Matrix2<f64>>,
+) -> Option<GazeRay> {
+    let (angular_cov, theta) = match shared_cov {
+        None => {
+            let (ia, ib) = (a.angular_cov.try_inverse()?, b.angular_cov.try_inverse()?);
+            let angular_cov = (ia + ib).try_inverse()?;
+            let theta = angular_cov
+                * (ia * yaw_pitch_from_direction(&a.direction)
+                    + ib * yaw_pitch_from_direction(&b.direction));
+            (angular_cov, theta)
+        }
+        Some(cross) => fuse_correlated(a, b, cross)?,
+    };
     let eps = Matrix3::identity() * 1e-9;
     let (oa, ob) = (
         (a.origin_cov + eps).try_inverse()?,
@@ -1161,7 +1247,7 @@ mod tests {
         let a = yaw_pitch_ray(1.0, 0.0, cov);
         let b = yaw_pitch_ray(-1.0, 0.0, cov);
 
-        let fused = fuse_inverse_covariance(&a, &b).expect("covariances invertible");
+        let fused = fuse_inverse_covariance(&a, &b, None).expect("covariances invertible");
 
         let angles = yaw_pitch_from_direction(&fused.direction);
         assert_abs_diff_eq!(angles.x, 0.0, epsilon = 1e-12);
@@ -1182,7 +1268,7 @@ mod tests {
         let a = yaw_pitch_ray(yaw_a, 0.0, cov_a);
         let b = yaw_pitch_ray(yaw_b, 0.0, cov_b);
 
-        let fused = fuse_inverse_covariance(&a, &b).expect("covariances invertible");
+        let fused = fuse_inverse_covariance(&a, &b, None).expect("covariances invertible");
 
         let angles = yaw_pitch_from_direction(&fused.direction);
         let expected = (9.0 * yaw_a.to_radians() + 1.0 * yaw_b.to_radians()) / 10.0;
@@ -1206,7 +1292,7 @@ mod tests {
             let a = yaw_pitch_ray(yaw_a.to_degrees(), 0.0, cov_a);
             let b = yaw_pitch_ray(yaw_b.to_degrees(), 0.0, cov_b);
 
-            if let Some(fused) = fuse_inverse_covariance(&a, &b) {
+            if let Some(fused) = fuse_inverse_covariance(&a, &b, None) {
                 let det_fused = fused.angular_cov.determinant();
                 let det_a = cov_a.determinant();
                 let det_b = cov_b.determinant();
@@ -2660,8 +2746,9 @@ mod tests {
         let a = yaw_pitch_ray(0.0, 0.0, Matrix2::identity());
         let b = yaw_pitch_ray(1.0, 0.0, Matrix2::zeros());
 
-        let (fused, logs) =
-            capture_logs(tracing::Level::DEBUG, || fuse_or_log(Side::Right, &a, &b));
+        let (fused, logs) = capture_logs(tracing::Level::DEBUG, || {
+            fuse_or_log(Side::Right, &a, &b, None)
+        });
 
         assert!(fused.is_none());
         let rec = logs
@@ -2732,9 +2819,163 @@ mod tests {
         let reference = yaw_pitch_ray(0.0, 0.0, cov_b);
         let candidate = yaw_pitch_ray(0.02f64.to_degrees(), 0.01f64.to_degrees(), cov_a);
 
-        let d2 = mahalanobis2(&candidate, &reference).expect("covariance sum is invertible");
+        let d2 = mahalanobis2(&candidate, &reference, None).expect("covariance sum is invertible");
 
         assert_abs_diff_eq!(d2, 1.2, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_mahalanobis_with_shared_centre_subtracts_cross_term() {
+        let cov = Matrix2::identity() * 1e-4;
+        let candidate = yaw_pitch_ray(1.0, 0.0, cov);
+        let reference = yaw_pitch_ray(0.0, 0.0, cov);
+        let cross = Matrix2::identity() * 0.6e-4;
+
+        let d2_independent = mahalanobis2(&candidate, &reference, None).expect("sum invertible");
+        let d2_corrected =
+            mahalanobis2(&candidate, &reference, Some(&cross)).expect("corrected cov invertible");
+
+        assert!(
+            d2_corrected > d2_independent,
+            "d2_independent {d2_independent} d2_corrected {d2_corrected}"
+        );
+
+        let delta = yaw_pitch_from_direction(&candidate.direction)
+            - yaw_pitch_from_direction(&reference.direction);
+        let expected_cov = cov + cov - cross - cross.transpose();
+        let expected_d2 =
+            (delta.transpose() * expected_cov.try_inverse().expect("invertible") * delta).x;
+        assert_abs_diff_eq!(d2_corrected, expected_d2, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_rays_without_shared_centre_keep_independent_gate() {
+        let rig = test_rig();
+        let cam = rig.camera("ir").expect("rig has an ir camera");
+        let params = EyeParams::default().without_kappa();
+        let centre = EyeCentre {
+            position: EYE_CENTRES[0],
+            cov: Matrix3::identity() * 0.01,
+        };
+        let glint_px = Measured::new(Point2::new(305.0, 178.0), 1.0).expect("valid sigma");
+        let reference = gaze_ray_pccr(
+            Side::Right,
+            &centre,
+            cam,
+            &Measured::new(Point2::new(300.0, 180.0), 1.0).expect("valid sigma"),
+            &glint_px,
+            &params,
+            None,
+            Timestamp::from_nanos(0),
+        )
+        .expect("pccr ray computed");
+        let candidate = gaze_ray_pccr(
+            Side::Right,
+            &centre,
+            cam,
+            &Measured::new(Point2::new(302.0, 181.0), 1.0).expect("valid sigma"),
+            &glint_px,
+            &params,
+            None,
+            Timestamp::from_nanos(0),
+        )
+        .expect("pccr ray computed");
+
+        let d2 = mahalanobis2(&candidate, &reference, None).expect("covariance sum is invertible");
+        let delta = yaw_pitch_from_direction(&candidate.direction)
+            - yaw_pitch_from_direction(&reference.direction);
+        let cov = candidate.angular_cov + reference.angular_cov;
+        let expected = (delta.transpose() * cov.try_inverse().expect("invertible") * delta).x;
+        assert_abs_diff_eq!(d2, expected, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_fused_inverse_covariance_with_shared_centre_is_not_overconfident() {
+        let base = Matrix2::identity() * 1e-4;
+        let a = yaw_pitch_ray(1.0, 0.0, base);
+        let b = yaw_pitch_ray(1.1, 0.0, base);
+        let cross = base * 0.999;
+
+        let fused =
+            fuse_inverse_covariance(&a, &b, Some(&cross)).expect("joint covariance invertible");
+        let independent =
+            fuse_inverse_covariance(&a, &b, None).expect("independent sum invertible");
+
+        assert!(
+            fused.angular_cov.determinant() >= base.determinant() * 0.9,
+            "fused det {} base det {}",
+            fused.angular_cov.determinant(),
+            base.determinant()
+        );
+        assert!(
+            fused.angular_cov.determinant() > independent.angular_cov.determinant(),
+            "fused det {} independent det {}",
+            fused.angular_cov.determinant(),
+            independent.angular_cov.determinant()
+        );
+    }
+
+    #[test]
+    fn test_fuse_inverse_covariance_matches_closed_form_gls_with_asymmetric_cross() {
+        use nalgebra::{DMatrix, DVector};
+
+        let ca = Matrix2::new(4e-4, 0.5e-4, 0.5e-4, 2e-4);
+        let cb = Matrix2::new(3e-4, -0.3e-4, -0.3e-4, 1.5e-4);
+        let cab = Matrix2::new(1.0e-4, 0.3e-4, -0.2e-4, 0.5e-4);
+        let a = yaw_pitch_ray(1.0, 0.5, ca);
+        let b = yaw_pitch_ray(0.8, 0.6, cb);
+
+        let fused =
+            fuse_inverse_covariance(&a, &b, Some(&cab)).expect("joint covariance invertible");
+
+        let mut sigma = DMatrix::<f64>::zeros(4, 4);
+        for r in 0..2 {
+            for c in 0..2 {
+                sigma[(r, c)] = ca[(r, c)];
+                sigma[(r, c + 2)] = cab[(r, c)];
+                sigma[(r + 2, c)] = cab[(c, r)];
+                sigma[(r + 2, c + 2)] = cb[(r, c)];
+            }
+        }
+        let sigma_inv = sigma.try_inverse().expect("joint covariance invertible");
+
+        let mut h = DMatrix::<f64>::zeros(4, 2);
+        h[(0, 0)] = 1.0;
+        h[(1, 1)] = 1.0;
+        h[(2, 0)] = 1.0;
+        h[(3, 1)] = 1.0;
+
+        let theta_a = yaw_pitch_from_direction(&a.direction);
+        let theta_b = yaw_pitch_from_direction(&b.direction);
+        let z = DVector::from_row_slice(&[theta_a.x, theta_a.y, theta_b.x, theta_b.y]);
+
+        let normal = h.transpose() * &sigma_inv * &h;
+        let cov_closed = normal.try_inverse().expect("normal matrix invertible");
+        let theta_closed = &cov_closed * h.transpose() * &sigma_inv * &z;
+
+        let fused_theta = yaw_pitch_from_direction(&fused.direction);
+        assert_abs_diff_eq!(fused_theta.x, theta_closed[0], epsilon = 1e-9);
+        assert_abs_diff_eq!(fused_theta.y, theta_closed[1], epsilon = 1e-9);
+        assert_abs_diff_eq!(
+            fused.angular_cov[(0, 0)],
+            cov_closed[(0, 0)],
+            epsilon = 1e-9
+        );
+        assert_abs_diff_eq!(
+            fused.angular_cov[(0, 1)],
+            cov_closed[(0, 1)],
+            epsilon = 1e-9
+        );
+        assert_abs_diff_eq!(
+            fused.angular_cov[(1, 0)],
+            cov_closed[(1, 0)],
+            epsilon = 1e-9
+        );
+        assert_abs_diff_eq!(
+            fused.angular_cov[(1, 1)],
+            cov_closed[(1, 1)],
+            epsilon = 1e-9
+        );
     }
 
     #[test]
@@ -2820,7 +3061,7 @@ mod tests {
                 .expect("rgb reference for side")
                 .ray
                 .clone();
-            let d2 = mahalanobis2(selected_ray, &rgb_ref).expect("mahalanobis2 computed");
+            let d2 = mahalanobis2(selected_ray, &rgb_ref, None).expect("mahalanobis2 computed");
             assert!(
                 d2 <= 9.21,
                 "side {side:?} source {source:?}: selection pulled away from the RgbOnly \
@@ -2830,7 +3071,7 @@ mod tests {
     }
 
     #[test]
-    fn test_seeded_ir_covariance_passes_gate_and_dominates_selection() {
+    fn test_wandering_seeded_ir_rejected_at_90mm() {
         let rig = test_rig();
         let screen_from_head = frontal_screen_from_head();
         let target = Point2::new(100.0, 50.0);
@@ -2858,18 +3099,28 @@ mod tests {
             .estimate_detailed(&[rgb.clone(), ir], &rig)
             .expect("estimate succeeds");
 
-        let ir_decision = estimator
+        for (source, _) in &selected {
+            assert!(
+                *source != FusedSource::IrOnly,
+                "the raw seeded IrOnly candidate should not win selection on merit at a 90mm \
+                 wander, got {source:?}"
+            );
+        }
+
+        let right_ir_decision = estimator
             .decisions()
             .iter()
-            .find(|d| d.source == FusedSource::IrOnly)
-            .expect("IrOnly decision present");
-        assert!(ir_decision.accepted, "{ir_decision:?}");
-        let ic_decision = estimator
-            .decisions()
-            .iter()
-            .find(|d| d.source == FusedSource::InverseCovariance)
-            .expect("InverseCovariance decision present");
-        assert!(ic_decision.accepted, "{ic_decision:?}");
+            .find(|d| d.side == Side::Right && d.source == FusedSource::IrOnly)
+            .expect("right IrOnly decision present");
+        assert!(!right_ir_decision.accepted, "{right_ir_decision:?}");
+        assert!(
+            right_ir_decision
+                .mahalanobis2
+                .expect("mahalanobis2 computed")
+                > 9.21,
+            "{:?}",
+            right_ir_decision.mahalanobis2
+        );
 
         let mut reference = LandmarkEstimator::new(LandmarkOptions {
             apply_kappa: false,
@@ -2879,34 +3130,23 @@ mod tests {
             .estimate_frame(&rgb, &rig)
             .expect("estimate succeeds")
             .expect("frame present");
-        for (source, selected_ray) in &selected {
-            assert_eq!(
-                *source,
-                FusedSource::InverseCovariance,
-                "the seeded IrOnly candidate's landmark covariance is tighter than the declared \
-                 ambiguity it replaces, so it now outweighs the RgbOnly reference in the \
-                 inverse-covariance fusion instead of losing selection on merit"
-            );
-            let side = selected_ray.side.expect("per-eye ray");
-            let rgb_ref = frame
-                .eyes
-                .iter()
-                .find(|e| e.side == side)
-                .expect("rgb reference for side")
-                .ray
-                .clone();
-            let error_deg = angle_deg(&selected_ray.direction, &rgb_ref.direction);
-            let (lo, hi) = match side {
-                Side::Right => (7.0, 9.0),
-                Side::Left => (4.0, 6.0),
-            };
-            assert!(
-                (lo..=hi).contains(&error_deg),
-                "side {side:?} source {source:?}: expected the seeded ir candidate to pull the \
-                 fused selection away from the RgbOnly reference by roughly the measured error \
-                 (error = {error_deg} deg, expected in [{lo}, {hi}])"
-            );
-        }
+        let (_, right_selected) = selected
+            .iter()
+            .find(|(_, ray)| ray.side == Some(Side::Right))
+            .expect("right ray selected");
+        let right_rgb_ref = frame
+            .eyes
+            .iter()
+            .find(|e| e.side == Side::Right)
+            .expect("right rgb reference")
+            .ray
+            .clone();
+        let error_deg = angle_deg(&right_selected.direction, &right_rgb_ref.direction);
+        assert!(
+            error_deg <= 3.0,
+            "right eye: selection pulled away from the RgbOnly reference despite the rejected \
+             wandering ir candidate (error = {error_deg} deg)"
+        );
     }
 
     #[test]

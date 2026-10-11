@@ -5,10 +5,11 @@ use eye_core::{
 };
 use eye_geometry::camera::pixel_ray;
 use eye_geometry::eyeball::{
-    EyeCentre, EyeParams, gaze_ray, gaze_ray_pccr, optical_axis, ray_sphere_near,
+    EyeCentre, EyeParams, gaze_ray, gaze_ray_centre_jacobian, gaze_ray_pccr,
+    gaze_ray_pccr_centre_jacobian, optical_axis, ray_sphere_near,
 };
 use eye_geometry::screen::intersect_plane;
-use nalgebra::{Matrix3, Point2, Point3, Unit, UnitQuaternion, Vector3};
+use nalgebra::{Matrix2x3, Matrix3, Point2, Point3, Unit, UnitQuaternion, Vector3};
 use serde::Deserialize;
 
 use crate::EstimateError;
@@ -73,6 +74,7 @@ pub struct IrPupilEstimator {
     seed_pending: bool,
     last_optical: Option<[Unit<Vector3<f64>>; 2]>,
     pub(crate) last_reanchor: Option<Trigger>,
+    last_centre_jacobian: Option<[Matrix2x3<f64>; 2]>,
 }
 
 impl IrPupilEstimator {
@@ -88,6 +90,7 @@ impl IrPupilEstimator {
             seed_pending: false,
             last_optical: None,
             last_reanchor: None,
+            last_centre_jacobian: None,
         }
     }
 
@@ -186,15 +189,31 @@ impl IrPupilEstimator {
             self.last_optical = Some(g);
         }
 
-        let rays: Vec<GazeRay> = self
-            .rays(&pair, cam, &anchor)
-            .into_iter()
-            .flatten()
-            .collect();
+        let built = self.rays(&pair, cam, &anchor);
+        self.last_centre_jacobian = if self.last_reanchor == Some(Trigger::Seeded) {
+            match (&built[0], &built[1]) {
+                (Some((_, Some(right))), Some((_, Some(left)))) => Some([*right, *left]),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let rays: Vec<GazeRay> = built.into_iter().flatten().map(|(ray, _)| ray).collect();
         for ray in &rays {
             trace_ray(Self::NAME, ray);
         }
         Ok(rays)
+    }
+
+    /// The right/left Jacobian of `(yaw, pitch)` with respect to the shared `EyeCentre`
+    /// position, from the last `estimate_rays` call whose anchor came from `seed_anchor`
+    /// (`None` otherwise, since the centre is then not shared with the landmark ray).
+    pub(crate) fn last_centre_jacobian(&self, side: Side) -> Option<Matrix2x3<f64>> {
+        let [right, left] = self.last_centre_jacobian?;
+        Some(match side {
+            Side::Right => right,
+            Side::Left => left,
+        })
     }
 
     /// Dead-reckoned anchor from the screen-centre assumption (or the last optical axis); clears
@@ -236,12 +255,15 @@ impl IrPupilEstimator {
         ])
     }
 
+    /// Each side's ray, plus the Jacobian of its `(yaw, pitch)` with respect to the shared
+    /// `EyeCentre` position (`None` if propagation is degenerate), for the caller to attach to
+    /// `last_centre_jacobian` when `anchor` is seeded from the landmark frame.
     fn rays(
         &self,
         pair: &PupilPair,
         cam: &CameraModel,
         anchor: &[Point3<f64>; 2],
-    ) -> [Option<GazeRay>; 2] {
+    ) -> [Option<(GazeRay, Option<Matrix2x3<f64>>)>; 2] {
         let params = self.params.effective(self.options.apply_kappa);
         let a = self.options.anchor_sigma_mm;
         let d = self.options.origin_ambiguity_mm;
@@ -264,7 +286,7 @@ impl IrPupilEstimator {
                 }
                 None => gaze_ray(side, &centre, cam, px, &params, viewer, pair.timestamp),
             };
-            result
+            let ray = result
                 .inspect_err(|e| {
                     tracing::debug!(
                         { field::REASON } = "gaze_ray_failed",
@@ -273,7 +295,14 @@ impl IrPupilEstimator {
                         "gaze ray failed"
                     );
                 })
-                .ok()
+                .ok()?;
+            let jacobian = match glint {
+                Some(g) => {
+                    gaze_ray_pccr_centre_jacobian(side, &centre, cam, px, g, &params, viewer)
+                }
+                None => gaze_ray_centre_jacobian(side, &centre, cam, px, &params, viewer),
+            };
+            Some((ray, jacobian))
         };
         [
             ray_for(Side::Right, 0, anchor[0], &pair.right, &pair.right_glint),
@@ -550,13 +579,14 @@ mod tests {
                     ),
             ];
             let rays = estimator.rays(&noisy_pair, cam, &noisy_anchor);
-            let right_ray = rays[0].clone().expect("right ray computed");
+            let right_ray = rays[0].clone().expect("right ray computed").0;
             samples.push(yaw_pitch_from_direction(&right_ray.direction));
         }
 
         let predicted = estimator.rays(&base_pair, cam, &EYE_CENTRES)[0]
             .clone()
             .expect("right ray computed")
+            .0
             .angular_cov;
 
         let mut sum = Vector2::zeros();
@@ -614,6 +644,7 @@ mod tests {
             estimator.rays(&pair_with_sigma, cam, &EYE_CENTRES)[0]
                 .clone()
                 .expect("right ray computed")
+                .0
                 .angular_cov
         };
 
@@ -640,7 +671,7 @@ mod tests {
 
         let rays = estimator.rays(&pair, cam, &EYE_CENTRES);
         let expected = Matrix3::from_diagonal(&Vector3::new(25.25, 25.25, 27.25));
-        for ray in rays.map(|r| r.expect("ray computed")) {
+        for (ray, _) in rays.map(|r| r.expect("ray computed")) {
             assert_abs_diff_eq!(ray.origin_cov, expected, epsilon = 1e-12);
         }
     }

@@ -6,11 +6,13 @@ use std::f64::consts::PI;
 
 use eye_core::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
 use eye_core::{CameraModel, GazeRay, Measured, Side, Timestamp};
-use nalgebra::{Point2, Point3, SVector, Unit, UnitQuaternion, Vector2, Vector3, Vector5};
+use nalgebra::{
+    Matrix2x3, Point2, Point3, SVector, Unit, UnitQuaternion, Vector2, Vector3, Vector5,
+};
 
 use crate::GeometryError;
 use crate::camera::pixel_ray;
-use crate::uncertainty::{Cov3, block_diag, isotropic2, propagate_fn};
+use crate::uncertainty::{Cov3, block_diag, isotropic2, numeric_jacobian, propagate_fn};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Kappa {
@@ -206,6 +208,35 @@ pub fn gaze_ray(
     })
 }
 
+/// Jacobian of the pupil-sphere ray's `(yaw, pitch)` with respect to `centre.position`, holding
+/// `pupil_px` fixed. Lets a caller that builds two rays from the same measured eye centre (an
+/// ir-pupil ray seeded from the landmark frame) account for the centre error they share.
+pub fn gaze_ray_centre_jacobian(
+    side: Side,
+    centre: &EyeCentre,
+    camera: &CameraModel,
+    pupil_px: &Measured<Point2<f64>>,
+    params: &EyeParams,
+    screen_from_viewer: Option<&UnitQuaternion<f64>>,
+) -> Option<Matrix2x3<f64>> {
+    let viewer = screen_from_viewer
+        .copied()
+        .unwrap_or_else(UnitQuaternion::identity);
+    let (o, d) = pixel_ray(camera, pupil_px.value()).ok()?;
+    let g = |e: &Vector3<f64>| -> Option<Vector2<f64>> {
+        let e = Point3::from(*e);
+        let p = ray_sphere_near(&o, &d, &e, params.rotation_to_pupil_mm);
+        let opt = optical_axis(&e, &p)?;
+        Some(yaw_pitch_from_direction(&visual_axis(
+            &opt,
+            &params.kappa,
+            side,
+            &viewer,
+        )))
+    };
+    numeric_jacobian(g, &centre.position.coords)
+}
+
 /// Glint-referenced ray: the cornea centre lies on the glint ray at `rotation_to_cornea_mm()`
 /// from `centre`, the pupil on the pupil ray at `cornea_to_pupil_mm()` from the cornea centre.
 /// If the glint ray misses the cornea sphere, `ray_sphere_near` returns the nearest point on it
@@ -262,6 +293,38 @@ pub fn gaze_ray_pccr(
         origin_cov: centre.cov,
         head_rotation: screen_from_viewer.copied(),
     })
+}
+
+/// Jacobian of the glint-referenced ray's `(yaw, pitch)` with respect to `centre.position`,
+/// holding `pupil_px` and `glint_px` fixed. See [`gaze_ray_centre_jacobian`].
+#[allow(clippy::too_many_arguments)]
+pub fn gaze_ray_pccr_centre_jacobian(
+    side: Side,
+    centre: &EyeCentre,
+    camera: &CameraModel,
+    pupil_px: &Measured<Point2<f64>>,
+    glint_px: &Measured<Point2<f64>>,
+    params: &EyeParams,
+    screen_from_viewer: Option<&UnitQuaternion<f64>>,
+) -> Option<Matrix2x3<f64>> {
+    let viewer = screen_from_viewer
+        .copied()
+        .unwrap_or_else(UnitQuaternion::identity);
+    let (o, u) = pixel_ray(camera, pupil_px.value()).ok()?;
+    let (_, v) = pixel_ray(camera, glint_px.value()).ok()?;
+    let g = |e: &Vector3<f64>| -> Option<Vector2<f64>> {
+        let e = Point3::from(*e);
+        let c = cornea_centre_from_coaxial_glint(&o, &v, &e, params);
+        let p = ray_sphere_near(&o, &u, &c, params.cornea_to_pupil_mm());
+        let opt = optical_axis(&c, &p)?;
+        Some(yaw_pitch_from_direction(&visual_axis(
+            &opt,
+            &params.kappa,
+            side,
+            &viewer,
+        )))
+    };
+    numeric_jacobian(g, &centre.position.coords)
 }
 
 #[cfg(test)]
