@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use eye_core::log::field;
-use eye_core::observation::{SCHEME_MEDIAPIPE_478, mediapipe478};
+use eye_core::observation::{LandmarkScheme, mediapipe478};
 use eye_core::stage::{GazeEstimator, StageError};
 use eye_core::{
     CameraId, CameraModel, FaceObservation, GazeRay, Measured, Observations, RaySource, Rig, Side,
@@ -102,7 +102,7 @@ impl LandmarkEstimator {
         let Some(face) = obs
             .face
             .as_ref()
-            .filter(|f| f.scheme == SCHEME_MEDIAPIPE_478)
+            .filter(|f| f.scheme == LandmarkScheme::MEDIAPIPE_478)
         else {
             return Ok(None);
         };

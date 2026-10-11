@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use eye_core::image::GrayView;
 use eye_core::log::field;
-use eye_core::observation::SCHEME_IR_PUPIL_PAIR;
+use eye_core::observation::LandmarkScheme;
 use eye_core::stage::{Detector, StageError};
 use eye_core::{
     CameraId, Ellipse2, EyeObservation, FaceObservation, Frame, FrameSet, Illumination, Measured,
@@ -350,7 +350,7 @@ fn face_from_pupils(eyes: [EyeObservation; 2]) -> FaceObservation {
         .filter_map(|e| e.pupil.map(|p| p.value().center()))
         .collect();
     FaceObservation {
-        scheme: SCHEME_IR_PUPIL_PAIR,
+        scheme: LandmarkScheme::IR_PUPIL_PAIR,
         landmarks,
         eyes: eyes.into(),
     }
@@ -1215,7 +1215,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].timestamp, Timestamp::from_nanos(1_068_000_000));
         let face = out[0].face.as_ref().expect("face detected");
-        assert_eq!(face.scheme, SCHEME_IR_PUPIL_PAIR);
+        assert_eq!(face.scheme, LandmarkScheme::IR_PUPIL_PAIR);
         assert_eq!(face.eyes.len(), 2);
         assert_eq!(face.eyes[0].side, Side::Right);
         assert_eq!(face.eyes[1].side, Side::Left);

@@ -13,7 +13,7 @@ use eye_capture::{CaptureError, FrameSource, IlluminationMeta, MetaRecord};
 use eye_core::{
     CameraId, CameraInfo, Ellipse2, EyeObservation, FaceObservation, Frame, FrameHeader, FrameSet,
     Illumination, Measured, Observations, PixelFormat, Side, Timestamp,
-    observation::SCHEME_IR_PUPIL_PAIR,
+    observation::LandmarkScheme,
     stage::{Detector, StageError},
 };
 use eye_platform::{
@@ -912,7 +912,7 @@ impl TestCase for ReadEmitterCase {
 }
 
 /// Accepts Gray8 frames whose illumination is in `accepts` (empty = all); finds one Left eye with a
-/// pupil circle of radius 3 at `(100.0 + dx(seq), 50.0)` (sigma 0.5) in a `FaceObservation { scheme: SCHEME_IR_PUPIL_PAIR, landmarks: vec![], eyes }`
+/// pupil circle of radius 3 at `(100.0 + dx(seq), 50.0)` (sigma 0.5) in a `FaceObservation { scheme: LandmarkScheme::IR_PUPIL_PAIR, landmarks: vec![], eyes }`
 /// when the frame's first byte is > 20, else returns `Observations::empty`; every `fail_every`-th call returns
 /// `Err(StageError::Failed("fake".into()))`.
 #[derive(Debug)]
@@ -960,7 +960,7 @@ impl Detector for FakeDetector {
                         camera: h.camera.clone(),
                         timestamp: h.timestamp,
                         face: Some(FaceObservation {
-                            scheme: SCHEME_IR_PUPIL_PAIR,
+                            scheme: LandmarkScheme::IR_PUPIL_PAIR,
                             landmarks: vec![],
                             eyes: vec![eye],
                         }),

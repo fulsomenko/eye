@@ -1,7 +1,7 @@
 //! 3D face template keyed by MediaPipe landmark index, for PnP head-pose solves.
 
 use eye_core::Measured;
-use eye_core::observation::SCHEME_MEDIAPIPE_478;
+use eye_core::observation::LandmarkScheme;
 use nalgebra::{Point2, Point3};
 
 use crate::GeometryError;
@@ -11,7 +11,7 @@ pub type Correspondences = (Vec<Point3<f64>>, Vec<Measured<Point2<f64>>>);
 
 #[derive(Debug, Clone, Copy)]
 pub struct FaceTemplate {
-    pub scheme: &'static str,
+    pub scheme: LandmarkScheme,
     pub points: &'static [(usize, [f64; 3])], // (landmark index, head-frame mm)
 }
 
@@ -35,7 +35,7 @@ pub struct FaceTemplate {
 /// commit f6988c4769278bde600efd488dfc8645432dc92b (sha256 8bac8044…e618), Apache-2.0,
 /// converted with head = 10 · (x, −y, −z) mm. See crates/eye-geometry/NOTICE.
 pub const MEDIAPIPE_RIGID: FaceTemplate = FaceTemplate {
-    scheme: SCHEME_MEDIAPIPE_478,
+    scheme: LandmarkScheme::MEDIAPIPE_478,
     points: &[
         (1, [0.000, 11.269, -74.756]),
         (4, [0.000, 4.632, -75.866]),
@@ -123,6 +123,11 @@ mod tests {
         let p362 = MEDIAPIPE_RIGID.point(362).unwrap();
         let inner = (p133 - p362).norm();
         assert!((25.0..=40.0).contains(&inner), "inner canthi = {inner}");
+    }
+
+    #[test]
+    fn test_face_template_scheme_is_mediapipe() {
+        assert_eq!(MEDIAPIPE_RIGID.scheme, LandmarkScheme::MEDIAPIPE_478);
     }
 
     #[test]

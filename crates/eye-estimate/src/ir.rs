@@ -1,5 +1,5 @@
 use eye_core::log::field;
-use eye_core::observation::SCHEME_IR_PUPIL_PAIR;
+use eye_core::observation::LandmarkScheme;
 use eye_core::{
     CameraId, CameraModel, EyeObservation, FaceObservation, Measured, Observations, Side, Timestamp,
 };
@@ -27,7 +27,7 @@ impl PupilPair {
             .iter()
             .filter_map(|o| {
                 let face = o.face.as_ref()?;
-                if face.scheme != SCHEME_IR_PUPIL_PAIR {
+                if face.scheme != LandmarkScheme::IR_PUPIL_PAIR {
                     return None;
                 }
                 let (Some(right), Some(left)) = (
@@ -141,7 +141,6 @@ pub fn binocular_pupils(
 
 #[cfg(test)]
 mod tests {
-    use eye_core::observation::SCHEME_MEDIAPIPE_478;
     use eye_core::{Ellipse2, EyeObservation};
     use eye_geometry::eyeball::EyeParams;
     use eye_log::testing::capture_logs;
@@ -236,7 +235,7 @@ mod tests {
             camera: CameraId::new("ir"),
             timestamp: Timestamp::from_nanos(0),
             face: Some(FaceObservation {
-                scheme: SCHEME_IR_PUPIL_PAIR,
+                scheme: LandmarkScheme::IR_PUPIL_PAIR,
                 landmarks: Vec::new(),
                 eyes: vec![right_eye],
             }),
@@ -272,7 +271,7 @@ mod tests {
             camera: CameraId::new("rgb"),
             timestamp: Timestamp::from_nanos(50_000_000),
             face: Some(FaceObservation {
-                scheme: SCHEME_MEDIAPIPE_478,
+                scheme: LandmarkScheme::MEDIAPIPE_478,
                 landmarks: Vec::new(),
                 eyes: Vec::new(),
             }),

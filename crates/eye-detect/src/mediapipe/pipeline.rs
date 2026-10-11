@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use eye_core::log::field;
-use eye_core::observation::SCHEME_MEDIAPIPE_478;
+use eye_core::observation::LandmarkScheme;
 use eye_core::stage::{Detector, StageError};
 use eye_core::{CameraId, FaceObservation, FrameSet, Illumination, Observations, PixelFormat};
 
@@ -111,7 +111,7 @@ impl<R: MediaPipeRuntime> MediaPipeDetector<R> {
         }
 
         Ok(Some(FaceObservation {
-            scheme: SCHEME_MEDIAPIPE_478,
+            scheme: LandmarkScheme::MEDIAPIPE_478,
             landmarks,
             eyes: eyes.into(),
         }))
@@ -286,7 +286,7 @@ mod tests {
             .detect_image(&camera, &image)
             .unwrap()
             .expect("face expected");
-        assert_eq!(face.scheme, SCHEME_MEDIAPIPE_478);
+        assert_eq!(face.scheme, LandmarkScheme::MEDIAPIPE_478);
         assert_eq!(face.landmarks.len(), crate::mediapipe::NUM_LANDMARKS);
         assert_eq!(face.eyes.len(), 2);
 

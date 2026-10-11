@@ -310,7 +310,7 @@ impl GazeEstimator for IrPupilEstimator {
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
-    use eye_core::observation::{SCHEME_IR_PUPIL_PAIR, SCHEME_MEDIAPIPE_478};
+    use eye_core::observation::LandmarkScheme;
     use eye_core::{CameraId, Ellipse2, EyeObservation, FaceObservation, Measured, Timestamp};
     use eye_geometry::angles::yaw_pitch_from_direction;
     use eye_geometry::camera::Intrinsics;
@@ -671,7 +671,7 @@ mod tests {
             camera: CameraId::new("ir"),
             timestamp: Timestamp::from_nanos(0),
             face: Some(FaceObservation {
-                scheme: SCHEME_IR_PUPIL_PAIR,
+                scheme: LandmarkScheme::IR_PUPIL_PAIR,
                 landmarks: Vec::new(),
                 eyes: vec![right_eye],
             }),
@@ -691,7 +691,7 @@ mod tests {
             camera: CameraId::new("rgb"),
             timestamp: Timestamp::from_nanos(0),
             face: Some(FaceObservation {
-                scheme: SCHEME_MEDIAPIPE_478,
+                scheme: LandmarkScheme::MEDIAPIPE_478,
                 landmarks: Vec::new(),
                 eyes: Vec::new(),
             }),

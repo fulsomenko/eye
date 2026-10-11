@@ -1,6 +1,6 @@
 use std::f64::consts::PI;
 
-use eye_core::observation::{SCHEME_IR_PUPIL_PAIR, SCHEME_MEDIAPIPE_478, mediapipe478};
+use eye_core::observation::{LandmarkScheme, mediapipe478};
 use eye_core::{
     CameraId, CameraModel, Ellipse2, EyeCorners, EyeObservation, FaceObservation, Measured,
     Observations, OutputId, Rig, ScreenModel, Side, Timestamp,
@@ -99,7 +99,7 @@ pub(crate) fn synthetic_ir_observation_at(
         camera: CameraId::new("ir"),
         timestamp: Timestamp::from_nanos(0),
         face: Some(FaceObservation {
-            scheme: SCHEME_IR_PUPIL_PAIR,
+            scheme: LandmarkScheme::IR_PUPIL_PAIR,
             landmarks: Vec::new(),
             eyes,
         }),
@@ -192,7 +192,7 @@ fn synthetic_pccr_observation_from_centres(
         camera: CameraId::new("ir"),
         timestamp: Timestamp::from_nanos(0),
         face: Some(FaceObservation {
-            scheme: SCHEME_IR_PUPIL_PAIR,
+            scheme: LandmarkScheme::IR_PUPIL_PAIR,
             landmarks: Vec::new(),
             eyes,
         }),
@@ -266,7 +266,7 @@ pub(crate) fn synthetic_eye_centres(
 /// projects into the "rgb" camera, fills 478 landmarks (template indices exact plus
 /// `N(0, landmark_noise_px)`; every other index at the projected head origin), and both eyes:
 /// corners at the projected template corners, iris at the pupil-sphere crossing towards
-/// `target_mm` plus `N(0, iris_noise_px)`. Scheme `SCHEME_MEDIAPIPE_478`, camera "rgb",
+/// `target_mm` plus `N(0, iris_noise_px)`. Scheme `LandmarkScheme::MEDIAPIPE_478`, camera "rgb",
 /// timestamp 0. Noise from `SplitMix64::new(seed)`.
 pub(crate) fn synthetic_rgb_observation(
     rig: &Rig,
@@ -347,7 +347,7 @@ pub(crate) fn synthetic_rgb_observation(
         camera: CameraId::new("rgb"),
         timestamp: Timestamp::from_nanos(0),
         face: Some(FaceObservation {
-            scheme: SCHEME_MEDIAPIPE_478,
+            scheme: LandmarkScheme::MEDIAPIPE_478,
             landmarks,
             eyes,
         }),

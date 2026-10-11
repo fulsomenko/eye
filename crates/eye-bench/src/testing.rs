@@ -17,7 +17,7 @@ use eye_core::stage::{Detector, GazeEstimator, StageError};
 use eye_core::{
     CameraId, CameraInfo, CameraModel, FaceObservation, Frame, FrameHeader, FrameSet, GazeRay,
     Illumination, Observations, OutputId, PixelFormat, RaySource, Rig, ScreenModel, SourcedRay,
-    Timestamp,
+    Timestamp, observation::LandmarkScheme,
 };
 use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
 use eye_geometry::screen::px_logical_to_mm;
@@ -242,7 +242,7 @@ impl Detector for NullDetector {
                 camera: f.header().camera.clone(),
                 timestamp: f.header().timestamp,
                 face: Some(eye_core::FaceObservation {
-                    scheme: "test",
+                    scheme: LandmarkScheme::new("test"),
                     landmarks: Vec::new(),
                     eyes: Vec::new(),
                 }),
@@ -343,7 +343,7 @@ impl Detector for TargetCodeDetector {
                     camera: f.header().camera.clone(),
                     timestamp: f.header().timestamp,
                     face: Some(FaceObservation {
-                        scheme: "test",
+                        scheme: LandmarkScheme::new("test"),
                         landmarks: vec![Point2::new(f64::from(code), 0.0)],
                         eyes: Vec::new(),
                     }),

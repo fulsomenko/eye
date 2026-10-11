@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use eye_core::log::field;
-use eye_core::observation::{SCHEME_IR_PUPIL_PAIR, SCHEME_MEDIAPIPE_478};
+use eye_core::observation::LandmarkScheme;
 use eye_core::stage::{GazeEstimator, StageError};
 use eye_core::{
     CameraModel, Ellipse2, EyeObservation, FaceObservation, GazeRay, Measured, Observations,
@@ -276,10 +276,10 @@ impl FusedEstimator {
     ) -> Result<Vec<(Side, FusedSource, GazeRay)>, EstimateError> {
         let rgb_obs = obs
             .iter()
-            .find(|o| matches!(&o.face, Some(f) if f.scheme == SCHEME_MEDIAPIPE_478));
+            .find(|o| matches!(&o.face, Some(f) if f.scheme == LandmarkScheme::MEDIAPIPE_478));
         let mut ir_pairs: Vec<Observations> = obs
             .iter()
-            .filter(|o| matches!(&o.face, Some(f) if f.scheme == SCHEME_IR_PUPIL_PAIR))
+            .filter(|o| matches!(&o.face, Some(f) if f.scheme == LandmarkScheme::IR_PUPIL_PAIR))
             .cloned()
             .collect();
         ir_pairs.sort_by_key(|o| o.timestamp);
@@ -930,11 +930,11 @@ pub fn interpolate_ir(
     let prev_face = prev
         .face
         .as_ref()
-        .filter(|f| f.scheme == SCHEME_IR_PUPIL_PAIR)?;
+        .filter(|f| f.scheme == LandmarkScheme::IR_PUPIL_PAIR)?;
     let next_face = next
         .face
         .as_ref()
-        .filter(|f| f.scheme == SCHEME_IR_PUPIL_PAIR)?;
+        .filter(|f| f.scheme == LandmarkScheme::IR_PUPIL_PAIR)?;
     let dt = next.timestamp.nanos_since(prev.timestamp);
     if dt <= 0 {
         return None;
@@ -982,7 +982,7 @@ pub fn interpolate_ir(
         camera: prev.camera.clone(),
         timestamp: t,
         face: Some(FaceObservation {
-            scheme: SCHEME_IR_PUPIL_PAIR,
+            scheme: LandmarkScheme::IR_PUPIL_PAIR,
             landmarks,
             eyes,
         }),
@@ -1252,7 +1252,7 @@ mod tests {
             camera: CameraId::new("ir"),
             timestamp: Timestamp::from_nanos((timestamp_ms * 1e6) as u64),
             face: Some(FaceObservation {
-                scheme: SCHEME_IR_PUPIL_PAIR,
+                scheme: LandmarkScheme::IR_PUPIL_PAIR,
                 landmarks: vec![Point2::new(right.0, right.1), Point2::new(left.0, left.1)],
                 eyes: vec![right_eye, left_eye],
             }),

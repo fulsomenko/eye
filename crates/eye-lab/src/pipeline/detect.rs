@@ -406,7 +406,7 @@ mod tests {
 
     use approx::assert_relative_eq;
     use eye_core::{
-        EyeObservation, FaceObservation, Illumination, Measured, observation::SCHEME_IR_PUPIL_PAIR,
+        EyeObservation, FaceObservation, Illumination, Measured, observation::LandmarkScheme,
     };
 
     use super::*;
@@ -433,7 +433,7 @@ mod tests {
             .unwrap(),
         );
         let face = FaceObservation {
-            scheme: SCHEME_IR_PUPIL_PAIR,
+            scheme: LandmarkScheme::IR_PUPIL_PAIR,
             landmarks: vec![],
             eyes: vec![eye],
         };

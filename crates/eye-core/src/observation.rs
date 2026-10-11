@@ -4,13 +4,34 @@ use nalgebra::Point2;
 
 use crate::{CameraId, CoreError, Timestamp};
 
-/// [`FaceObservation::scheme`] of the IR bright-pupil detector: `landmarks` holds the two pupil
-/// centres, the subject's right eye first; there is no face mesh.
-pub const SCHEME_IR_PUPIL_PAIR: &str = "ir-pupil-pair";
-/// [`FaceObservation::scheme`] of the MediaPipe Face Landmarker (478 points, iris 468..=477).
-pub const SCHEME_MEDIAPIPE_478: &str = "mediapipe-478";
+/// Landmark layout of a [`FaceObservation`]. An open set: a detector that emits a new layout
+/// adds a constant here; consumers compare by value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LandmarkScheme(&'static str);
 
-/// Layout of the MediaPipe Face Landmarker output named by [`SCHEME_MEDIAPIPE_478`].
+impl LandmarkScheme {
+    /// `landmarks` holds the two pupil centres, the subject's right eye first; there is no face
+    /// mesh.
+    pub const IR_PUPIL_PAIR: Self = Self("ir-pupil-pair");
+    /// MediaPipe Face Landmarker: 478 points, iris 468..=477 (see [`mediapipe478`]).
+    pub const MEDIAPIPE_478: Self = Self("mediapipe-478");
+
+    pub const fn new(name: &'static str) -> Self {
+        Self(name)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+impl std::fmt::Display for LandmarkScheme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// Layout of the MediaPipe Face Landmarker output named by [`LandmarkScheme::MEDIAPIPE_478`].
 pub mod mediapipe478 {
     pub const COUNT: usize = 478;
     pub const RIGHT_EYE_LATERAL: usize = 33;
@@ -199,8 +220,7 @@ impl EyeObservation {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FaceObservation {
-    /// Landmark layout: one of the `SCHEME_*` constants of this module.
-    pub scheme: &'static str,
+    pub scheme: LandmarkScheme,
     pub landmarks: Vec<Point2<f64>>,
     /// At most one per side.
     pub eyes: Vec<EyeObservation>,
@@ -355,7 +375,7 @@ mod tests {
     #[test]
     fn test_face_observation_eye_finds_side() {
         let face = FaceObservation {
-            scheme: "test",
+            scheme: LandmarkScheme::new("test"),
             landmarks: Vec::new(),
             eyes: vec![EyeObservation::new(Side::Right)],
         };
@@ -365,15 +385,23 @@ mod tests {
     }
 
     #[test]
-    fn test_scheme_constants_are_distinct_layout_names() {
-        assert_eq!(SCHEME_IR_PUPIL_PAIR, "ir-pupil-pair");
-        assert_eq!(SCHEME_MEDIAPIPE_478, "mediapipe-478");
+    fn test_landmark_scheme_values_are_distinct_and_display_their_name() {
+        assert_ne!(LandmarkScheme::IR_PUPIL_PAIR, LandmarkScheme::MEDIAPIPE_478);
+        assert_eq!(LandmarkScheme::MEDIAPIPE_478.as_str(), "mediapipe-478");
+        assert_eq!(
+            format!("{}", LandmarkScheme::IR_PUPIL_PAIR),
+            "ir-pupil-pair"
+        );
+        assert_eq!(
+            LandmarkScheme::new("mediapipe-478"),
+            LandmarkScheme::MEDIAPIPE_478
+        );
         let face = FaceObservation {
-            scheme: SCHEME_MEDIAPIPE_478,
+            scheme: LandmarkScheme::MEDIAPIPE_478,
             landmarks: Vec::new(),
             eyes: Vec::new(),
         };
-        assert_ne!(face.scheme, SCHEME_IR_PUPIL_PAIR);
+        assert_ne!(face.scheme, LandmarkScheme::IR_PUPIL_PAIR);
     }
 
     #[test]
