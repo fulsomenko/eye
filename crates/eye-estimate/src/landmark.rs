@@ -12,7 +12,7 @@ use eye_core::{
 };
 use eye_geometry::camera::{Intrinsics, pixel_ray};
 use eye_geometry::eyeball::{
-    EyeCentre, EyeParams, Kappa, eyeball_centre_in_head, gaze_ray, screen_from_viewer,
+    EyeCentre, EyeParams, eyeball_centre_in_head, gaze_ray, screen_from_viewer,
 };
 use eye_geometry::face_template::MEDIAPIPE_RIGID;
 use eye_geometry::pnp::{Pose, solve_pnp};
@@ -83,10 +83,14 @@ impl LandmarkEstimator {
         Ok(Self::new(parse_options(Self::NAME, table)?))
     }
 
-    /// Overrides the anatomical priors (bench sweeps of `corner_midpoint_to_rotation_mm`,
-    /// per-user profiles).
+    /// Overrides the anatomical priors.
     pub fn with_params(self, params: EyeParams) -> Self {
         Self { params, ..self }
+    }
+
+    /// `self.params` with kappa zeroed per `self.options.apply_kappa`.
+    pub fn effective_params(&self) -> EyeParams {
+        self.params.effective(self.options.apply_kappa)
     }
 
     /// Detailed result for one RGB observation; reused by `FusedEstimator`.
@@ -277,17 +281,7 @@ impl LandmarkEstimator {
             return None;
         }
 
-        let params = if self.options.apply_kappa {
-            self.params
-        } else {
-            EyeParams {
-                kappa: Kappa {
-                    alpha_rad: 0.0,
-                    beta_rad: 0.0,
-                },
-                ..self.params
-            }
-        };
+        let params = self.effective_params();
         let ray = gaze_ray(side, &centre, cam, &iris_px, &params, Some(viewer), at)
             .inspect_err(|e| {
                 tracing::debug!(

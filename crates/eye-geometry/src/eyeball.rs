@@ -58,6 +58,26 @@ impl EyeParams {
     pub fn rotation_to_iris_mm(&self) -> f64 {
         (self.globe_radius_mm.powi(2) - self.iris_radius_mm.powi(2)).sqrt()
     }
+
+    /// `self` with kappa zeroed: the visual axis coincides with the optical axis.
+    pub fn without_kappa(self) -> Self {
+        Self {
+            kappa: Kappa {
+                alpha_rad: 0.0,
+                beta_rad: 0.0,
+            },
+            ..self
+        }
+    }
+
+    /// `self` when `apply_kappa`, else `without_kappa()`.
+    pub fn effective(self, apply_kappa: bool) -> Self {
+        if apply_kappa {
+            self
+        } else {
+            self.without_kappa()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -281,6 +301,49 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn test_without_kappa_zeroes_only_kappa() {
+        let p = EyeParams {
+            globe_radius_mm: 13.0,
+            ..EyeParams::default()
+        }
+        .without_kappa();
+
+        assert_eq!(
+            p.kappa,
+            Kappa {
+                alpha_rad: 0.0,
+                beta_rad: 0.0
+            }
+        );
+        assert_abs_diff_eq!(p.globe_radius_mm, 13.0, epsilon = 1e-12);
+        let default = EyeParams::default();
+        assert_abs_diff_eq!(
+            p.rotation_to_apex_mm,
+            default.rotation_to_apex_mm,
+            epsilon = 1e-12
+        );
+        assert_abs_diff_eq!(
+            p.rotation_to_pupil_mm,
+            default.rotation_to_pupil_mm,
+            epsilon = 1e-12
+        );
+        assert_abs_diff_eq!(p.iris_radius_mm, default.iris_radius_mm, epsilon = 1e-12);
+        assert_abs_diff_eq!(
+            p.cornea_radius_mm,
+            default.cornea_radius_mm,
+            epsilon = 1e-12
+        );
+        assert_abs_diff_eq!(
+            p.corner_midpoint_to_rotation_mm,
+            default.corner_midpoint_to_rotation_mm,
+            epsilon = 1e-12
+        );
+
+        assert_eq!(default.effective(true), default);
+        assert_eq!(default.effective(false), default.without_kappa());
     }
 
     #[test]

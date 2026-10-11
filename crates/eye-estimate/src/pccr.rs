@@ -50,6 +50,11 @@ impl PccrEstimator {
         Ok(Self::new(parse_options(Self::NAME, table)?))
     }
 
+    /// Overrides the anatomical priors.
+    pub fn with_params(self, params: EyeParams) -> Self {
+        Self { params, ..self }
+    }
+
     /// Shared with `FusedEstimator`'s IR chain.
     pub(crate) fn estimate_rays(
         &mut self,

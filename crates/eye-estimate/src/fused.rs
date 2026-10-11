@@ -13,7 +13,7 @@ use eye_core::{
 };
 use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
 use eye_geometry::eyeball::{
-    EyeCentre, EyeParams, Kappa, gaze_ray, gaze_ray_pccr, optical_axis, visual_axis,
+    EyeCentre, EyeParams, gaze_ray, gaze_ray_pccr, optical_axis, visual_axis,
 };
 use eye_geometry::triangulation::{Triangulated, View, triangulate};
 use eye_geometry::uncertainty::{block_diag, propagate_fn};
@@ -218,7 +218,6 @@ fn fuse_or_log(side: Side, rgb: &GazeRay, ir: &GazeRay) -> Option<GazeRay> {
 #[derive(Debug)]
 pub struct FusedEstimator {
     options: FusedOptions,
-    params: EyeParams,
     landmark: LandmarkEstimator,
     ir: IrChain,
     /// Latest ir-pupil-pair observation from earlier calls (the previous bracket).
@@ -248,7 +247,6 @@ impl FusedEstimator {
         };
         Self {
             landmark: LandmarkEstimator::new(options.landmark.clone()),
-            params: EyeParams::default(),
             ir,
             prev_ir: None,
             last_viewer: None,
@@ -502,16 +500,19 @@ impl FusedEstimator {
     }
 
     fn eye_params(&self) -> EyeParams {
-        if self.options.landmark.apply_kappa {
-            self.params
-        } else {
-            EyeParams {
-                kappa: Kappa {
-                    alpha_rad: 0.0,
-                    beta_rad: 0.0,
-                },
-                ..self.params
-            }
+        self.landmark.effective_params()
+    }
+
+    /// Overrides the anatomical priors for every chain (RGB landmark and IR).
+    pub fn with_params(self, params: EyeParams) -> Self {
+        let ir = match self.ir {
+            IrChain::Pupil(e) => IrChain::Pupil(Box::new(e.with_params(params))),
+            IrChain::Pccr(e) => IrChain::Pccr(e.with_params(params)),
+        };
+        Self {
+            landmark: self.landmark.with_params(params),
+            ir,
+            ..self
         }
     }
 
@@ -2225,6 +2226,60 @@ mod tests {
                 .iter()
                 .any(|(_, src, _)| matches!(src, FusedSource::Stereo))
         );
+    }
+
+    #[test]
+    fn test_fused_with_params_reaches_every_chain() {
+        for ir_kind in [IrChainKind::Pupil, IrChainKind::Pccr] {
+            let rig = test_rig();
+            let screen_from_head = frontal_screen_from_head();
+            let target = Point2::new(100.0, 50.0);
+            let default_params = EyeParams::default();
+            let centres = synthetic_eye_centres(&screen_from_head, 1.0, &default_params);
+
+            let ir = match ir_kind {
+                IrChainKind::Pupil => synthetic_ir_observation_at(&rig, centres, target, 0.0, 1),
+                IrChainKind::Pccr => {
+                    synthetic_pccr_observation_posed(&rig, target, &screen_from_head, 0.0, 0.0, 1)
+                }
+            };
+            let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.0, 0);
+
+            let options = FusedOptions {
+                ir: ir_kind,
+                ..fused_options_no_kappa()
+            };
+            let overridden = EyeParams {
+                rotation_to_pupil_mm: 9.0,
+                ..EyeParams::default()
+            };
+
+            let mut baseline = FusedEstimator::new(options.clone());
+            let baseline_candidates = baseline
+                .candidates(&[rgb.clone(), ir.clone()], &rig)
+                .expect("estimate succeeds");
+
+            let mut changed = FusedEstimator::new(options).with_params(overridden);
+            let changed_candidates = changed
+                .candidates(&[rgb, ir], &rig)
+                .expect("estimate succeeds");
+
+            for source in [FusedSource::RgbOnly, FusedSource::IrOnly] {
+                let direction_of = |candidates: &[(Side, FusedSource, GazeRay)]| {
+                    candidates
+                        .iter()
+                        .find(|(side, src, _)| *side == Side::Right && *src == source)
+                        .map(|(_, _, ray)| ray.direction)
+                        .unwrap_or_else(|| panic!("{ir_kind:?}: no {source:?} candidate"))
+                };
+                let baseline_direction = direction_of(&baseline_candidates);
+                let changed_direction = direction_of(&changed_candidates);
+                assert!(
+                    angle_deg(&baseline_direction, &changed_direction) > 1e-6,
+                    "{ir_kind:?} {source:?}: with_params did not reach this chain"
+                );
+            }
+        }
     }
 
     #[test]

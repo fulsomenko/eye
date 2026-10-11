@@ -5,7 +5,7 @@ use eye_core::{
 };
 use eye_geometry::camera::pixel_ray;
 use eye_geometry::eyeball::{
-    EyeCentre, EyeParams, Kappa, gaze_ray, gaze_ray_pccr, optical_axis, ray_sphere_near,
+    EyeCentre, EyeParams, gaze_ray, gaze_ray_pccr, optical_axis, ray_sphere_near,
 };
 use eye_geometry::screen::intersect_plane;
 use nalgebra::{Matrix3, Point2, Point3, Unit, UnitQuaternion, Vector3};
@@ -93,6 +93,11 @@ impl IrPupilEstimator {
 
     pub fn from_config(table: &toml::Table, _rig: &eye_core::Rig) -> Result<Self, StageError> {
         Ok(Self::new(parse_options(Self::NAME, table)?))
+    }
+
+    /// Overrides the anatomical priors. Leaves the seed anchor untouched.
+    pub fn with_params(self, params: EyeParams) -> Self {
+        Self { params, ..self }
     }
 
     /// Place the anchor from an external eye-centre measurement (the landmark frame in fused).
@@ -237,17 +242,7 @@ impl IrPupilEstimator {
         cam: &CameraModel,
         anchor: &[Point3<f64>; 2],
     ) -> [Option<GazeRay>; 2] {
-        let params = if self.options.apply_kappa {
-            self.params
-        } else {
-            EyeParams {
-                kappa: Kappa {
-                    alpha_rad: 0.0,
-                    beta_rad: 0.0,
-                },
-                ..self.params
-            }
-        };
+        let params = self.params.effective(self.options.apply_kappa);
         let a = self.options.anchor_sigma_mm;
         let d = self.options.origin_ambiguity_mm;
         let declared_cov = Matrix3::from_diagonal(&Vector3::new(
@@ -781,6 +776,40 @@ mod tests {
             1.5f64.to_radians(),
             epsilon = 1e-3
         );
+    }
+
+    #[test]
+    fn test_apply_kappa_false_uses_zero_kappa() {
+        let rig = test_rig();
+        let target = Point2::new(155.0, 85.0);
+        let obs = synthetic_ir_observation(&rig, target, Vector3::zeros(), 0.0, 1);
+
+        let mut via_option = IrPupilEstimator::new(IrPupilOptions {
+            apply_kappa: false,
+            ..Default::default()
+        });
+        let mut via_params = IrPupilEstimator::new(IrPupilOptions {
+            apply_kappa: true,
+            ..Default::default()
+        })
+        .with_params(EyeParams::default().without_kappa());
+
+        let rays_option = via_option
+            .estimate_rays(std::slice::from_ref(&obs), &rig)
+            .expect("estimate succeeds");
+        let rays_params = via_params
+            .estimate_rays(&[obs], &rig)
+            .expect("estimate succeeds");
+
+        assert_eq!(rays_option.len(), rays_params.len());
+        for (a, b) in rays_option.iter().zip(rays_params.iter()) {
+            assert_abs_diff_eq!(
+                a.direction.into_inner(),
+                b.direction.into_inner(),
+                epsilon = 1e-12
+            );
+            assert_abs_diff_eq!(a.origin, b.origin, epsilon = 1e-12);
+        }
     }
 
     #[test]
