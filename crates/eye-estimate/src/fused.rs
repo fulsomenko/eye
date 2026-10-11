@@ -24,7 +24,7 @@ use crate::EstimateError;
 use crate::ir::glint_near;
 use crate::ir_pupil::{IrPupilEstimator, IrPupilOptions};
 use crate::landmark::{LandmarkEstimator, LandmarkEye, LandmarkFrame, LandmarkOptions};
-use crate::log::{side_str, trace_ray};
+use crate::log::trace_ray;
 use crate::options::parse_options;
 use crate::pccr::{PccrEstimator, PccrOptions};
 
@@ -208,7 +208,7 @@ fn fuse_or_log(side: Side, rgb: &GazeRay, ir: &GazeRay) -> Option<GazeRay> {
     if fused.is_none() {
         tracing::debug!(
             { field::REASON } = "singular_cov",
-            side = side_str(side),
+            side = side.as_str(),
             "fusion skipped"
         );
     }
@@ -559,7 +559,7 @@ impl FusedEstimator {
                 match triangulate(&views.0, &views.1) {
                     Err(e) => tracing::debug!(
                         { field::REASON } = "triangulate_failed",
-                        side = side_str(side),
+                        side = side.as_str(),
                         error = %e,
                         "stereo failed"
                     ),
@@ -575,7 +575,7 @@ impl FusedEstimator {
                         Some(ray) => return Ok(Some((ray, FusedSource::Stereo))),
                         None => tracing::debug!(
                             { field::REASON } = "stereo_no_root",
-                            side = side_str(side),
+                            side = side.as_str(),
                             rms_px = t.rms_px,
                             parallax_rad = t.parallax_rad,
                             "stereo failed"
@@ -593,7 +593,7 @@ impl FusedEstimator {
         else {
             tracing::debug!(
                 { field::REASON } = "no_ir_time",
-                side = side_str(side),
+                side = side.as_str(),
                 "cross chain skipped"
             );
             return Ok(None);
@@ -608,7 +608,7 @@ impl FusedEstimator {
         else {
             tracing::debug!(
                 { field::REASON } = "no_ir_pupil",
-                side = side_str(side),
+                side = side.as_str(),
                 "cross chain skipped"
             );
             return Ok(None);
@@ -697,7 +697,7 @@ impl FusedEstimator {
         }
         for decision in &self.decisions {
             tracing::debug!(
-                side = side_str(decision.side),
+                side = decision.side.as_str(),
                 source = decision.source.as_str(),
                 mahalanobis2 = decision.mahalanobis2,
                 accepted = decision.accepted,
@@ -719,7 +719,7 @@ impl FusedEstimator {
             .into_iter()
             .map(|(side, (source, ray, det))| {
                 tracing::debug!(
-                    side = side_str(side),
+                    side = side.as_str(),
                     source = source.as_str(),
                     angular_cov_det = det,
                     candidates = counts[&side],

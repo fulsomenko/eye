@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::EstimateError;
 use crate::ir::{PupilPair, glint_near};
-use crate::log::{side_str, trace_ray};
+use crate::log::trace_ray;
 use crate::options::parse_options;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,7 +115,7 @@ impl PccrEstimator {
                 None => {
                     tracing::debug!(
                         { field::REASON } = "no_solution",
-                        side = side_str(side),
+                        side = side.as_str(),
                         "pccr ray failed"
                     );
                 }
@@ -133,7 +133,7 @@ impl PccrEstimator {
         let Some(eye) = face.eye(side) else {
             tracing::debug!(
                 { field::REASON } = "eye_missing",
-                side = side_str(side),
+                side = side.as_str(),
                 "glint rejected"
             );
             return None;

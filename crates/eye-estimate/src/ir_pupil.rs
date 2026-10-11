@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use crate::EstimateError;
 use crate::ir::{PupilPair, binocular_pupils};
-use crate::log::{side_str, trace_ray};
+use crate::log::trace_ray;
 use crate::options::parse_options;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -268,7 +268,7 @@ impl IrPupilEstimator {
                 .inspect_err(|e| {
                     tracing::debug!(
                         { field::REASON } = "gaze_ray_failed",
-                        side = side_str(side),
+                        side = side.as_str(),
                         error = %e,
                         "gaze ray failed"
                     );

@@ -209,7 +209,7 @@ impl IrClassicDetector {
             let pupil = eye.pupil.expect("pupil set above");
             let ellipse = pupil.value();
             tracing::trace!(
-                side = side_str(eye.side),
+                side = eye.side.as_str(),
                 x = ellipse.center().x,
                 y = ellipse.center().y,
                 semi_major = ellipse.semi_major(),
@@ -320,13 +320,6 @@ impl IrClassicDetector {
             });
         }
         Ok(out)
-    }
-}
-
-fn side_str(side: Side) -> &'static str {
-    match side {
-        Side::Right => "right",
-        Side::Left => "left",
     }
 }
 

@@ -181,6 +181,13 @@ impl Side {
             Self::Right => Self::Left,
         }
     }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -259,6 +266,12 @@ mod tests {
 
     fn center_fixture() -> Point2<f64> {
         Point2::new(320.5, 180.25)
+    }
+
+    #[test]
+    fn test_side_as_str() {
+        assert_eq!(Side::Left.as_str(), "left");
+        assert_eq!(Side::Right.as_str(), "right");
     }
 
     #[test]

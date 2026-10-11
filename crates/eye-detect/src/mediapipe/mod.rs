@@ -17,6 +17,10 @@ use crate::mediapipe::blazeface::FaceDetectorOutput;
 pub const LANDMARK_INPUT: usize = 256;
 pub const NUM_LANDMARKS: usize = eye_core::observation::mediapipe478::COUNT;
 
+pub(crate) fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LandmarkOutput {
     /// `478 * 3` crop-pixel `(x, y, z)` triples; `z` is dropped downstream.
@@ -142,6 +146,13 @@ pub fn resolve_landmark_roles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sigmoid_midpoint_and_symmetry() {
+        assert_eq!(sigmoid(0.0), 0.5);
+        let x = 3.0f32;
+        assert!((sigmoid(x) + sigmoid(-x) - 1.0).abs() < 1e-6);
+    }
 
     #[test]
     fn test_resolve_detector_roles_by_element_count() {

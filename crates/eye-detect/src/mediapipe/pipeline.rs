@@ -12,11 +12,7 @@ use crate::mediapipe::blazeface::{DETECTOR_INPUT, decode, letterbox_to_tensor, w
 use crate::mediapipe::landmarks::{eyes_from_landmarks, unproject_landmarks};
 use crate::mediapipe::roi::{RotatedRect, roi_from_detection, roi_from_landmarks};
 use crate::mediapipe::warp::warp_roi_to_tensor;
-use crate::mediapipe::{LANDMARK_INPUT, MediaPipeOptions, MediaPipeRuntime};
-
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
+use crate::mediapipe::{LANDMARK_INPUT, MediaPipeOptions, MediaPipeRuntime, sigmoid};
 
 #[derive(Debug)]
 pub struct MediaPipeDetector<R: MediaPipeRuntime> {

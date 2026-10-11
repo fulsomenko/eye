@@ -3,6 +3,7 @@ use nalgebra::{Point2, Vector2};
 use crate::DetectError;
 use crate::image::RgbImage;
 use crate::mediapipe::anchors::Anchor;
+use crate::mediapipe::sigmoid;
 
 pub const DETECTOR_INPUT: usize = 128;
 pub const NUM_ANCHORS: usize = 896;
@@ -21,10 +22,6 @@ pub struct FaceDetection {
     pub center: Point2<f64>,
     pub size: Vector2<f64>,
     pub keypoints: [Point2<f64>; NUM_KEYPOINTS],
-}
-
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
 }
 
 fn iou(a: &FaceDetection, b: &FaceDetection) -> f64 {

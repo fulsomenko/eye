@@ -6,8 +6,6 @@ use eye_core::{
 use eye_geometry::camera::pixel_ray;
 use nalgebra::{Point2, Point3};
 
-use crate::log::side_str;
-
 /// Pixel-space pupil centres from one `ir-pupil-pair` observation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PupilPair {
@@ -94,7 +92,7 @@ pub(crate) fn glint_near(
             .min_by(f64::total_cmp);
         tracing::debug!(
             { field::REASON } = "no_glint",
-            side = side_str(side),
+            side = side.as_str(),
             glints = eye.glints.len() as u64,
             nearest_px,
             max_glint_offset_px = max_px,

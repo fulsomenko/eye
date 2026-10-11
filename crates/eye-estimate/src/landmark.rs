@@ -21,7 +21,7 @@ use nalgebra::{Isometry3, Point2, Point3, Translation3, UnitQuaternion, Vector3,
 use serde::Deserialize;
 
 use crate::EstimateError;
-use crate::log::{side_str, trace_ray};
+use crate::log::trace_ray;
 use crate::options::parse_options;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -231,7 +231,7 @@ impl LandmarkEstimator {
         let Some((e, cov)) = propagate_fn::<3, 6>(e_of, &Vector6::zeros(), &pose.cov) else {
             tracing::debug!(
                 { field::REASON } = "propagate_failed",
-                side = side_str(side),
+                side = side.as_str(),
                 "eye dropped"
             );
             return None;
@@ -244,7 +244,7 @@ impl LandmarkEstimator {
         let Some(eye) = face.eye(side) else {
             tracing::debug!(
                 { field::REASON } = "eye_missing",
-                side = side_str(side),
+                side = side.as_str(),
                 "eye dropped"
             );
             return None;
@@ -252,7 +252,7 @@ impl LandmarkEstimator {
         let Some(iris_px) = eye.iris.map(|m| m.map(|ellipse| ellipse.center())) else {
             tracing::debug!(
                 { field::REASON } = "no_iris",
-                side = side_str(side),
+                side = side.as_str(),
                 "eye dropped"
             );
             return None;
@@ -262,7 +262,7 @@ impl LandmarkEstimator {
             .inspect_err(|err| {
                 tracing::debug!(
                     { field::REASON } = "pixel_ray_failed",
-                    side = side_str(side),
+                    side = side.as_str(),
                     error = %err,
                     "eye dropped"
                 );
@@ -273,7 +273,7 @@ impl LandmarkEstimator {
         if miss > self.options.max_iris_miss_mm {
             tracing::debug!(
                 { field::REASON } = "iris_miss",
-                side = side_str(side),
+                side = side.as_str(),
                 miss_mm = miss,
                 max_iris_miss_mm = self.options.max_iris_miss_mm,
                 "eye dropped"
@@ -286,7 +286,7 @@ impl LandmarkEstimator {
             .inspect_err(|e| {
                 tracing::debug!(
                     { field::REASON } = "gaze_ray_failed",
-                    side = side_str(side),
+                    side = side.as_str(),
                     error = %e,
                     "eye dropped"
                 );
