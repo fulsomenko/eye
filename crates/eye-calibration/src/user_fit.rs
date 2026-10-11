@@ -5,11 +5,12 @@ use eye_core::{GazeRay, RaySource, Rig};
 use eye_geometry::angles::yaw_pitch_from_direction;
 use nalgebra::{
     Cholesky, Matrix2, Point2, Point3, Quaternion, SMatrix, SVector, Unit, UnitQuaternion, Vector2,
+    Vector3,
 };
 
 use crate::correction::{
     AngularCorrection, CalibrationPose, CorrectionModel, EyeKey, PROFILE_VERSION, Provenance,
-    UserProfile, design, design_quad, design12, eye_label,
+    UserProfile, design, design_quad, design12, eye_label, line_of_sight_rotation,
 };
 use crate::error::CalibrationError;
 
@@ -185,7 +186,8 @@ impl DotSessionFit {
             .iter()
             .filter(|s| Some(s.source) == primary)
             .collect();
-        let calibration_pose = calibration_pose(&primary_samples);
+        let camera = rig_camera_centroid(rig);
+        let calibration_pose = calibration_pose(&primary_samples, camera);
 
         let mut target_index_of: HashMap<(u64, u64), u32> = HashMap::new();
         let mut target_mm_of: Vec<Point2<f64>> = Vec::new();
@@ -217,7 +219,14 @@ impl DotSessionFit {
 
         for (source, source_samples) in &by_source {
             let source = *source;
-            match fit_source(source, source_samples, &target_index_of, &target_mm_of, cfg) {
+            match fit_source(
+                source,
+                source_samples,
+                &target_index_of,
+                &target_mm_of,
+                cfg,
+                camera,
+            ) {
                 Ok(source_fit) => {
                     if source_fit.eyes.is_empty() {
                         if Some(source) == primary {
@@ -312,18 +321,35 @@ fn fit_source(
     target_index_of: &HashMap<(u64, u64), u32>,
     target_mm_of: &[Point2<f64>],
     cfg: &FitConfig,
+    camera: Option<Point3<f64>>,
 ) -> Result<SourceFit, CalibrationError> {
     let model_override = cfg.model_override.or_else(|| {
         samples
             .iter()
             .any(|s| s.ray.head_rotation.is_some())
-            .then_some(CorrectionModel::HeadFrame)
+            .then_some(if camera.is_some() {
+                CorrectionModel::CameraFrame
+            } else {
+                CorrectionModel::HeadFrame
+            })
     });
-    let use_head_frame = model_override == Some(CorrectionModel::HeadFrame);
+    let frame_of = |s: &FitSample| -> Option<UnitQuaternion<f64>> {
+        match model_override {
+            Some(CorrectionModel::HeadFrame) => s.ray.head_rotation,
+            Some(CorrectionModel::CameraFrame) => {
+                camera.and_then(|c| line_of_sight_rotation(&s.ray.origin, &c))
+            }
+            _ => Some(UnitQuaternion::identity()),
+        }
+    };
+    let use_head_frame = matches!(
+        model_override,
+        Some(CorrectionModel::HeadFrame | CorrectionModel::CameraFrame)
+    );
     let (samples, without_pose): (Vec<&FitSample>, Vec<&FitSample>) = samples
         .iter()
         .copied()
-        .partition(|s| !use_head_frame || s.ray.head_rotation.is_some());
+        .partition(|s| !use_head_frame || frame_of(s).is_some());
     if use_head_frame && samples.is_empty() {
         return Err(CalibrationError::NoHeadPose {
             samples: without_pose.len(),
@@ -401,7 +427,7 @@ fn fit_source(
             for s in group.iter() {
                 let desired_dir = Unit::new_normalize(target_point - s.ray.origin);
                 let (o, d) = if use_head_frame {
-                    let inv = s.ray.head_rotation.expect("partitioned above").inverse();
+                    let inv = frame_of(s).expect("partitioned above").inverse();
                     (
                         yaw_pitch_from_direction(&(inv * s.ray.direction)),
                         yaw_pitch_from_direction(&(inv * desired_dir)),
@@ -654,7 +680,7 @@ fn fit_source(
             chi2_final,
             dof,
         ) = match model {
-            CorrectionModel::Affine | CorrectionModel::HeadFrame => {
+            CorrectionModel::Affine | CorrectionModel::HeadFrame | CorrectionModel::CameraFrame => {
                 let (theta, cov, chi2) = solve_weighted(&remaining, &ones, &prior6)
                     .expect("ridge prior keeps the normal matrix positive definite");
                 (
@@ -778,10 +804,21 @@ fn fit_source(
     })
 }
 
+fn rig_camera_centroid(rig: &Rig) -> Option<Point3<f64>> {
+    let cameras = rig.cameras();
+    if cameras.is_empty() {
+        return None;
+    }
+    let sum = cameras.iter().fold(Vector3::zeros(), |acc, c| {
+        acc + c.screen_from_camera.translation.vector
+    });
+    Some(Point3::from(sum / cameras.len() as f64))
+}
+
 /// Mean origin per eye over ALL input samples; quaternion mean over the samples that carry a
 /// pose, with each quaternion sign-aligned to the first so antipodal representations do not
 /// cancel.
-fn calibration_pose(samples: &[&FitSample]) -> CalibrationPose {
+fn calibration_pose(samples: &[&FitSample], camera: Option<Point3<f64>>) -> CalibrationPose {
     let mut origin_sum: BTreeMap<EyeKey, ([f64; 3], u32)> = BTreeMap::new();
     for s in samples {
         let e = origin_sum
@@ -819,6 +856,7 @@ fn calibration_pose(samples: &[&FitSample]) -> CalibrationPose {
         samples_with_head_pose: with_pose,
         samples_total: samples.len() as u32,
         eye_origin_mm,
+        camera_mm: camera.map(|c| [c.x, c.y, c.z]),
     }
 }
 
@@ -956,7 +994,7 @@ fn loo_target_mean_deg(
             .map(|(_, t)| t.clone())
             .collect();
         let predicted = match model {
-            CorrectionModel::Affine | CorrectionModel::HeadFrame => {
+            CorrectionModel::Affine | CorrectionModel::HeadFrame | CorrectionModel::CameraFrame => {
                 let ones = vec![1.0; rest.len()];
                 let (theta, _, _) = solve_weighted(&rest, &ones, prior6)
                     .expect("ridge prior keeps the normal matrix positive definite");
@@ -2243,7 +2281,7 @@ mod tests {
     }
 
     #[test]
-    fn test_default_fit_picks_head_frame_when_samples_carry_pose() {
+    fn test_default_fit_picks_camera_frame_when_samples_carry_pose() {
         let (samples, _, _) = head_frame_rotation_session();
         let outcome = DotSessionFit::fit_with(
             &samples,
@@ -2256,7 +2294,7 @@ mod tests {
             .profile
             .correction(RaySource::RgbOnly, EyeKey::Right)
             .unwrap();
-        assert_eq!(right.model, CorrectionModel::HeadFrame);
+        assert_eq!(right.model, CorrectionModel::CameraFrame);
         assert_eq!(right.targets_used, 9);
     }
 
@@ -2685,7 +2723,7 @@ mod tests {
             });
         }
 
-        let pose = calibration_pose(&samples.iter().collect::<Vec<_>>());
+        let pose = calibration_pose(&samples.iter().collect::<Vec<_>>(), None);
         assert_eq!(pose.samples_total, 4);
         assert_eq!(pose.samples_with_head_pose, 2);
         let origin_mm = pose.eye_origin_mm[&EyeKey::Right];
@@ -2716,7 +2754,7 @@ mod tests {
             },
         ];
 
-        let pose = calibration_pose(&samples.iter().collect::<Vec<_>>());
+        let pose = calibration_pose(&samples.iter().collect::<Vec<_>>(), None);
         assert_eq!(pose.head_rotation, None);
         assert_eq!(pose.samples_with_head_pose, 0);
         assert_eq!(pose.samples_total, 2);
@@ -2735,7 +2773,10 @@ mod tests {
             .iter()
             .filter(|s| s.ray.head_rotation.is_some())
             .count();
-        let expected_pose = calibration_pose(&samples.iter().collect::<Vec<_>>());
+        let expected_pose = calibration_pose(
+            &samples.iter().collect::<Vec<_>>(),
+            rig_camera_centroid(&fixture_rig()),
+        );
 
         let meta = ProfileMeta {
             provenance: Provenance {

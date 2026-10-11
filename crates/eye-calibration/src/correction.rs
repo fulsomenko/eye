@@ -5,7 +5,7 @@ use eye_core::stage::GazeCorrection;
 use eye_core::{GazeRay, RaySource, Rig, Side};
 use eye_geometry::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
 use eye_geometry::uncertainty::{block_diag, numeric_jacobian, propagate};
-use nalgebra::{Matrix2, SMatrix, SVector, Vector2};
+use nalgebra::{Matrix2, Point3, SMatrix, SVector, Vector2, Vector3};
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -69,6 +69,9 @@ pub enum CorrectionModel {
     /// `theta`'s affine map applied in the head frame (`GazeRay::head_rotation`), not the screen
     /// frame: rotate the ray into the head frame, apply, rotate back.
     HeadFrame,
+    /// `theta`'s affine map applied in the line-of-sight frame: z from the ray origin towards
+    /// `CalibrationPose::camera_mm`, no roll.
+    CameraFrame,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -81,6 +84,9 @@ pub struct CalibrationPose {
     pub samples_total: u32,
     /// Mean ray origin per eye, screen frame mm.
     pub eye_origin_mm: BTreeMap<EyeKey, [f64; 3]>,
+    /// Centroid of the rig's camera centres, screen frame mm: the `CameraFrame` anchor.
+    #[serde(default)]
+    pub camera_mm: Option<[f64; 3]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -181,18 +187,31 @@ impl UserProfile {
                     propagate(&j, &ray.angular_cov) + propagate(&b12, &cov12),
                 )
             }
-            CorrectionModel::HeadFrame => {
-                let th = SVector::<f64, 6>::from(c.theta);
-                let cov_theta = SMatrix::<f64, 6, 6>::from_fn(|r, k| c.cov[r][k]);
-                let Some(rot) = ray.head_rotation else {
+            CorrectionModel::HeadFrame | CorrectionModel::CameraFrame => {
+                let rot = match c.model {
+                    CorrectionModel::HeadFrame => ray.head_rotation,
+                    _ => self
+                        .calibration_pose
+                        .as_ref()
+                        .and_then(|p| p.camera_mm)
+                        .and_then(|camera| {
+                            line_of_sight_rotation(&ray.origin, &Point3::from(camera))
+                        }),
+                };
+                let Some(rot) = rot else {
                     tracing::trace!(
                         source = source.as_str(),
                         eye = eye_label(eye),
-                        { field::REASON } = "no_head_pose",
+                        { field::REASON } = match c.model {
+                            CorrectionModel::HeadFrame => "no_head_pose",
+                            _ => "no_camera_anchor",
+                        },
                         "ray uncorrected"
                     );
                     return None;
                 };
+                let th = SVector::<f64, 6>::from(c.theta);
+                let cov_theta = SMatrix::<f64, 6, 6>::from_fn(|r, k| c.cov[r][k]);
                 let x = SVector::<f64, 8>::from_fn(|i, _| if i < 2 { a[i] } else { th[i - 2] });
                 let cov8 = block_diag::<2, 6, 8>(&ray.angular_cov, &cov_theta);
                 let f = move |x: &SVector<f64, 8>| -> Option<SVector<f64, 2>> {
@@ -247,6 +266,14 @@ pub(crate) fn design12(o: &Vector2<f64>) -> SMatrix<f64, 2, 12> {
     d.fixed_view_mut::<2, 6>(0, 0).copy_from(&design(o));
     d.fixed_view_mut::<2, 6>(0, 6).copy_from(&design_quad(o));
     d
+}
+
+/// Rotation taking screen +z onto the direction from `origin` to `camera`, without roll.
+pub fn line_of_sight_rotation(
+    origin: &Point3<f64>,
+    camera: &Point3<f64>,
+) -> Option<nalgebra::UnitQuaternion<f64>> {
+    nalgebra::UnitQuaternion::rotation_between(&Vector3::z(), &(camera - origin))
 }
 
 fn head_frame_correct(
@@ -597,6 +624,7 @@ mod tests {
             samples_with_head_pose: 42,
             samples_total: 50,
             eye_origin_mm: BTreeMap::from([(EyeKey::Right, [155.0, 85.0, -500.0])]),
+            camera_mm: None,
         });
         profile.provenance = Provenance {
             session_id: Some("sess-1".into()),
@@ -613,6 +641,47 @@ mod tests {
         let mut with_extra = text;
         with_extra.push_str("\nfoo = 1\n");
         assert!(toml::from_str::<UserProfile>(&with_extra).is_err());
+    }
+
+    #[test]
+    fn test_profile_toml_round_trip_with_camera_anchor() {
+        let mut profile = fixture_profile();
+        profile.calibration_pose = Some(CalibrationPose {
+            head_rotation: Some([0.0, 0.0, 0.0, 1.0]),
+            samples_with_head_pose: 42,
+            samples_total: 50,
+            eye_origin_mm: BTreeMap::from([(EyeKey::Right, [155.0, 85.0, -500.0])]),
+            camera_mm: Some([155.0, -7.0, 0.0]),
+        });
+
+        let text = toml::to_string(&profile).unwrap();
+        let back: UserProfile = toml::from_str(&text).unwrap();
+        assert_eq!(back, profile);
+        assert_eq!(
+            back.calibration_pose.unwrap().camera_mm,
+            Some([155.0, -7.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn test_old_profile_without_camera_mm_loads_as_none() {
+        let mut profile = fixture_profile();
+        profile.calibration_pose = Some(CalibrationPose {
+            head_rotation: Some([0.0, 0.0, 0.0, 1.0]),
+            samples_with_head_pose: 42,
+            samples_total: 50,
+            eye_origin_mm: BTreeMap::from([(EyeKey::Right, [155.0, 85.0, -500.0])]),
+            camera_mm: None,
+        });
+
+        let text = toml::to_string(&profile).unwrap();
+        assert!(
+            !text.contains("camera_mm"),
+            "camera_mm must be omitted from serialized output when None, mirroring a pre-camera-anchor profile"
+        );
+
+        let back: UserProfile = toml::from_str(&text).unwrap();
+        assert_eq!(back.calibration_pose.unwrap().camera_mm, None);
     }
 
     #[test]
@@ -670,6 +739,49 @@ mod tests {
         );
         assert_abs_diff_eq!(a.x, b.x, epsilon = 1e-9);
         assert_abs_diff_eq!(a.y, b.y, epsilon = 1e-9);
+    }
+
+    fn camera_frame_profile(theta: [f64; 6], camera_mm: Option<[f64; 3]>) -> UserProfile {
+        let mut profile = single_eye_profile(CorrectionModel::CameraFrame, theta);
+        profile.calibration_pose = Some(CalibrationPose {
+            head_rotation: None,
+            samples_with_head_pose: 0,
+            samples_total: 0,
+            eye_origin_mm: BTreeMap::new(),
+            camera_mm,
+        });
+        profile
+    }
+
+    #[test]
+    fn test_camera_frame_slope_is_centred_on_line_of_sight() {
+        let camera = Point3::new(154.0, -7.0, 0.0);
+        let profile =
+            camera_frame_profile([0.0, 1.0, 0.0, 0.0, 0.0, 1.0], Some(camera.coords.into()));
+        let mut ray = straight_ray(Some(eye_core::Side::Right));
+        let los = Unit::new_normalize(camera - ray.origin);
+
+        ray.direction = los;
+        let corrected = profile.correct(RaySource::RgbOnly, &ray).unwrap();
+        assert_abs_diff_eq!(corrected.direction.dot(&los), 1.0, epsilon = 1e-12);
+
+        let off = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 2.0_f64.to_radians());
+        ray.direction = off * los;
+        let angle_to_los_deg =
+            |d: &Unit<Vector3<f64>>| d.dot(&los).clamp(-1.0, 1.0).acos().to_degrees();
+        let corrected = profile.correct(RaySource::RgbOnly, &ray).unwrap();
+        assert_abs_diff_eq!(
+            angle_to_los_deg(&corrected.direction),
+            2.0 * angle_to_los_deg(&ray.direction),
+            epsilon = 0.01
+        );
+    }
+
+    #[test]
+    fn test_camera_frame_without_anchor_is_uncorrected() {
+        let profile = camera_frame_profile([0.01, 0.0, 0.0, 0.0, 0.0, 0.0], None);
+        let ray = straight_ray(Some(eye_core::Side::Right));
+        assert_eq!(profile.correct(RaySource::RgbOnly, &ray), None);
     }
 
     #[test]

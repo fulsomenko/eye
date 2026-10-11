@@ -645,6 +645,7 @@ name = "eye-estimate"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "eye-calibration",
  "eye-core",
  "eye-geometry",
  "eye-log",

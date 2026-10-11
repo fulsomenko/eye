@@ -5,6 +5,8 @@ mod error;
 mod log;
 
 pub mod fused;
+#[cfg(test)]
+mod head_motion_tests;
 pub mod ir;
 pub mod ir_pupil;
 pub mod landmark;
