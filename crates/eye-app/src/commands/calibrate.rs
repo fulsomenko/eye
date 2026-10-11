@@ -1507,6 +1507,7 @@ mod tests {
             dwell_ms: 1000,
             settle_ms: 500,
             window_ms: 200,
+            ..ProtocolConfig::default()
         })
         .unwrap();
         let mut live = LiveFeedback::with_pipeline(

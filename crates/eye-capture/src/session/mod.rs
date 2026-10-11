@@ -186,6 +186,7 @@ mod tests {
                 dwell_ms: 2500,
                 settle_ms: 1000,
                 window_ms: 1200,
+                ..ProtocolConfig::default()
             }),
             ..meta()
         };

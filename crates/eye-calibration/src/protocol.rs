@@ -54,6 +54,10 @@ fn param_err(name: &'static str, reason: impl Into<String>) -> CalibrationError 
     }
 }
 
+fn span(i: u32, n: u32, m: f64) -> f64 {
+    m + f64::from(i) * (1.0 - 2.0 * m) / f64::from(n - 1)
+}
+
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = *state;
@@ -73,6 +77,12 @@ impl TargetProtocol {
             return Err(param_err(
                 "timing",
                 "dwell_ms, settle_ms and window_ms must all be non-zero",
+            ));
+        }
+        if !(0.0..0.25).contains(&cfg.edge_margin) {
+            return Err(param_err(
+                "edge_margin",
+                format!("edge_margin {} outside 0.0..0.25", cfg.edge_margin),
             ));
         }
         if cfg.settle_ms + cfg.window_ms > cfg.dwell_ms {
@@ -114,8 +124,8 @@ impl TargetProtocol {
                 index: k as u32,
                 cell: (c, r),
                 norm: Point2::new(
-                    (f64::from(c) + 0.5) / f64::from(cols),
-                    (f64::from(r) + 0.5) / f64::from(rows),
+                    span(c, cols, self.cfg.edge_margin),
+                    span(r, rows, self.cfg.edge_margin),
                 ),
             })
             .collect();
@@ -296,6 +306,7 @@ mod tests {
                 dwell_ms: 1500,
                 settle_ms: 600,
                 window_ms: 800,
+                edge_margin: 0.04,
             }
         );
         let parsed: ProtocolConfig = toml::from_str("").unwrap();
@@ -303,7 +314,16 @@ mod tests {
     }
 
     #[test]
-    fn test_3x3_sequence_is_permutation_of_cell_centres() {
+    fn test_protocol_config_without_edge_margin_parses_with_default() {
+        let parsed: ProtocolConfig = toml::from_str(
+            "grid = [4, 4]\nlead_in_ms = 1000\ndwell_ms = 1500\nsettle_ms = 600\nwindow_ms = 800\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.edge_margin, 0.04);
+    }
+
+    #[test]
+    fn test_3x3_sequence_is_permutation_of_span_positions() {
         let proto = TargetProtocol::new(ProtocolConfig {
             grid: [3, 3],
             ..ProtocolConfig::default()
@@ -318,10 +338,10 @@ mod tests {
         expected_sorted.sort();
         assert_eq!(cells, expected_sorted);
         for t in &seq {
-            let ok = [1.0 / 6.0, 0.5, 5.0 / 6.0]
+            let ok = [0.04, 0.5, 0.96]
                 .iter()
                 .any(|e| (t.norm.x - e).abs() < 1e-12)
-                && [1.0 / 6.0, 0.5, 5.0 / 6.0]
+                && [0.04, 0.5, 0.96]
                     .iter()
                     .any(|e| (t.norm.y - e).abs() < 1e-12);
             assert!(ok);
@@ -329,18 +349,67 @@ mod tests {
     }
 
     #[test]
-    fn test_4x4_cell_centres() {
+    fn test_sequence_4x4_spans_to_corners() {
         let proto = TargetProtocol::new(ProtocolConfig {
             grid: [4, 4],
             ..ProtocolConfig::default()
         })
         .unwrap();
         let seq = proto.sequence(1);
-        let expected_coords = [0.125, 0.375, 0.625, 0.875];
+        let expected_coords = [0.04, 0.3467, 0.6533, 0.96];
         for t in &seq {
-            assert!(expected_coords.iter().any(|e| (t.norm.x - e).abs() < 1e-12));
-            assert!(expected_coords.iter().any(|e| (t.norm.y - e).abs() < 1e-12));
+            assert!(expected_coords.iter().any(|e| (t.norm.x - e).abs() < 1e-4));
+            assert!(expected_coords.iter().any(|e| (t.norm.y - e).abs() < 1e-4));
         }
+        for corner in [(0.04, 0.04), (0.96, 0.04), (0.04, 0.96), (0.96, 0.96)] {
+            assert!(seq.iter().any(|t| {
+                (t.norm.x - corner.0).abs() < 1e-4 && (t.norm.y - corner.1).abs() < 1e-4
+            }));
+        }
+    }
+
+    #[test]
+    fn test_edge_margin_zero_reaches_screen_edges() {
+        let proto = TargetProtocol::new(ProtocolConfig {
+            grid: [4, 4],
+            edge_margin: 0.0,
+            ..ProtocolConfig::default()
+        })
+        .unwrap();
+        let seq = proto.sequence(1);
+        assert!(seq.iter().any(|t| (t.norm.x - 0.0).abs() < 1e-12));
+        assert!(seq.iter().any(|t| (t.norm.x - 1.0).abs() < 1e-12));
+        assert!(seq.iter().any(|t| (t.norm.y - 0.0).abs() < 1e-12));
+        assert!(seq.iter().any(|t| (t.norm.y - 1.0).abs() < 1e-12));
+    }
+
+    #[test]
+    fn test_edge_margin_out_of_range_rejected() {
+        let err = TargetProtocol::new(ProtocolConfig {
+            edge_margin: 0.25,
+            ..ProtocolConfig::default()
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CalibrationError::Param {
+                name: "edge_margin",
+                ..
+            }
+        ));
+
+        let err = TargetProtocol::new(ProtocolConfig {
+            edge_margin: -0.01,
+            ..ProtocolConfig::default()
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CalibrationError::Param {
+                name: "edge_margin",
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -1042,6 +1042,7 @@ mod tests {
     #[derive(Clone, Copy)]
     struct SessionConfig {
         grid: [u32; 2],
+        edge_margin: f64,
         samples_per_target: usize,
         side: Option<Side>,
         base_xy: (f64, f64),
@@ -1056,6 +1057,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 grid: [3, 3],
+                edge_margin: ProtocolConfig::default().edge_margin,
                 samples_per_target: 24,
                 side: Some(Side::Right),
                 base_xy: (185.0, 60.0),
@@ -1095,6 +1097,7 @@ mod tests {
     fn generate_session(cfg: &SessionConfig) -> Vec<FitSample> {
         let proto = TargetProtocol::new(ProtocolConfig {
             grid: cfg.grid,
+            edge_margin: cfg.edge_margin,
             ..ProtocolConfig::default()
         })
         .unwrap();
@@ -1788,6 +1791,9 @@ mod tests {
         // the robust pass; the bias on target 1 then empties it to 2.
         let cfg = SessionConfig {
             grid: [3, 3],
+            // Recovers the pre-span 3x3 cell-centre positions (1/6, 1/2, 5/6)
+            // this test's rejection counts are pinned to.
+            edge_margin: 1.0 / 6.0,
             bias: UNBIASED,
             ..SessionConfig::default()
         };
@@ -1835,6 +1841,7 @@ mod tests {
             seed: 97,
             noise_deg: 1.0,
             source: RaySource::RgbOnly,
+            ..SessionConfig::default()
         };
         let per_target = left_cfg.samples_per_target;
         let left_samples: Vec<FitSample> = generate_session(&left_cfg)
@@ -2548,6 +2555,7 @@ mod tests {
             seed: 97,
             noise_deg: 1.0,
             source: RaySource::RgbOnly,
+            ..SessionConfig::default()
         };
         let per_target = left_cfg.samples_per_target;
         let left_samples: Vec<FitSample> = generate_session(&left_cfg)

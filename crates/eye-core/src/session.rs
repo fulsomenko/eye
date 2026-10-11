@@ -92,6 +92,10 @@ pub struct TargetTiming {
     pub dwell: Duration,
 }
 
+fn default_edge_margin() -> f64 {
+    0.04
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProtocolConfig {
@@ -100,6 +104,10 @@ pub struct ProtocolConfig {
     pub dwell_ms: u64,
     pub settle_ms: u64,
     pub window_ms: u64,
+    /// Fraction of each axis reserved as a margin before the first target and
+    /// after the last; targets span the remaining band edge to edge.
+    #[serde(default = "default_edge_margin")]
+    pub edge_margin: f64,
 }
 
 impl Default for ProtocolConfig {
@@ -110,6 +118,7 @@ impl Default for ProtocolConfig {
             dwell_ms: 1500,
             settle_ms: 600,
             window_ms: 800,
+            edge_margin: default_edge_margin(),
         }
     }
 }
@@ -162,6 +171,7 @@ impl ProtocolConfig {
             dwell_ms,
             settle_ms,
             window_ms,
+            edge_margin: fallback.edge_margin,
         })
     }
 }
@@ -206,6 +216,7 @@ mod protocol_config_from_target_records_tests {
                 dwell_ms: 1500,
                 settle_ms: 600,
                 window_ms: 800,
+                edge_margin: 0.04,
             }
         );
     }
@@ -225,6 +236,7 @@ mod protocol_config_from_target_records_tests {
                 dwell_ms: 1500,
                 settle_ms: 600,
                 window_ms: 800,
+                edge_margin: 0.04,
             }
         );
     }
@@ -244,6 +256,7 @@ mod protocol_config_from_target_records_tests {
                 dwell_ms: 2500,
                 settle_ms: 1000,
                 window_ms: 1333,
+                edge_margin: 0.04,
             }
         );
     }
@@ -285,6 +298,7 @@ mod protocol_config_tests {
             dwell_ms: 2500,
             settle_ms: 1000,
             window_ms: 1200,
+            edge_margin: 0.04,
         };
         let text = toml::to_string(&cfg).unwrap();
         assert!(text.contains("grid = [4, 4]"));

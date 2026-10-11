@@ -1134,6 +1134,7 @@ mod tests {
             dwell_ms: 2500,
             settle_ms: 1000,
             window_ms: 1200,
+            ..ProtocolConfig::default()
         };
         let spec = SyntheticSession {
             targets: vec![(960.0, 540.0)],
@@ -1181,6 +1182,7 @@ mod tests {
             dwell_ms: 2500,
             settle_ms: 1000,
             window_ms: 1200,
+            ..ProtocolConfig::default()
         };
         let spec_with = SyntheticSession {
             targets: vec![(960.0, 540.0)],
@@ -1243,6 +1245,7 @@ mod tests {
             dwell_ms: 1500,
             settle_ms: 900,
             window_ms: 500,
+            ..ProtocolConfig::default()
         };
         let replayed =
             replay_session(&session_dir, &config, &fake_registry(), &wrong_fallback).unwrap();
