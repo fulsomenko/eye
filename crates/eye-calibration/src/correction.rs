@@ -228,6 +228,7 @@ impl UserProfile {
 pub fn legacy_source(estimator: &str) -> RaySource {
     match estimator {
         "pccr" | "ir-pupil" => RaySource::IrOnly,
+        "fused" => RaySource::Fused,
         _ => RaySource::RgbOnly,
     }
 }
@@ -892,8 +893,13 @@ mod tests {
     fn test_legacy_source_maps_estimator_names() {
         assert_eq!(legacy_source("pccr"), RaySource::IrOnly);
         assert_eq!(legacy_source("ir-pupil"), RaySource::IrOnly);
-        for estimator in ["fused", "landmark", "", "test-kappa-ray"] {
+        for estimator in ["landmark", "", "test-kappa-ray"] {
             assert_eq!(legacy_source(estimator), RaySource::RgbOnly);
         }
+    }
+
+    #[test]
+    fn test_legacy_source_fused_is_fused() {
+        assert_eq!(legacy_source("fused"), RaySource::Fused);
     }
 }

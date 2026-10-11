@@ -69,8 +69,10 @@ impl GazePoint {
     }
 }
 
-/// The ray model that produced a gaze ray. Keys per-source corrections; the serde names equal
-/// `eye_estimate::fused::FusedSource::as_str`. `RgbOnly` sorts first: it is the primary source.
+/// The ray model that produced a gaze ray. Keys per-source corrections; for the per-chain
+/// variants the serde names equal `eye_estimate::fused::FusedSource::as_str`. `Fused` tags
+/// the fused estimator's selected output and has no `FusedSource` counterpart. `RgbOnly`
+/// sorts first: it is the primary source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RaySource {
@@ -79,15 +81,17 @@ pub enum RaySource {
     IrOnRgbEyeball,
     IrGlintOnRgbEyeball,
     Stereo,
+    Fused,
 }
 
 impl RaySource {
-    pub const ALL: [RaySource; 5] = [
+    pub const ALL: [RaySource; 6] = [
         Self::RgbOnly,
         Self::IrOnly,
         Self::IrOnRgbEyeball,
         Self::IrGlintOnRgbEyeball,
         Self::Stereo,
+        Self::Fused,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -97,6 +101,7 @@ impl RaySource {
             Self::IrOnRgbEyeball => "ir-on-rgb-eyeball",
             Self::IrGlintOnRgbEyeball => "ir-glint-on-rgb-eyeball",
             Self::Stereo => "stereo",
+            Self::Fused => "fused",
         }
     }
 }
@@ -263,5 +268,13 @@ mod tests {
     #[test]
     fn test_ray_source_orders_rgb_only_first() {
         assert_eq!(RaySource::ALL.iter().min(), Some(&RaySource::RgbOnly));
+    }
+
+    #[test]
+    fn test_ray_source_fused_round_trips_serde() {
+        let json = serde_json::to_string(&RaySource::Fused).unwrap();
+        assert_eq!(json, "\"fused\"");
+        let back: RaySource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, RaySource::Fused);
     }
 }

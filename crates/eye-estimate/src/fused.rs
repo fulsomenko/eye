@@ -886,7 +886,7 @@ impl GazeEstimator for FusedEstimator {
             .into_iter()
             .map(|(_, ray)| ray)
             .collect();
-        Ok(SourcedRay::tag(RaySource::RgbOnly, selected))
+        Ok(SourcedRay::tag(RaySource::Fused, selected))
     }
 }
 
@@ -1709,6 +1709,24 @@ mod tests {
                 .find(|e| Some(e.side) == ray.side)
                 .expect("matching eye");
             assert_eq!(*ray, expected.ray);
+        }
+    }
+
+    #[test]
+    fn test_fused_estimator_tags_selected_ray_fused() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let target = Point2::new(100.0, 50.0);
+        let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.0, 1);
+
+        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        let tagged: Vec<SourcedRay> =
+            GazeEstimator::estimate(&mut estimator, std::slice::from_ref(&rgb), &rig)
+                .expect("estimate succeeds");
+
+        assert!(!tagged.is_empty());
+        for sourced in &tagged {
+            assert_eq!(sourced.source, RaySource::Fused);
         }
     }
 

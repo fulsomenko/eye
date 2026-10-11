@@ -30,7 +30,7 @@ pub struct FitConfig {
     pub target_outlier_factor: f64,
     pub slope_prior_sigma: f64,
     /// Ridge prior sigma on the four slope terms for every source except `rgb-only`
-    /// (`slope_prior_sigma` keeps applying to `rgb-only`).
+    /// and `fused` (`slope_prior_sigma` applies to both of those instead).
     pub ir_slope_prior_sigma: f64,
     pub offset_prior_sigma_deg: f64,
     pub quad_prior_sigma: f64,
@@ -352,10 +352,9 @@ fn fit_source(
 
     let jitter_rad = cfg.fixation_jitter_deg.to_radians();
     let s_off = cfg.offset_prior_sigma_deg.to_radians();
-    let s_slope = if source == RaySource::RgbOnly {
-        cfg.slope_prior_sigma
-    } else {
-        cfg.ir_slope_prior_sigma
+    let s_slope = match source {
+        RaySource::RgbOnly | RaySource::Fused => cfg.slope_prior_sigma,
+        _ => cfg.ir_slope_prior_sigma,
     };
     let prior6 = SMatrix::<f64, 6, 6>::from_diagonal(&SVector::<f64, 6>::from([
         1.0 / (s_off * s_off),
@@ -1224,6 +1223,42 @@ mod tests {
             .correction(RaySource::IrOnly, EyeKey::Right)
             .unwrap();
         assert_abs_diff_eq!(ir.theta[1], 1.0, epsilon = 0.1);
+    }
+
+    #[test]
+    fn test_fused_source_uses_rgb_slope_prior() {
+        let rgb_samples = generate_session(&SessionConfig::default());
+        let fused_samples = generate_session(&SessionConfig {
+            source: RaySource::Fused,
+            ..SessionConfig::default()
+        });
+
+        let rgb_outcome = DotSessionFit::fit_with(
+            &rgb_samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap();
+        let fused_outcome = DotSessionFit::fit_with(
+            &fused_samples,
+            &fixture_rig(),
+            &FitConfig::default(),
+            ProfileMeta::default(),
+        )
+        .unwrap();
+
+        let rgb = rgb_outcome
+            .profile
+            .correction(RaySource::RgbOnly, EyeKey::Right)
+            .unwrap();
+        let fused = fused_outcome
+            .profile
+            .correction(RaySource::Fused, EyeKey::Right)
+            .unwrap();
+        for (a, b) in rgb.theta.iter().zip(fused.theta.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-12);
+        }
     }
 
     #[test]

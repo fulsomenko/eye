@@ -4,6 +4,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use eye_core::RaySource;
+
 use crate::correction::{
     AngularCorrection, CalibrationPose, EyeKey, PROFILE_VERSION, Provenance, UserProfile,
     legacy_source,
@@ -113,6 +115,21 @@ fn profile_version(table: &toml::Table) -> Result<u32, StoreError> {
     }
 }
 
+fn rekey_fused_rgb_entry(mut profile: UserProfile, path: &Path) -> UserProfile {
+    if profile.estimator == "fused"
+        && !profile.corrections.contains_key(&RaySource::Fused)
+        && let Some(entries) = profile.corrections.remove(&RaySource::RgbOnly)
+    {
+        profile.corrections.insert(RaySource::Fused, entries);
+        tracing::info!(
+            path = %path.display(),
+            reason = "fused_source",
+            "profile migrated"
+        );
+    }
+    profile
+}
+
 fn profile_from_table(table: toml::Table, path: &Path) -> Result<UserProfile, CalibrationError> {
     let profile = match profile_version(&table)? {
         1 => {
@@ -135,6 +152,7 @@ fn profile_from_table(table: toml::Table, path: &Path) -> Result<UserProfile, Ca
             source,
         })?,
     };
+    let profile = rekey_fused_rgb_entry(profile, path);
     tracing::info!(
         path = %path.display(),
         name = %profile.name,
@@ -430,7 +448,7 @@ estimator = "ir-pupil"
     }
 
     #[test]
-    fn test_v1_fused_profile_loads_into_rgb_only() {
+    fn test_v1_fused_profile_migrates_to_fused_source() {
         let dir = test_dir("v1-fused");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("p.toml");
@@ -456,10 +474,13 @@ rms_after_rad = 0.001
 
         assert_eq!(profile.version, PROFILE_VERSION);
         assert_eq!(profile.corrections.len(), 1);
-        let entry = profile
-            .correction(RaySource::RgbOnly, EyeKey::Left)
-            .unwrap();
+        let entry = profile.correction(RaySource::Fused, EyeKey::Left).unwrap();
         assert_eq!(entry.theta, [0.01, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert!(
+            profile
+                .correction(RaySource::RgbOnly, EyeKey::Left)
+                .is_none()
+        );
         assert!(
             profile
                 .correction(RaySource::IrOnly, EyeKey::Left)
@@ -473,7 +494,7 @@ rms_after_rad = 0.001
         assert_eq!(rec.level, eye_log::Level::Info);
         assert_eq!(
             rec.fields.get("source"),
-            Some(&eye_log::Value::Str("rgb-only".to_string()))
+            Some(&eye_log::Value::Str("fused".to_string()))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -541,7 +562,7 @@ rms_after_rad = 0.001
         write_profile(&path, &migrated).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("version = 2"));
-        assert!(contents.contains("[corrections.rgb-only.left]"));
+        assert!(contents.contains("[corrections.fused.left]"));
 
         let reloaded = read_profile(&path).unwrap();
         assert_eq!(reloaded, migrated);
@@ -569,6 +590,51 @@ estimator = "fused"
         assert!(
             matches!(err, CalibrationError::Store(StoreError::Parse { .. })),
             "expected Parse error, got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_fused_profile_rgb_entry_rekeyed_to_fused_on_load() {
+        let dir = test_dir("v2-fused-rgb-rekey");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.toml");
+        std::fs::write(
+            &path,
+            r#"version = 2
+name = "max"
+created_unix_s = 1700000000
+rig_fingerprint = "deadbeefcafef00d"
+estimator = "fused"
+[corrections.rgb-only.left]
+theta = [0.01, 0.0, 0.0, 0.0, 0.0, 0.0]
+cov = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+model = "affine"
+targets_used = 9
+rms_after_rad = 0.001
+"#,
+        )
+        .unwrap();
+
+        let (profile, records) =
+            eye_log::testing::capture_logs(tracing::Level::INFO, || read_profile(&path).unwrap());
+
+        assert_eq!(profile.corrections.len(), 1);
+        let entry = profile.correction(RaySource::Fused, EyeKey::Left).unwrap();
+        assert_eq!(entry.theta, [0.01, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert!(
+            profile
+                .correction(RaySource::RgbOnly, EyeKey::Left)
+                .is_none()
+        );
+
+        let rec = records
+            .iter()
+            .find(|r| r.message == "profile migrated")
+            .expect("no 'profile migrated' record");
+        assert_eq!(
+            rec.fields.get("reason"),
+            Some(&eye_log::Value::Str("fused_source".to_string()))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
