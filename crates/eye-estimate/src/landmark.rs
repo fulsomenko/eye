@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use eye_core::angles::{direction_from_yaw_pitch, yaw_pitch_from_direction};
 use eye_core::log::field;
 use eye_core::observation::{LandmarkScheme, mediapipe478};
 use eye_core::stage::{GazeEstimator, StageError};
@@ -12,17 +13,65 @@ use eye_core::{
 };
 use eye_geometry::camera::{Intrinsics, pixel_ray};
 use eye_geometry::eyeball::{
-    EyeCentre, EyeParams, eyeball_centre_in_head, gaze_ray, screen_from_viewer,
+    EyeCentre, EyeParams, eyeball_centre_in_head, optical_axis, ray_sphere_near,
+    screen_from_viewer, visual_axis,
 };
 use eye_geometry::face_template::MEDIAPIPE_RIGID;
 use eye_geometry::pnp::{Pose, solve_pnp};
-use eye_geometry::uncertainty::propagate_fn;
-use nalgebra::{Isometry3, Point2, Point3, Translation3, UnitQuaternion, Vector3, Vector6};
+use eye_geometry::uncertainty::{block_diag, isotropic2, propagate_fn};
+use nalgebra::{
+    Isometry3, Matrix2, Point2, Point3, SVector, Translation3, UnitQuaternion, Vector2, Vector3,
+    Vector6,
+};
 use serde::Deserialize;
 
 use crate::EstimateError;
 use crate::log::trace_ray;
 use crate::options::parse_options;
+
+/// How the detected iris centre responds to the true pupil: `measured = offset_mm + gain * true`
+/// per head axis `[lateral (temporal +), vertical (down +)]`, where `true` is the true pupil's
+/// image offset in head-frame mm, laterally from the eyeball rotation centre's image and
+/// vertically from the eye-corner midpoint's image. The vertical anchor sits on the face surface
+/// so that PnP pitch error does not move it. The vertical `measured` is the iris minus
+/// `lower_lid_weight` times the lower lid, both about that midpoint. The estimator inverts this
+/// before the eyeball model.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IrisResponse {
+    pub gain: [f64; 2],
+    pub offset_mm: [f64; 2],
+    #[serde(default)]
+    pub lower_lid_weight: f64,
+}
+
+impl IrisResponse {
+    /// The detected iris is the true pupil.
+    pub const IDENTITY: Self = Self {
+        gain: [1.0, 1.0],
+        offset_mm: [0.0, 0.0],
+        lower_lid_weight: 0.0,
+    };
+
+    /// MediaPipe Face Landmarker (478) iris, fitted on 26 recorded dot sessions of one user
+    /// (notes/eye/compress-20261011). `offset_mm` is for the optical axis (kappa applied after).
+    pub const MEDIAPIPE_478: Self = Self {
+        gain: [0.493, 0.175],
+        offset_mm: [0.63, -3.29],
+        lower_lid_weight: 0.5,
+    };
+}
+
+pub(crate) const RIGHT_LOWER_LID: [usize; 3] = [144, 145, 153];
+pub(crate) const LEFT_LOWER_LID: [usize; 3] = [373, 374, 380];
+
+/// One frame's eye geometry the [`IrisResponse`] is inverted about: points in the camera frame.
+struct EyeAnchors {
+    rotation_centre: Point3<f64>,
+    corner_midpoint: Point3<f64>,
+    camera_from_head: UnitQuaternion<f64>,
+    lower_lid_px: Point2<f64>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -31,6 +80,7 @@ pub struct LandmarkOptions {
     pub max_reprojection_px: f64,
     pub max_iris_miss_mm: f64,
     pub apply_kappa: bool,
+    pub iris_response: IrisResponse,
 }
 
 impl Default for LandmarkOptions {
@@ -40,6 +90,7 @@ impl Default for LandmarkOptions {
             max_reprojection_px: 6.0,
             max_iris_miss_mm: 2.0,
             apply_kappa: true,
+            iris_response: IrisResponse::MEDIAPIPE_478,
         }
     }
 }
@@ -55,7 +106,12 @@ pub struct LandmarkEstimator {
 pub struct LandmarkEye {
     pub side: Side,
     pub centre: EyeCentre,
+    /// As detected.
     pub iris_px: Measured<Point2<f64>>,
+    /// `iris_px` with the [`IrisResponse`] inverted: the pupil the eyeball model uses.
+    pub pupil_px: Point2<f64>,
+    /// Covariance of `pupil_px` from the iris noise and the head-pose error, px².
+    pub pupil_cov: Matrix2<f64>,
     pub ray: GazeRay,
 }
 
@@ -215,18 +271,24 @@ impl LandmarkEstimator {
             &self.params,
         );
 
+        let corner_mid_head = corner_midpoint(
+            &MEDIAPIPE_RIGID.point(inner_idx)?,
+            &MEDIAPIPE_RIGID.point(outer_idx)?,
+        );
+
         let (r0, t0) = (
             pose.camera_from_object.rotation,
             pose.camera_from_object.translation.vector,
         );
         let screen_from_camera = cam.screen_from_camera;
-        let e_of = |x: &Vector6<f64>| -> Option<Vector3<f64>> {
-            let rotation = UnitQuaternion::from_scaled_axis(Vector3::new(x[0], x[1], x[2])) * r0;
-            let camera_from_head = Isometry3::from_parts(
+        let perturbed = |x: &[f64]| -> Isometry3<f64> {
+            Isometry3::from_parts(
                 Translation3::from(t0 + Vector3::new(x[3], x[4], x[5])),
-                rotation,
-            );
-            Some((screen_from_camera * camera_from_head * e_head).coords)
+                UnitQuaternion::from_scaled_axis(Vector3::new(x[0], x[1], x[2])) * r0,
+            )
+        };
+        let e_of = |x: &Vector6<f64>| -> Option<Vector3<f64>> {
+            Some((screen_from_camera * perturbed(x.as_slice()) * e_head).coords)
         };
         let Some((e, cov)) = propagate_fn::<3, 6>(e_of, &Vector6::zeros(), &pose.cov) else {
             tracing::debug!(
@@ -258,7 +320,40 @@ impl LandmarkEstimator {
             return None;
         };
 
-        let (o, u) = pixel_ray(cam, iris_px.value())
+        let intr = Intrinsics::from_camera_model(cam);
+        let response = self.options.iris_response;
+        let lid = match side {
+            Side::Right => RIGHT_LOWER_LID,
+            Side::Left => LEFT_LOWER_LID,
+        };
+        let lower_lid_px = Point2::from(
+            lid.iter()
+                .map(|&i| face.landmarks.get(i).map(|p| p.coords))
+                .sum::<Option<Vector2<f64>>>()?
+                / lid.len() as f64,
+        );
+        let anchors = |camera_from_head: &Isometry3<f64>, lower_lid_px: Point2<f64>| EyeAnchors {
+            rotation_centre: camera_from_head * e_head,
+            corner_midpoint: camera_from_head * corner_mid_head,
+            camera_from_head: camera_from_head.rotation,
+            lower_lid_px,
+        };
+        let Some(pupil_px) = invert_iris_response(
+            &response,
+            side,
+            &intr,
+            &anchors(&pose.camera_from_object, lower_lid_px),
+            iris_px.value(),
+        ) else {
+            tracing::debug!(
+                { field::REASON } = "iris_response_degenerate",
+                side = side.as_str(),
+                "eye dropped"
+            );
+            return None;
+        };
+
+        let (o, u) = pixel_ray(cam, &pupil_px)
             .inspect_err(|err| {
                 tracing::debug!(
                     { field::REASON } = "pixel_ray_failed",
@@ -282,24 +377,131 @@ impl LandmarkEstimator {
         }
 
         let params = self.effective_params();
-        let ray = gaze_ray(side, &centre, cam, &iris_px, &params, Some(viewer), at)
-            .inspect_err(|e| {
-                tracing::debug!(
-                    { field::REASON } = "gaze_ray_failed",
-                    side = side.as_str(),
-                    error = %e,
-                    "eye dropped"
-                );
-            })
-            .ok()?;
+        let angles_of = |response: &IrisResponse, x: &SVector<f64, 10>| -> Option<Vector2<f64>> {
+            let camera_from_head = perturbed(x.as_slice());
+            let e = screen_from_camera * camera_from_head * e_head;
+            let pupil = invert_iris_response(
+                response,
+                side,
+                &intr,
+                &anchors(&camera_from_head, Point2::new(x[8], x[9])),
+                &Point2::new(x[6], x[7]),
+            )?;
+            let (o, d) = pixel_ray(cam, &pupil).ok()?;
+            let p = ray_sphere_near(&o, &d, &e, params.rotation_to_pupil_mm);
+            let opt = optical_axis(&e, &p)?;
+            Some(yaw_pitch_from_direction(&visual_axis(
+                &opt,
+                &params.kappa,
+                side,
+                viewer,
+            )))
+        };
+        let x0 = SVector::<f64, 10>::from_row_slice(&[
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            iris_px.value().x,
+            iris_px.value().y,
+            lower_lid_px.x,
+            lower_lid_px.y,
+        ]);
+        let lid_sigma = self.options.landmark_sigma_px / (lid.len() as f64).sqrt();
+        let cov_in = block_diag::<8, 2, 10>(
+            &block_diag::<6, 2, 8>(&pose.cov, &isotropic2(iris_px.sigma())),
+            &isotropic2(lid_sigma),
+        );
+        // Deliberately the covariance of the ray read from the uncorrected iris: the inverted ray's
+        // own (about 1/gain larger) makes the fused selector prefer less accurate IR candidates.
+        let uncorrected = |x: &SVector<f64, 10>| angles_of(&IrisResponse::IDENTITY, x);
+        let (Some(angles), Some((_, angular_cov))) = (
+            angles_of(&response, &x0),
+            propagate_fn::<2, 10>(uncorrected, &x0, &cov_in),
+        ) else {
+            tracing::debug!(
+                { field::REASON } = "gaze_ray_failed",
+                side = side.as_str(),
+                "eye dropped"
+            );
+            return None;
+        };
+        let ray = GazeRay {
+            side: Some(side),
+            timestamp: at,
+            origin: centre.position,
+            direction: direction_from_yaw_pitch(&angles),
+            angular_cov,
+            origin_cov: centre.cov,
+            head_rotation: Some(*viewer),
+        };
 
+        let pupil_of = |x: &SVector<f64, 10>| -> Option<Vector2<f64>> {
+            let camera_from_head = perturbed(x.as_slice());
+            invert_iris_response(
+                &response,
+                side,
+                &intr,
+                &anchors(&camera_from_head, Point2::new(x[8], x[9])),
+                &Point2::new(x[6], x[7]),
+            )
+            .map(|p| p.coords)
+        };
+        let (_, pupil_cov) = propagate_fn::<2, 10>(pupil_of, &x0, &cov_in)?;
         Some(LandmarkEye {
             side,
             centre,
             iris_px,
+            pupil_px,
+            pupil_cov,
             ray,
         })
     }
+}
+
+fn corner_midpoint(inner: &Point3<f64>, outer: &Point3<f64>) -> Point3<f64> {
+    Point3::from((inner.coords + outer.coords) / 2.0)
+}
+
+/// The pupil pixel the eyeball model expects for a detected `iris_px`: inverts `response` with
+/// lateral offsets about the rotation centre and vertical offsets about the corner midpoint, along
+/// the head's x and y axes.
+fn invert_iris_response(
+    response: &IrisResponse,
+    side: Side,
+    intr: &Intrinsics,
+    anchors: &EyeAnchors,
+    iris_px: &Point2<f64>,
+) -> Option<Point2<f64>> {
+    if *response == IrisResponse::IDENTITY {
+        return Some(*iris_px);
+    }
+    let lateral_px = intr.project(&anchors.rotation_centre).ok()?;
+    let vertical_px = intr.project(&anchors.corner_midpoint).ok()?;
+    let axis_px = |axis: Vector3<f64>| -> Option<Vector2<f64>> {
+        Some(
+            intr.project(&(anchors.rotation_centre + anchors.camera_from_head * axis))
+                .ok()?
+                - lateral_px,
+        )
+    };
+    let head_px = Matrix2::from_columns(&[axis_px(Vector3::x())?, axis_px(Vector3::y())?]);
+    let px_head = head_px.try_inverse()?;
+    let temporal_x = match side {
+        Side::Right => -1.0,
+        Side::Left => 1.0,
+    };
+    let offset = Vector2::new(temporal_x * response.offset_mm[0], response.offset_mm[1]);
+    let lower_lid_y = (px_head * (anchors.lower_lid_px - vertical_px)).y;
+    let measured = Vector2::new(
+        (px_head * (iris_px - lateral_px)).x,
+        (px_head * (iris_px - vertical_px)).y - response.lower_lid_weight * lower_lid_y,
+    );
+    let truth = (measured - offset).component_div(&Vector2::from(response.gain));
+    let vertical_shift = (px_head * (vertical_px - lateral_px)).y;
+    Some(lateral_px + head_px * Vector2::new(truth.x, truth.y + vertical_shift))
 }
 
 impl GazeEstimator for LandmarkEstimator {
@@ -331,7 +533,8 @@ mod tests {
 
     use super::*;
     use crate::testutil::{
-        synthetic_eye_centres, synthetic_ir_observation, synthetic_rgb_observation, test_rig,
+        synthetic_eye_centres, synthetic_ir_observation, synthetic_rgb_observation,
+        synthetic_rgb_observation_with_response, test_rig,
     };
 
     fn frontal_screen_from_head() -> Isometry3<f64> {
@@ -577,17 +780,67 @@ mod tests {
 
     #[test]
     fn test_angular_cov_matches_monte_carlo() {
+        assert_angular_cov_matches_monte_carlo(&IrisResponse::IDENTITY, 1.5, 1.0);
+    }
+
+    #[test]
+    fn test_angular_cov_is_that_of_the_uncorrected_ray() {
+        let rig = test_rig();
+        let obs = synthetic_rgb_observation(
+            &rig,
+            &frontal_screen_from_head(),
+            1.0,
+            Point2::new(100.0, 50.0),
+            0.5,
+            0.3,
+            7,
+        );
+        let corrected = right_eye_ray(LandmarkOptions::default(), &obs, &rig);
+        let uncorrected = right_eye_ray(
+            LandmarkOptions {
+                iris_response: IrisResponse::IDENTITY,
+                ..Default::default()
+            },
+            &obs,
+            &rig,
+        );
+
+        assert!(angle_deg(&corrected.ray.direction, &uncorrected.ray.direction) > 1.0);
+        assert_abs_diff_eq!(
+            corrected.ray.angular_cov,
+            uncorrected.ray.angular_cov,
+            epsilon = 1e-15
+        );
+    }
+
+    fn assert_angular_cov_matches_monte_carlo(
+        response: &IrisResponse,
+        landmark_sigma_px: f64,
+        iris_sigma_px: f64,
+    ) {
         let rig = test_rig();
         let screen_from_head = frontal_screen_from_head();
         let target = Point2::new(100.0, 50.0);
         let options = LandmarkOptions {
-            landmark_sigma_px: 1.5,
+            landmark_sigma_px,
             apply_kappa: false,
+            iris_response: *response,
             ..Default::default()
         };
+        let observe = |landmark_noise_px, iris_noise_px, seed| {
+            synthetic_rgb_observation_with_response(
+                &rig,
+                &screen_from_head,
+                1.0,
+                target,
+                landmark_noise_px,
+                iris_noise_px,
+                seed,
+                response,
+            )
+        };
 
-        let mut noise_free =
-            synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.0, 0);
+        let mut noise_free = observe(0.0, 0.0, 0);
         for eye in noise_free
             .face
             .as_mut()
@@ -597,7 +850,7 @@ mod tests {
         {
             eye.iris = eye
                 .iris
-                .map(|m| Measured::new(m.into_value(), 1.0).expect("valid sigma"));
+                .map(|m| Measured::new(m.into_value(), iris_sigma_px).expect("valid sigma"));
         }
         let mut reference_estimator = LandmarkEstimator::new(options.clone());
         let reference_frame = reference_estimator
@@ -609,8 +862,7 @@ mod tests {
         let n = 2000;
         let mut samples = Vec::with_capacity(n);
         for seed in 0..n as u64 {
-            let obs =
-                synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 1.5, 1.0, seed);
+            let obs = observe(landmark_sigma_px, iris_sigma_px, seed);
             let mut estimator = LandmarkEstimator::new(options.clone());
             let frame = estimator
                 .estimate_frame(&obs, &rig)
@@ -852,6 +1104,139 @@ mod tests {
             .estimate(&[obs], &rig)
             .expect_err("unknown camera is an error");
         assert!(matches!(stage_err, StageError::Failed(_)));
+    }
+
+    fn right_eye_ray(options: LandmarkOptions, obs: &Observations, rig: &Rig) -> LandmarkEye {
+        LandmarkEstimator::new(options)
+            .estimate_frame(obs, rig)
+            .expect("estimate succeeds")
+            .expect("frame is recovered")
+            .eyes
+            .into_iter()
+            .find(|e| e.side == Side::Right)
+            .expect("right eye present")
+    }
+
+    #[test]
+    fn test_compressed_iris_read_as_true_pupil_compresses_gaze() {
+        let rig = test_rig();
+        let screen_from_head = frontal_screen_from_head();
+        let left = Point2::new(0.0, 85.0);
+        let right = Point2::new(310.0, 85.0);
+        let identity = LandmarkOptions {
+            apply_kappa: false,
+            iris_response: IrisResponse::IDENTITY,
+            ..Default::default()
+        };
+        let observe =
+            |target| synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.0, 1);
+
+        let span = |options: &LandmarkOptions| {
+            let a = right_eye_ray(options.clone(), &observe(left), &rig);
+            let b = right_eye_ray(options.clone(), &observe(right), &rig);
+            angle_deg(&a.ray.direction, &b.ray.direction)
+        };
+        let centre = synthetic_eye_centres(&screen_from_head, 1.0, &EyeParams::default())[0];
+        let true_span = angle_deg(
+            &Unit::new_normalize(Point3::new(left.x, left.y, 0.0) - centre),
+            &Unit::new_normalize(Point3::new(right.x, right.y, 0.0) - centre),
+        );
+
+        let compressed = span(&identity) / true_span;
+        assert!(
+            (0.4..0.6).contains(&compressed),
+            "identity response span ratio {compressed}"
+        );
+        let inverted = span(&LandmarkOptions {
+            apply_kappa: false,
+            ..Default::default()
+        }) / true_span;
+        assert!(
+            (inverted - 1.0).abs() < 0.01,
+            "inverted response span ratio {inverted}"
+        );
+    }
+
+    #[test]
+    fn test_identity_response_uses_detected_iris_as_pupil() {
+        let rig = test_rig();
+        let obs = synthetic_rgb_observation_with_response(
+            &rig,
+            &frontal_screen_from_head(),
+            1.0,
+            Point2::new(100.0, 50.0),
+            0.0,
+            0.0,
+            1,
+            &IrisResponse::IDENTITY,
+        );
+        let eye = right_eye_ray(
+            LandmarkOptions {
+                iris_response: IrisResponse::IDENTITY,
+                ..Default::default()
+            },
+            &obs,
+            &rig,
+        );
+
+        assert_eq!(eye.pupil_px, *eye.iris_px.value());
+    }
+
+    #[test]
+    fn test_iris_response_scales_pupil_offset_per_head_axis() {
+        let rig = test_rig();
+        let obs = synthetic_rgb_observation_with_response(
+            &rig,
+            &frontal_screen_from_head(),
+            1.0,
+            Point2::new(0.0, 170.0),
+            0.0,
+            0.0,
+            1,
+            &IrisResponse::IDENTITY,
+        );
+        let options = |gain: [f64; 2]| LandmarkOptions {
+            iris_response: IrisResponse {
+                gain,
+                offset_mm: [0.0, 0.0],
+                lower_lid_weight: 0.0,
+            },
+            ..Default::default()
+        };
+        let base = right_eye_ray(options([1.0, 0.999_999]), &obs, &rig);
+        let halved_x = right_eye_ray(options([0.5, 0.999_999]), &obs, &rig);
+        let halved_y = right_eye_ray(options([0.999_999, 0.5]), &obs, &rig);
+
+        let shift_x = halved_x.pupil_px - base.pupil_px;
+        let shift_y = halved_y.pupil_px - base.pupil_px;
+        assert!(shift_x.x.abs() > 1.0, "lateral shift {shift_x:?}");
+        assert!(
+            shift_x.y.abs() < 0.05 * shift_x.x.abs(),
+            "lateral shift {shift_x:?}"
+        );
+        assert!(shift_y.y.abs() > 1.0, "vertical shift {shift_y:?}");
+        assert!(
+            shift_y.x.abs() < 0.05 * shift_y.y.abs(),
+            "vertical shift {shift_y:?}"
+        );
+    }
+
+    #[test]
+    fn test_iris_response_parses_from_config_without_lower_lid_weight() {
+        let table: toml::Table =
+            toml::from_str("iris_response = { gain = [0.5, 0.25], offset_mm = [0.5, -2.0] }")
+                .expect("valid toml");
+        let options: LandmarkOptions =
+            parse_options(LandmarkEstimator::NAME, &table).expect("options parse");
+
+        assert_eq!(
+            options.iris_response,
+            IrisResponse {
+                gain: [0.5, 0.25],
+                offset_mm: [0.5, -2.0],
+                lower_lid_weight: 0.0,
+            }
+        );
     }
 
     #[test]

@@ -9,7 +9,13 @@ use eye_geometry::camera::Intrinsics;
 use eye_geometry::eyeball::{EyeParams, eyeball_centre_in_head};
 use eye_geometry::face_template::MEDIAPIPE_RIGID;
 use eye_geometry::synth::SplitMix64;
-use nalgebra::{Isometry3, Point2, Point3, Translation3, UnitQuaternion, Vector2, Vector3};
+use nalgebra::{
+    Isometry3, Matrix2, Point2, Point3, Translation3, UnitQuaternion, Vector2, Vector3,
+};
+
+use crate::landmark::{IrisResponse, LEFT_LOWER_LID, RIGHT_LOWER_LID};
+
+const LOWER_LID_BELOW_CORNERS_MM: f64 = 3.0;
 
 pub(crate) fn test_rig() -> Rig {
     let ir = CameraModel {
@@ -262,12 +268,61 @@ pub(crate) fn synthetic_eye_centres(
         .map(|centre| screen_from_head.transform_point(&Point3::from(centre.coords * scale)))
 }
 
-/// Poses `MEDIAPIPE_RIGID` scaled by `scale` about the head origin at `screen_from_head`,
-/// projects into the "rgb" camera, fills 478 landmarks (template indices exact plus
-/// `N(0, landmark_noise_px)`; every other index at the projected head origin), and both eyes:
-/// corners at the projected template corners, iris at the pupil-sphere crossing towards
-/// `target_mm` plus `N(0, iris_noise_px)`. Scheme `LandmarkScheme::MEDIAPIPE_478`, camera "rgb",
-/// timestamp 0. Noise from `SplitMix64::new(seed)`.
+/// What a detector with `response` reports for a true pupil at `pupil_px` (see
+/// [`IrisResponse`]): the forward map that `LandmarkEstimator` inverts, given the noise-free
+/// lower lid.
+#[allow(clippy::too_many_arguments)]
+fn detected_iris(
+    response: &IrisResponse,
+    project: &impl Fn(&Point3<f64>) -> Point2<f64>,
+    screen_from_head: &Isometry3<f64>,
+    scale: f64,
+    side: Side,
+    rotation_centre: &Point3<f64>,
+    lower_lid_px: &Point2<f64>,
+    pupil_px: &Point2<f64>,
+) -> Point2<f64> {
+    let (medial, lateral) = match side {
+        Side::Right => (
+            mediapipe478::RIGHT_EYE_MEDIAL,
+            mediapipe478::RIGHT_EYE_LATERAL,
+        ),
+        Side::Left => (
+            mediapipe478::LEFT_EYE_MEDIAL,
+            mediapipe478::LEFT_EYE_LATERAL,
+        ),
+    };
+    let corner = |i| {
+        MEDIAPIPE_RIGID
+            .point(i)
+            .expect("corners are in the rigid template")
+    };
+    let mid_head = Point3::from((corner(medial).coords + corner(lateral).coords) * (scale / 2.0));
+    let lateral_px = project(rotation_centre);
+    let vertical_px = project(&screen_from_head.transform_point(&mid_head));
+    let axis_px = |axis: Vector3<f64>| {
+        project(&(rotation_centre + screen_from_head.rotation * axis)) - lateral_px
+    };
+    let head_px = Matrix2::from_columns(&[axis_px(Vector3::x()), axis_px(Vector3::y())]);
+    let px_head = head_px.try_inverse().expect("head axes span the image");
+    let temporal_x = match side {
+        Side::Right => -1.0,
+        Side::Left => 1.0,
+    };
+    let offset = Vector2::new(temporal_x * response.offset_mm[0], response.offset_mm[1]);
+    let truth = Vector2::new(
+        (px_head * (pupil_px - lateral_px)).x,
+        (px_head * (pupil_px - vertical_px)).y,
+    );
+    let lower_lid_y = (px_head * (lower_lid_px - vertical_px)).y;
+    let measured = offset
+        + Vector2::from(response.gain).component_mul(&truth)
+        + Vector2::new(0.0, response.lower_lid_weight * lower_lid_y);
+    let vertical_shift = (px_head * (vertical_px - lateral_px)).y;
+    lateral_px + head_px * Vector2::new(measured.x, measured.y + vertical_shift)
+}
+
+/// A MediaPipe RGB observation: the iris follows [`IrisResponse::MEDIAPIPE_478`].
 pub(crate) fn synthetic_rgb_observation(
     rig: &Rig,
     screen_from_head: &Isometry3<f64>,
@@ -276,6 +331,35 @@ pub(crate) fn synthetic_rgb_observation(
     landmark_noise_px: f64,
     iris_noise_px: f64,
     seed: u64,
+) -> Observations {
+    synthetic_rgb_observation_with_response(
+        rig,
+        screen_from_head,
+        scale,
+        target_mm,
+        landmark_noise_px,
+        iris_noise_px,
+        seed,
+        &IrisResponse::MEDIAPIPE_478,
+    )
+}
+
+/// Poses `MEDIAPIPE_RIGID` scaled by `scale` about the head origin at `screen_from_head`,
+/// projects into the "rgb" camera, fills 478 landmarks (template indices exact plus
+/// `N(0, landmark_noise_px)`; every other index at the projected head origin), and both eyes:
+/// corners at the projected template corners, iris at the pupil-sphere crossing towards
+/// `target_mm` plus `N(0, iris_noise_px)`. Scheme `LandmarkScheme::MEDIAPIPE_478`, camera "rgb",
+/// timestamp 0. Noise from `SplitMix64::new(seed)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn synthetic_rgb_observation_with_response(
+    rig: &Rig,
+    screen_from_head: &Isometry3<f64>,
+    scale: f64,
+    target_mm: Point2<f64>,
+    landmark_noise_px: f64,
+    iris_noise_px: f64,
+    seed: u64,
+    response: &IrisResponse,
 ) -> Observations {
     let cam = rig.camera("rgb").expect("test rig has an rgb camera");
     let intrinsics = Intrinsics::from_camera_model(cam);
@@ -300,6 +384,37 @@ pub(crate) fn synthetic_rgb_observation(
         );
     }
 
+    let lower_lid_px = [
+        (
+            mediapipe478::RIGHT_EYE_MEDIAL,
+            mediapipe478::RIGHT_EYE_LATERAL,
+            RIGHT_LOWER_LID,
+        ),
+        (
+            mediapipe478::LEFT_EYE_MEDIAL,
+            mediapipe478::LEFT_EYE_LATERAL,
+            LEFT_LOWER_LID,
+        ),
+    ]
+    .map(|(medial, lateral, lid)| {
+        let corner = |i| {
+            MEDIAPIPE_RIGID
+                .point(i)
+                .expect("corners are in the rigid template")
+        };
+        let mid = (corner(medial).coords + corner(lateral).coords) / 2.0;
+        let lid_head =
+            Point3::from((mid + Vector3::new(0.0, LOWER_LID_BELOW_CORNERS_MM, 0.0)) * scale);
+        let pixel = project(&screen_from_head.transform_point(&lid_head));
+        for i in lid {
+            landmarks[i] = Point2::new(
+                pixel.x + landmark_noise_px * rng.gaussian(),
+                pixel.y + landmark_noise_px * rng.gaussian(),
+            );
+        }
+        pixel
+    });
+
     let target = Point3::new(target_mm.x, target_mm.y, 0.0);
     let centres = synthetic_eye_centres(screen_from_head, scale, &params);
 
@@ -317,30 +432,42 @@ pub(crate) fn synthetic_rgb_observation(
     ]
     .into_iter()
     .zip(centres)
-    .map(|((side, lateral_idx, medial_idx), centre)| {
-        let direction = (target - centre).normalize();
-        let pupil_screen = centre + direction * params.rotation_to_pupil_mm;
-        let pupil_pixel = project(&pupil_screen);
-        let noisy_pupil = Point2::new(
-            pupil_pixel.x + iris_noise_px * rng.gaussian(),
-            pupil_pixel.y + iris_noise_px * rng.gaussian(),
-        );
-        let mut eye = EyeObservation::new(side);
-        eye.corners = Some(EyeCorners {
-            lateral: Measured::new(landmarks[lateral_idx], landmark_noise_px)
+    .zip(lower_lid_px)
+    .map(
+        |(((side, lateral_idx, medial_idx), centre), lower_lid_px)| {
+            let direction = (target - centre).normalize();
+            let pupil_screen = centre + direction * params.rotation_to_pupil_mm;
+            let pupil_pixel = detected_iris(
+                response,
+                &project,
+                screen_from_head,
+                scale,
+                side,
+                &centre,
+                &lower_lid_px,
+                &project(&pupil_screen),
+            );
+            let noisy_pupil = Point2::new(
+                pupil_pixel.x + iris_noise_px * rng.gaussian(),
+                pupil_pixel.y + iris_noise_px * rng.gaussian(),
+            );
+            let mut eye = EyeObservation::new(side);
+            eye.corners = Some(EyeCorners {
+                lateral: Measured::new(landmarks[lateral_idx], landmark_noise_px)
+                    .expect("synthetic sigma is valid"),
+                medial: Measured::new(landmarks[medial_idx], landmark_noise_px)
+                    .expect("synthetic sigma is valid"),
+            });
+            eye.iris = Some(
+                Measured::new(
+                    Ellipse2::circle(noisy_pupil, 11.85).expect("synthetic iris ellipse is valid"),
+                    iris_noise_px,
+                )
                 .expect("synthetic sigma is valid"),
-            medial: Measured::new(landmarks[medial_idx], landmark_noise_px)
-                .expect("synthetic sigma is valid"),
-        });
-        eye.iris = Some(
-            Measured::new(
-                Ellipse2::circle(noisy_pupil, 11.85).expect("synthetic iris ellipse is valid"),
-                iris_noise_px,
-            )
-            .expect("synthetic sigma is valid"),
-        );
-        eye
-    })
+            );
+            eye
+        },
+    )
     .collect();
 
     Observations {

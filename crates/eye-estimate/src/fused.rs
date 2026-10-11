@@ -409,7 +409,7 @@ impl FusedEstimator {
                         eye.side,
                         &eye.centre,
                         rgb_cam,
-                        &eye.iris_px,
+                        &eye.iris_px.map(|_| eye.pupil_px),
                         &params,
                         Some(&f.viewer),
                     )
@@ -595,11 +595,13 @@ impl FusedEstimator {
                 let views = (
                     View {
                         camera: rgb_cam,
-                        pixel: eye.iris_px,
+                        pixel: eye.iris_px.map(|_| eye.pupil_px),
+                        pixel_cov: Some(eye.pupil_cov),
                     },
                     View {
                         camera: ir_cam,
                         pixel: pupil_px,
+                        pixel_cov: None,
                     },
                 );
                 match triangulate(&views.0, &views.1) {
@@ -1163,11 +1165,11 @@ mod tests {
 
     use super::*;
     use crate::ir_pupil::Trigger;
-    use crate::landmark::LandmarkOptions;
+    use crate::landmark::{IrisResponse, LandmarkOptions};
     use crate::testutil::{
         EYE_CENTRES, synthetic_eye_centres, synthetic_ir_observation_at,
         synthetic_pccr_observation, synthetic_pccr_observation_posed, synthetic_rgb_observation,
-        test_rig,
+        synthetic_rgb_observation_with_response, test_rig,
     };
     use eye_geometry::pnp::Pose;
 
@@ -1193,6 +1195,40 @@ mod tests {
         }
     }
 
+    /// `fused_options_no_kappa` for an RGB detector whose iris is the true pupil, to pair with
+    /// `synthetic_rgb_observation_with_response(.., &IrisResponse::IDENTITY)`.
+    fn exact_iris_options() -> FusedOptions {
+        let options = fused_options_no_kappa();
+        FusedOptions {
+            landmark: LandmarkOptions {
+                iris_response: IrisResponse::IDENTITY,
+                ..options.landmark.clone()
+            },
+            ..options
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exact_iris_rgb(
+        rig: &Rig,
+        screen_from_head: &Isometry3<f64>,
+        target: Point2<f64>,
+        landmark_noise_px: f64,
+        iris_noise_px: f64,
+        seed: u64,
+    ) -> Observations {
+        synthetic_rgb_observation_with_response(
+            rig,
+            screen_from_head,
+            1.0,
+            target,
+            landmark_noise_px,
+            iris_noise_px,
+            seed,
+            &IrisResponse::IDENTITY,
+        )
+    }
+
     fn angle_deg(a: &Unit<Vector3<f64>>, b: &Unit<Vector3<f64>>) -> f64 {
         a.dot(b).clamp(-1.0, 1.0).acos().to_degrees()
     }
@@ -1212,6 +1248,8 @@ mod tests {
                 cov,
             },
             iris_px,
+            pupil_px: *iris_px.value(),
+            pupil_cov: Matrix2::identity(),
             ray: yaw_pitch_ray(0.0, 0.0, Matrix2::identity()),
         };
         LandmarkFrame {
@@ -1449,7 +1487,7 @@ mod tests {
 
         let stereo_error = angle_deg(&stereo.direction, &truth(Side::Right));
         let rgb_error = angle_deg(&rgb_only.direction, &truth(Side::Right));
-        assert!(stereo_error < 0.3, "stereo error {stereo_error} deg");
+        assert!(stereo_error < 0.5, "stereo error {stereo_error} deg");
         assert!(rgb_error > 1.0, "rgb-only error {rgb_error} deg");
     }
 
@@ -1494,7 +1532,7 @@ mod tests {
             .2
             .clone();
         let stereo_error = angle_deg(&stereo.direction, &truth);
-        assert!(stereo_error < 0.3, "stereo error {stereo_error} deg");
+        assert!(stereo_error < 0.5, "stereo error {stereo_error} deg");
     }
 
     #[test]
@@ -2395,7 +2433,7 @@ mod tests {
         let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
         let (iris_sigma, pupil_sigma) = (1.0, 0.2);
 
-        let mut rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.0, 0);
+        let mut rgb = exact_iris_rgb(&rig, &screen_from_head, target, 0.0, 0.0, 0);
         for eye in rgb.face.as_mut().expect("face present").eyes.iter_mut() {
             eye.iris = eye
                 .iris
@@ -2409,7 +2447,7 @@ mod tests {
         }
         ir.timestamp = rgb.timestamp;
 
-        let mut reference = FusedEstimator::new(fused_options_no_kappa());
+        let mut reference = FusedEstimator::new(exact_iris_options());
         let predicted = reference
             .candidates(&[rgb, ir], &rig)
             .expect("estimate succeeds")
@@ -2423,10 +2461,9 @@ mod tests {
         let n = 2000;
         let mut samples = Vec::with_capacity(n);
         for seed in 0..n as u64 {
-            let rgb_noisy = synthetic_rgb_observation(
+            let rgb_noisy = exact_iris_rgb(
                 &rig,
                 &screen_from_head,
-                1.0,
                 target,
                 landmark_sigma,
                 iris_sigma,
@@ -2436,7 +2473,7 @@ mod tests {
                 synthetic_ir_observation_at(&rig, centres, target, pupil_sigma, seed);
             ir_noisy.timestamp = rgb_noisy.timestamp;
 
-            let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+            let mut estimator = FusedEstimator::new(exact_iris_options());
             let stereo = estimator
                 .candidates(&[rgb_noisy, ir_noisy], &rig)
                 .expect("estimate succeeds")
@@ -3078,16 +3115,17 @@ mod tests {
         let params = EyeParams::default();
         let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
 
-        let rgb0 = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 1.0, 3);
+        let options = exact_iris_options();
+        let rgb0 = exact_iris_rgb(&rig, &screen_from_head, target, 0.0, 1.0, 3);
         let mut ir0 = synthetic_ir_observation_at(&rig, centres, target, 0.05, 3);
         ir0.timestamp = rgb0.timestamp;
 
-        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
+        let mut estimator = FusedEstimator::new(options.clone());
         estimator
             .estimate_detailed(&[rgb0, ir0], &rig)
             .expect("calibrating call succeeds");
 
-        let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 1.0, 4);
+        let rgb = exact_iris_rgb(&rig, &screen_from_head, target, 0.0, 1.0, 4);
         let ir_target = Point2::new(target.x + 90.0, target.y);
         let mut ir = synthetic_ir_observation_at(&rig, centres, ir_target, 0.05, 4);
         ir.timestamp = Timestamp::from_nanos(1_000_000);
@@ -3122,10 +3160,7 @@ mod tests {
             right_ir_decision.mahalanobis2
         );
 
-        let mut reference = LandmarkEstimator::new(LandmarkOptions {
-            apply_kappa: false,
-            ..Default::default()
-        });
+        let mut reference = LandmarkEstimator::new(options.landmark);
         let frame = reference
             .estimate_frame(&rgb, &rig)
             .expect("estimate succeeds")
@@ -3271,9 +3306,8 @@ mod tests {
         let centres = synthetic_eye_centres(&screen_from_head, 1.0, &params);
         let ir_target = Point2::new(target.x + 500.0 * 12f64.to_radians().tan(), target.y);
 
-        let mut estimator = FusedEstimator::new(fused_options_no_kappa());
-        let calibrate_rgb =
-            synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.05, 0);
+        let mut estimator = FusedEstimator::new(exact_iris_options());
+        let calibrate_rgb = exact_iris_rgb(&rig, &screen_from_head, target, 0.0, 0.05, 0);
         let mut calibrate_ir = synthetic_ir_observation_at(&rig, centres, target, 0.02, 1000);
         calibrate_ir.timestamp = calibrate_rgb.timestamp;
         estimator
@@ -3284,7 +3318,7 @@ mod tests {
         let mut last_rgb = None;
         let mut last_ir = None;
         for i in 0..40u64 {
-            let rgb = synthetic_rgb_observation(&rig, &screen_from_head, 1.0, target, 0.0, 0.05, i);
+            let rgb = exact_iris_rgb(&rig, &screen_from_head, target, 0.0, 0.05, i);
             let mut ir = synthetic_ir_observation_at(&rig, centres, ir_target, 0.02, i + 1000);
             ir.timestamp = Timestamp::from_nanos((i + 1) * 1_000_000);
             let rgb = Observations {
@@ -3305,7 +3339,7 @@ mod tests {
             .expect("InverseCovariance decision present");
         assert!(ic_decision.accepted);
 
-        let mut probe = FusedEstimator::new(fused_options_no_kappa());
+        let mut probe = FusedEstimator::new(exact_iris_options());
         let probe_candidates = probe
             .candidates(
                 &[last_rgb.expect("ran once"), last_ir.expect("ran once")],

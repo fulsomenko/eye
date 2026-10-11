@@ -4,12 +4,12 @@
 //! (reprojection-error minimisation).
 
 use eye_core::{CameraModel, Measured};
-use nalgebra::{DVector, Point2, Point3, Unit, Vector3};
+use nalgebra::{DVector, Matrix2, Point2, Point3, Unit, Vector3};
 
 use crate::GeometryError;
 use crate::camera::Intrinsics;
 use crate::lsq::{self, ResidualModel, SolveOptions};
-use crate::uncertainty::Cov3;
+use crate::uncertainty::{Cov2, Cov3};
 
 pub const MIN_PARALLAX_RAD: f64 = 0.005;
 
@@ -17,6 +17,17 @@ pub const MIN_PARALLAX_RAD: f64 = 0.005;
 pub struct View<'a> {
     pub camera: &'a CameraModel,
     pub pixel: Measured<Point2<f64>>,
+    /// Full pixel covariance; when set it replaces `pixel.sigma()` in the reprojection weights.
+    pub pixel_cov: Option<Cov2>,
+}
+
+impl View<'_> {
+    fn whitening(&self) -> Option<Matrix2<f64>> {
+        match self.pixel_cov {
+            None => Some(Matrix2::identity() / self.pixel.sigma()),
+            Some(cov) => Some(cov.cholesky()?.l().try_inverse()?),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -54,7 +65,7 @@ pub fn midpoint(
 }
 
 struct TwoView<'a> {
-    views: [(&'a CameraModel, Intrinsics, Measured<Point2<f64>>); 2],
+    views: [(&'a CameraModel, Intrinsics, Point2<f64>, Matrix2<f64>); 2],
 }
 
 impl ResidualModel for TwoView<'_> {
@@ -65,12 +76,13 @@ impl ResidualModel for TwoView<'_> {
     fn residuals(&self, x: &DVector<f64>) -> Option<DVector<f64>> {
         let p = Point3::new(x[0], x[1], x[2]);
         let mut r = DVector::zeros(4);
-        for (k, (cam, intr, m)) in self.views.iter().enumerate() {
+        for (k, (cam, intr, m, w)) in self.views.iter().enumerate() {
             let u = intr
                 .project(&cam.screen_from_camera.inverse_transform_point(&p))
                 .ok()?;
-            r[2 * k] = (u.x - m.value().x) / m.sigma();
-            r[2 * k + 1] = (u.y - m.value().y) / m.sigma();
+            let rk = w * (u - m);
+            r[2 * k] = rk.x;
+            r[2 * k + 1] = rk.y;
         }
         Some(r)
     }
@@ -96,10 +108,21 @@ pub fn triangulate(a: &View<'_>, b: &View<'_>) -> Result<Triangulated, GeometryE
         return Err(GeometryError::BehindCamera);
     }
 
+    let whitening = |v: &View<'_>| v.whitening().ok_or(GeometryError::Degenerate("pixel cov"));
     let problem = TwoView {
         views: [
-            (a.camera, Intrinsics::from_camera_model(a.camera), a.pixel),
-            (b.camera, Intrinsics::from_camera_model(b.camera), b.pixel),
+            (
+                a.camera,
+                Intrinsics::from_camera_model(a.camera),
+                *a.pixel.value(),
+                whitening(a)?,
+            ),
+            (
+                b.camera,
+                Intrinsics::from_camera_model(b.camera),
+                *b.pixel.value(),
+                whitening(b)?,
+            ),
         ],
     };
     let fit = lsq::solve(
@@ -114,9 +137,9 @@ pub fn triangulate(a: &View<'_>, b: &View<'_>) -> Result<Triangulated, GeometryE
     let cov = Cov3::from_iterator(fit.cov.iter().copied());
 
     let mut sq_sum = 0.0;
-    for (cam, intr, m) in &problem.views {
+    for (cam, intr, m, _) in &problem.views {
         let u = intr.project(&cam.screen_from_camera.inverse_transform_point(&point))?;
-        sq_sum += (u - m.value()).norm_squared();
+        sq_sum += (u - m).norm_squared();
     }
     let rms_px: f64 = (sq_sum / 2.0).sqrt();
 
@@ -252,14 +275,67 @@ mod tests {
         let a = View {
             camera: &rgb,
             pixel: Measured::new(pixel_of(&rgb, &x), 0.5).unwrap(),
+            pixel_cov: None,
         };
         let b = View {
             camera: &ir,
             pixel: Measured::new(pixel_of(&ir, &x), 0.5).unwrap(),
+            pixel_cov: None,
         };
         let t = triangulate(&a, &b).unwrap();
         assert_abs_diff_eq!((t.point - x).norm(), 0.0, epsilon = 1e-8);
         assert!(t.rms_px < 1e-8, "rms_px = {}", t.rms_px);
+    }
+
+    #[test]
+    fn test_pixel_cov_isotropic_matches_sigma() {
+        let (ir, rgb) = stereo_rig();
+        let x = Point3::new(155.0, 40.0, -500.0);
+        let rgb_px = pixel_of(&rgb, &x) + nalgebra::Vector2::new(0.8, -0.6);
+        let view = |pixel_cov| View {
+            camera: &rgb,
+            pixel: Measured::new(rgb_px, 0.5).unwrap(),
+            pixel_cov,
+        };
+        let b = View {
+            camera: &ir,
+            pixel: Measured::new(pixel_of(&ir, &x), 0.5).unwrap(),
+            pixel_cov: None,
+        };
+        let by_sigma = triangulate(&view(None), &b).unwrap();
+        let by_cov = triangulate(&view(Some(Matrix2::identity() * 0.25)), &b).unwrap();
+
+        assert_abs_diff_eq!((by_sigma.point - by_cov.point).norm(), 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(by_sigma.cov, by_cov.cov, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_pixel_cov_down_weights_its_noisy_axis() {
+        let (ir, rgb) = stereo_rig();
+        let x = Point3::new(155.0, 40.0, -500.0);
+        let rgb_px = pixel_of(&rgb, &x) + nalgebra::Vector2::new(0.0, 3.0);
+        let b = View {
+            camera: &ir,
+            pixel: Measured::new(pixel_of(&ir, &x), 0.5).unwrap(),
+            pixel_cov: None,
+        };
+        let solve = |pixel_cov| {
+            let a = View {
+                camera: &rgb,
+                pixel: Measured::new(rgb_px, 0.5).unwrap(),
+                pixel_cov,
+            };
+            triangulate(&a, &b).unwrap().point
+        };
+        let isotropic = solve(None);
+        let vertical_noisy = solve(Some(Matrix2::new(0.25, 0.0, 0.0, 100.0)));
+
+        assert!(
+            (vertical_noisy.y - x.y).abs() < 0.2 * (isotropic.y - x.y).abs(),
+            "isotropic y error {}, vertical-noisy y error {}",
+            isotropic.y - x.y,
+            vertical_noisy.y - x.y
+        );
     }
 
     #[test]
@@ -273,10 +349,12 @@ mod tests {
         let a = View {
             camera: &rgb,
             pixel: Measured::new(rgb_px, sigma).unwrap(),
+            pixel_cov: None,
         };
         let b = View {
             camera: &ir,
             pixel: Measured::new(ir_px, sigma).unwrap(),
+            pixel_cov: None,
         };
         let predicted = triangulate(&a, &b).unwrap();
 
@@ -302,10 +380,12 @@ mod tests {
             let a = View {
                 camera: &rgb,
                 pixel: Measured::new(noisy_rgb, sigma).unwrap(),
+                pixel_cov: None,
             };
             let b = View {
                 camera: &ir,
                 pixel: Measured::new(noisy_ir, sigma).unwrap(),
+                pixel_cov: None,
             };
             let t = triangulate(&a, &b).unwrap();
             let v = t.point.coords;
@@ -353,10 +433,12 @@ mod tests {
         let a = View {
             camera: &rgb,
             pixel: Measured::new(pixel_of(&rgb, &x), 0.5).unwrap(),
+            pixel_cov: None,
         };
         let b = View {
             camera: &ir,
             pixel: Measured::new(pixel_of(&ir, &x), 0.5).unwrap(),
+            pixel_cov: None,
         };
         assert_eq!(
             triangulate(&a, &b),
@@ -377,10 +459,12 @@ mod tests {
         let a = View {
             camera: &rgb,
             pixel: Measured::new(mirrored(&rgb), 0.5).unwrap(),
+            pixel_cov: None,
         };
         let b = View {
             camera: &ir,
             pixel: Measured::new(mirrored(&ir), 0.5).unwrap(),
+            pixel_cov: None,
         };
         assert_eq!(triangulate(&a, &b), Err(GeometryError::BehindCamera));
     }
@@ -392,10 +476,12 @@ mod tests {
         let a = View {
             camera: &rgb,
             pixel: Measured::new(pixel_of(&rgb, &x), 0.0).unwrap(),
+            pixel_cov: None,
         };
         let b = View {
             camera: &ir,
             pixel: Measured::new(pixel_of(&ir, &x), 0.5).unwrap(),
+            pixel_cov: None,
         };
         assert_eq!(
             triangulate(&a, &b),
@@ -412,10 +498,12 @@ mod tests {
         let a = View {
             camera: &rgb,
             pixel: Measured::new(pixel_of(&rgb, &x), 0.5).unwrap(),
+            pixel_cov: None,
         };
         let b = View {
             camera: &ir,
             pixel: Measured::new(pixel_of(&ir, &x), 0.5).unwrap(),
+            pixel_cov: None,
         };
         let t = triangulate(&a, &b).unwrap();
         assert_abs_diff_eq!((t.point - x).norm(), 0.0, epsilon = 1e-8);
