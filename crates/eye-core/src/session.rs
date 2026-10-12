@@ -33,12 +33,24 @@ pub struct TargetRecord {
 }
 
 /// Why a presentation was discarded. `Retake` and `Skip` are the operator's own call during a
-/// live session (`r`/`s`); `eye-calibration` may add further reasons (e.g. a warmup presentation).
+/// live session (`r`/`s`); `Warmup` marks the extra lead-in presentation `eye-calibration` shows
+/// before the protocol's own targets, never used by any fit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscardReason {
     Retake,
     Skip,
+    Warmup,
+}
+
+impl std::fmt::Display for DiscardReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            DiscardReason::Retake => "retake",
+            DiscardReason::Skip => "skip",
+            DiscardReason::Warmup => "warmup",
+        })
+    }
 }
 
 /// One line of a recording's append-only `discards.jsonl`: marks `seq`'s `TargetRecord` as
@@ -157,6 +169,10 @@ pub struct ProtocolConfig {
     /// after the last; targets span the remaining band edge to edge.
     #[serde(default = "default_edge_margin")]
     pub edge_margin: f64,
+    /// Whether an extra screen-centre target precedes the grid, shifting every later target's
+    /// recorded index by one; a retry boundary derived from `grid[0] * grid[1]` must add this.
+    #[serde(default)]
+    pub warmup: bool,
 }
 
 impl Default for ProtocolConfig {
@@ -168,6 +184,7 @@ impl Default for ProtocolConfig {
             settle_ms: 600,
             window_ms: 800,
             edge_margin: default_edge_margin(),
+            warmup: false,
         }
     }
 }
@@ -221,6 +238,7 @@ impl ProtocolConfig {
             settle_ms,
             window_ms,
             edge_margin: fallback.edge_margin,
+            warmup: fallback.warmup,
         })
     }
 }
@@ -267,6 +285,7 @@ mod protocol_config_from_target_records_tests {
                 settle_ms: 600,
                 window_ms: 800,
                 edge_margin: 0.04,
+                warmup: false,
             }
         );
     }
@@ -287,6 +306,7 @@ mod protocol_config_from_target_records_tests {
                 settle_ms: 600,
                 window_ms: 800,
                 edge_margin: 0.04,
+                warmup: false,
             }
         );
     }
@@ -307,6 +327,7 @@ mod protocol_config_from_target_records_tests {
                 settle_ms: 1000,
                 window_ms: 1333,
                 edge_margin: 0.04,
+                warmup: false,
             }
         );
     }
@@ -349,6 +370,7 @@ mod protocol_config_tests {
             settle_ms: 1000,
             window_ms: 1200,
             edge_margin: 0.04,
+            warmup: false,
         };
         let text = toml::to_string(&cfg).unwrap();
         assert!(text.contains("grid = [4, 4]"));

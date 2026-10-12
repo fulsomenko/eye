@@ -140,7 +140,8 @@ pub fn cross(
 
     let mut train = Vec::new();
     for other in others {
-        let base_len = other.protocol.grid[0] * other.protocol.grid[1];
+        let base_len =
+            other.protocol.grid[0] * other.protocol.grid[1] + u32::from(other.protocol.warmup);
         train.extend(fit_samples(
             &other.windows,
             other.steps.iter().filter_map(|s| s.batch.as_ref()),

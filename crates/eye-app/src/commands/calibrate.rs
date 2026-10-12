@@ -70,6 +70,9 @@ const FRAME_PERIOD_30HZ: Duration = Duration::from_nanos(1_000_000_000 / 30);
 /// At most this many retries per target position before an online rejection is left standing.
 const MAX_RETRIES: u8 = 2;
 
+/// At most this many positions re-presented in the review round, worst residual first.
+const MAX_REVIEW_RETAKES: u32 = 4;
+
 /// Summary of the live preview fit: distinct target positions shown, samples selected (by the
 /// same selection the offline fit will make on the same events), and the worst-eye residual, so
 /// the live number and the saved profile's LOTO can be told apart.
@@ -97,7 +100,17 @@ pub struct LiveFeedback {
     fit_cfg: FitConfig,
     meta: ProfileMeta,
     retries: HashMap<(u64, u64), u8>,
+    /// Presentations hidden so far, not counting the warm-up.
     completed: usize,
+    /// How many presentations (base protocol + every retry appended so far by
+    /// `handle_verdict`/`run_review_round`, and every manual retake reported through
+    /// `on_retake_appended`) the overlay is expected to show. `on_hidden` runs the review round
+    /// once `completed` reaches this, i.e. once nothing further is queued. Like `completed`, it
+    /// leaves out the warm-up.
+    expected_presentations: u32,
+    /// Set once the review round has run, so a defensive second call (from `on_finished`) is a
+    /// no-op.
+    review_done: bool,
     calibrated: bool,
     frame_period: Duration,
     last_rays_duration: Duration,
@@ -115,14 +128,15 @@ impl LiveFeedback {
         meta: ProfileMeta,
     ) -> Self {
         let (cols, rows) = protocol.grid();
+        let base_len = cols * rows + u32::from(protocol.config().warmup);
         Self {
             registry,
             config,
             pipeline: None,
             feedback: None,
             append: None,
+            base_len,
             protocol,
-            base_len: cols * rows,
             windows: Vec::new(),
             batches: Vec::new(),
             last_preview: None,
@@ -130,6 +144,8 @@ impl LiveFeedback {
             meta,
             retries: HashMap::new(),
             completed: 0,
+            expected_presentations: cols * rows,
+            review_done: false,
             calibrated: false,
             frame_period: FRAME_PERIOD_30HZ,
             last_rays_duration: Duration::ZERO,
@@ -147,14 +163,15 @@ impl LiveFeedback {
         meta: ProfileMeta,
     ) -> Self {
         let (cols, rows) = protocol.grid();
+        let base_len = cols * rows + u32::from(protocol.config().warmup);
         Self {
             registry: Registry::with_defaults(),
             config: Config::builtin_default(),
             pipeline: Some(pipeline),
             feedback: None,
             append: None,
+            base_len,
             protocol,
-            base_len: cols * rows,
             windows: Vec::new(),
             batches: Vec::new(),
             last_preview: None,
@@ -162,6 +179,8 @@ impl LiveFeedback {
             meta,
             retries: HashMap::new(),
             completed: 0,
+            expected_presentations: cols * rows,
+            review_done: false,
             calibrated: false,
             frame_period: FRAME_PERIOD_30HZ,
             last_rays_duration: Duration::ZERO,
@@ -283,6 +302,7 @@ impl LiveFeedback {
                 let targets = self
                     .windows
                     .iter()
+                    .filter(|w| !w.discarded)
                     .map(position_key)
                     .collect::<BTreeSet<_>>()
                     .len();
@@ -360,7 +380,90 @@ impl LiveFeedback {
                 retry: true,
             };
             let _ = sender.append(spec);
+            self.expected_presentations += 1;
         }
+    }
+
+    /// The final pass once the base protocol's targets and their online-rejection retries have
+    /// all been hidden: refits once more on every sample collected and judges every position,
+    /// not just whichever was last hidden. Idempotent (`review_done` guards a defensive second
+    /// call, e.g. from `on_finished`).
+    fn run_final_review(&mut self) {
+        if self.review_done {
+            return;
+        }
+        self.review_done = true;
+        if self.completed < self.fit_cfg.min_targets_offset {
+            return;
+        }
+        let samples = self.fit_samples();
+        let Some(pipeline) = self.pipeline.as_mut() else {
+            return;
+        };
+        match DotSessionFit::fit_with(&samples, pipeline.rig(), &self.fit_cfg, self.meta.clone()) {
+            Ok(outcome) => {
+                let verdicts = outcome.verdicts();
+                pipeline.set_correction(Some(Box::new(outcome.profile)));
+                self.calibrated = true;
+                self.run_review_round(&samples, &verdicts);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "final calibration refit failed; keeping the previous correction"
+                );
+            }
+        }
+    }
+
+    /// Once the base protocol's targets and their online-rejection retries have all been hidden,
+    /// judges every position against the final fit (not just the one that was just hidden) and
+    /// re-presents the worst-residual rejections, same cap and amber-retry marking as
+    /// `handle_verdict`.
+    fn run_review_round(&mut self, samples: &[FitSample], verdicts: &[TargetVerdict]) {
+        let mut rejected: Vec<(f64, Point2<f64>, Point2<f64>)> = Vec::new();
+        for v in verdicts {
+            if !v.rejected {
+                continue;
+            }
+            let Some(target_mm) = target_mm_at_index(samples, v.index) else {
+                continue;
+            };
+            let Some(px_logical) = self
+                .windows
+                .iter()
+                .find(|w| target_mm_key(w.target_mm) == target_mm_key(target_mm))
+                .map(|w| w.target_px_logical)
+            else {
+                continue;
+            };
+            rejected.push((v.residual_deg, target_mm, px_logical));
+        }
+        rejected.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+        let mut positions_retaken = 0u32;
+        for (_, target_mm, px_logical) in rejected {
+            if positions_retaken >= MAX_REVIEW_RETAKES {
+                break;
+            }
+            let key = target_mm_key(target_mm);
+            let retries = *self.retries.get(&key).unwrap_or(&0);
+            if retries >= MAX_RETRIES {
+                continue;
+            }
+            self.retries.insert(key, retries + 1);
+            if let Some(sender) = &self.append {
+                let spec = TargetSpec {
+                    px_logical,
+                    timing: self.protocol.timing(),
+                    retry: true,
+                };
+                let _ = sender.append(spec);
+                self.expected_presentations += 1;
+            }
+            positions_retaken += 1;
+        }
+        tracing::info!(positions_retaken, "review round");
     }
 }
 
@@ -385,6 +488,25 @@ fn target_index_in_samples(samples: &[FitSample], target_mm: Point2<f64>) -> Opt
         });
     }
     seen.get(&key).copied()
+}
+
+/// The inverse of `target_index_in_samples`: the `target_mm` `DotSessionFit::fit_with` assigned
+/// `index`, by the same first-appearance order.
+fn target_mm_at_index(samples: &[FitSample], index: u32) -> Option<Point2<f64>> {
+    let mut next_index = 0u32;
+    let mut seen: HashMap<(u64, u64), u32> = HashMap::new();
+    for s in samples {
+        let k = target_mm_key(s.target_mm);
+        let idx = *seen.entry(k).or_insert_with(|| {
+            let idx = next_index;
+            next_index += 1;
+            idx
+        });
+        if idx == index {
+            return Some(s.target_mm);
+        }
+    }
+    None
 }
 
 impl PumpObserver for LiveFeedback {
@@ -443,18 +565,36 @@ impl PumpObserver for LiveFeedback {
     }
 
     fn on_hidden(&mut self, index: usize, _at: Timestamp) {
+        if self.protocol.config().warmup && index == 0 {
+            if let Some(w) = self.windows.iter_mut().find(|w| w.index == 0) {
+                w.discarded = true;
+            }
+            return;
+        }
         let last_target = self
             .windows
             .last()
             .map(|w| (w.target_mm, w.target_px_logical));
         self.completed += 1;
         self.refit(index, last_target);
+        if !self.review_done && self.completed as u32 >= self.expected_presentations {
+            self.run_final_review();
+        }
     }
 
     fn on_discard(&mut self, index: usize) {
         if let Some(w) = self.windows.iter_mut().find(|w| w.index == index as u32) {
             w.discarded = true;
         }
+        self.refit(index, None);
+    }
+
+    fn on_retake_appended(&mut self) {
+        self.expected_presentations += 1;
+    }
+
+    fn on_finished(&mut self) {
+        self.run_final_review();
     }
 }
 
@@ -530,6 +670,8 @@ pub struct FitResult {
     pub profile: UserProfile,
     pub samples: usize,
     pub targets: usize,
+    /// Windows discarded by a manual retake/skip and excluded from `targets`; never the warm-up.
+    pub discarded: usize,
     /// Leave-one-target-out estimate of the accuracy this profile gives on this pipeline; `None` if every fold failed.
     pub expected: Option<SessionMetrics>,
     /// Targets the primary source's fit excluded, merged across eyes and deduplicated.
@@ -555,6 +697,22 @@ fn primary_rejected_targets(reports: &[EyeFitReport]) -> Vec<u32> {
         .collect()
 }
 
+/// `(targets, discarded)` for the summary: distinct positions among the windows kept, and how
+/// many windows were discarded. The warm-up (`index` 0 when `warmup`) is in neither.
+fn target_counts(windows: &[FixationWindow], warmup: bool) -> (usize, usize) {
+    let targets = windows
+        .iter()
+        .filter(|w| !w.discarded)
+        .map(position_key)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let discarded = windows
+        .iter()
+        .filter(|w| w.discarded && !(warmup && w.index == 0))
+        .count();
+    (targets, discarded)
+}
+
 pub fn fit_recording(
     dir: &Path,
     config: &Config,
@@ -564,7 +722,7 @@ pub fn fit_recording(
 ) -> anyhow::Result<FitResult> {
     let mut replayed = replay_session(dir, config, registry, protocol)?;
     let run = &replayed.run;
-    let base_len = run.protocol.grid[0] * run.protocol.grid[1];
+    let base_len = run.protocol.grid[0] * run.protocol.grid[1] + u32::from(run.protocol.warmup);
     let windows = run.windows.clone();
     let include = latest_presentation(&windows, base_len);
     let samples = fit_samples(
@@ -576,12 +734,7 @@ pub fn fit_recording(
         !samples.is_empty(),
         "no gaze samples in fixation windows (is the face visible and the pipeline producing rays?)"
     );
-    let targets = run
-        .windows
-        .iter()
-        .map(position_key)
-        .collect::<BTreeSet<_>>()
-        .len();
+    let (targets, discarded) = target_counts(&run.windows, run.protocol.warmup);
     let outcome = DotSessionFit::fit_with(&samples, &run.rig, &FitConfig::default(), meta)?;
     let mut profile = outcome.profile;
     let rejected_targets = primary_rejected_targets(&outcome.reports);
@@ -606,6 +759,7 @@ pub fn fit_recording(
         profile,
         samples: samples.len(),
         targets,
+        discarded,
         expected,
         rejected_targets,
         preview: None,
@@ -626,6 +780,7 @@ fn protocol_for(targets: u32, dwell_ms: Option<u64>) -> ProtocolConfig {
         dwell_ms,
         settle_ms,
         window_ms,
+        warmup: true,
         ..ProtocolConfig::default()
     }
 }
@@ -671,8 +826,13 @@ pub fn summary_line(result: &FitResult) -> String {
         Some(p) => format!("; live preview residual: {:.2} deg", p.rms_after_deg),
         None => String::new(),
     };
+    let discarded = if result.discarded == 0 {
+        String::new()
+    } else {
+        format!("; {} discarded", result.discarded)
+    };
     format!(
-        "{} targets, {} samples; expected accuracy (bench leave-one-target-out): {accuracy}{preview}{rejected}",
+        "{} targets, {} samples; expected accuracy (bench leave-one-target-out): {accuracy}{preview}{rejected}{discarded}",
         result.targets, result.samples
     )
 }
@@ -1099,6 +1259,7 @@ mod tests {
             profile: fixture_profile(),
             samples,
             targets,
+            discarded: 0,
             expected,
             rejected_targets,
             preview: None,
@@ -1130,6 +1291,7 @@ mod tests {
             profile: fixture_profile(),
             samples: 2140,
             targets: 9,
+            discarded: 0,
             expected: None,
             rejected_targets: Vec::new(),
             preview: None,
@@ -1169,6 +1331,76 @@ mod tests {
         assert_eq!(
             summary_line(&result),
             "9 targets, 2140 samples; expected accuracy (bench leave-one-target-out): mean 1.84 deg, p95 3.90 deg, 3x3 hit 100.0 %; 2 targets rejected: [4, 7]"
+        );
+    }
+
+    #[test]
+    fn test_summary_line_prints_discarded_count() {
+        let mut result = fit_result(9, 2140, Some(1.84), 3.90, Some(1.0));
+        result.discarded = 3;
+        assert_eq!(
+            summary_line(&result),
+            "9 targets, 2140 samples; expected accuracy (bench leave-one-target-out): mean 1.84 deg, p95 3.90 deg, 3x3 hit 100.0 %; 3 discarded"
+        );
+    }
+
+    fn counted_window(index: u32, x_mm: f64, discarded: bool) -> FixationWindow {
+        FixationWindow {
+            index,
+            cell: (0, 0),
+            onset: Timestamp::from_nanos(0),
+            start: Timestamp::from_nanos(0),
+            end: Timestamp::from_nanos(0),
+            target_mm: Point2::new(x_mm, 50.0),
+            target_px_logical: Point2::new(x_mm, 50.0),
+            discarded,
+        }
+    }
+
+    #[test]
+    fn test_target_counts_leave_discarded_windows_out_of_targets_and_count_them() {
+        let windows = [
+            counted_window(0, 100.0, false),
+            counted_window(1, 200.0, true),
+            counted_window(2, 300.0, true),
+            counted_window(3, 200.0, false),
+        ];
+
+        assert_eq!(
+            target_counts(&windows, false),
+            (2, 2),
+            "position 300 has only a discarded window and is not a target; position 200's \
+             retake still is; both discarded windows are counted"
+        );
+    }
+
+    #[test]
+    fn test_summary_line_does_not_count_the_warmup_as_discarded() {
+        let warmup_only = [
+            counted_window(0, 0.0, true),
+            counted_window(1, 100.0, false),
+            counted_window(2, 200.0, false),
+        ];
+        let (targets, discarded) = target_counts(&warmup_only, true);
+        let mut result = fit_result(9, 2140, Some(1.84), 3.90, Some(1.0));
+        result.targets = targets;
+        result.discarded = discarded;
+        assert_eq!(
+            summary_line(&result),
+            "2 targets, 2140 samples; expected accuracy (bench leave-one-target-out): mean 1.84 deg, p95 3.90 deg, 3x3 hit 100.0 %"
+        );
+
+        let warmup_and_skip = [
+            counted_window(0, 0.0, true),
+            counted_window(1, 100.0, true),
+            counted_window(2, 200.0, false),
+        ];
+        let (targets, discarded) = target_counts(&warmup_and_skip, true);
+        result.targets = targets;
+        result.discarded = discarded;
+        assert_eq!(
+            summary_line(&result),
+            "1 targets, 2140 samples; expected accuracy (bench leave-one-target-out): mean 1.84 deg, p95 3.90 deg, 3x3 hit 100.0 %; 1 discarded"
         );
     }
 
@@ -2174,6 +2406,740 @@ mod tests {
             third_retry.len(),
             0,
             "a third rejection of the same target exceeds MAX_RETRIES and must not append"
+        );
+    }
+
+    fn warmup_protocol(grid: [u32; 2]) -> TargetProtocol {
+        TargetProtocol::new(ProtocolConfig {
+            grid,
+            warmup: true,
+            ..ProtocolConfig::default()
+        })
+        .unwrap()
+    }
+
+    /// Shows a centre warm-up (index 0) then one presentation per `targets_px` entry (index
+    /// `k + 1`, `samples_per_target` rays each), aimed at its own position plus `biases_deg[k]`
+    /// degrees of yaw, directly through `on_shown`/`live.batches`/`on_hidden`.
+    fn drive_warmup_session(
+        live: &mut LiveFeedback,
+        screen: &eye_core::ScreenModel,
+        timing: TargetTiming,
+        targets_px: &[(f64, f64)],
+        biases_deg: &[f64],
+        samples_per_target: usize,
+    ) {
+        present_warmup(live, screen, timing);
+        for (k, (&px, &bias_deg)) in targets_px.iter().zip(biases_deg).enumerate() {
+            present_target(
+                live,
+                screen,
+                timing,
+                k + 1,
+                px,
+                bias_deg,
+                samples_per_target,
+            );
+        }
+    }
+
+    fn present_warmup(
+        live: &mut LiveFeedback,
+        screen: &eye_core::ScreenModel,
+        timing: TargetTiming,
+    ) {
+        let warmup_px = Point2::new(
+            f64::from(screen.size_px.0) / screen.scale / 2.0,
+            f64::from(screen.size_px.1) / screen.scale / 2.0,
+        );
+        live.on_shown(&TargetShown {
+            index: 0,
+            output: screen.output.clone(),
+            px_logical: warmup_px,
+            shown_at: Timestamp::from_nanos(0),
+            clock: TargetClock::Commit,
+        });
+        live.on_hidden(0, Timestamp::from_nanos(timing.dwell.as_nanos() as u64));
+    }
+
+    /// Shows presentation `index` at `px` (onset `index * dwell`), feeds `samples_per_target`
+    /// rays aimed at it plus `bias_deg` of yaw, then hides it.
+    fn present_target(
+        live: &mut LiveFeedback,
+        screen: &eye_core::ScreenModel,
+        timing: TargetTiming,
+        index: usize,
+        px: (f64, f64),
+        bias_deg: f64,
+        samples_per_target: usize,
+    ) {
+        use eye_core::GazeRay;
+        use nalgebra::{Matrix2, Matrix3, Point3, Unit, Vector2};
+
+        let dwell_ns = timing.dwell.as_nanos() as u64;
+        let settle_ns = timing.settle.as_nanos() as u64;
+        let window_ns = timing.window.as_nanos() as u64;
+        let step_ns = (window_ns / samples_per_target.max(1) as u64).max(1);
+        let eye = Point3::new(155.0, 85.0, -500.0);
+
+        let onset_ns = index as u64 * dwell_ns;
+        let target_px = Point2::new(px.0, px.1);
+        live.on_shown(&TargetShown {
+            index,
+            output: screen.output.clone(),
+            px_logical: target_px,
+            shown_at: Timestamp::from_nanos(onset_ns),
+            clock: TargetClock::Commit,
+        });
+        let target_mm = px_logical_to_mm(screen, &target_px);
+        let true_dir = Unit::new_normalize(Point3::new(target_mm.x, target_mm.y, 0.0) - eye);
+        let angles = eye_geometry::angles::yaw_pitch_from_direction(&true_dir);
+        let biased = Vector2::new(angles.x + bias_deg.to_radians(), angles.y);
+        let direction = eye_geometry::angles::direction_from_yaw_pitch(&biased);
+        for i in 0..samples_per_target {
+            let t_ns = onset_ns + settle_ns + i as u64 * step_ns;
+            live.batches.push(RayBatch {
+                timestamp: Timestamp::from_nanos(t_ns),
+                candidates: SourcedRay::tag(
+                    RaySource::RgbOnly,
+                    vec![GazeRay {
+                        side: None,
+                        timestamp: Timestamp::from_nanos(t_ns),
+                        origin: eye,
+                        direction,
+                        angular_cov: Matrix2::identity() * 1e-6,
+                        origin_cov: Matrix3::zeros(),
+                        head_rotation: None,
+                    }],
+                ),
+            });
+        }
+        live.on_hidden(index, Timestamp::from_nanos(onset_ns + dwell_ns));
+    }
+
+    /// A warm-up `LiveFeedback` on the synthetic rig with both overlay senders attached; the
+    /// append receiver is returned so a test can inspect re-presented targets.
+    fn attached_warmup_live(
+        fit_cfg: FitConfig,
+    ) -> (
+        LiveFeedback,
+        crossbeam_channel::Receiver<eye_overlay::targets::AppendMsg>,
+    ) {
+        let config = kappa_ray_config(&[(0.0, 0.0)], [0.0, 0.0], None);
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let mut live = LiveFeedback::with_pipeline(
+            pipeline,
+            warmup_protocol([3, 3]),
+            fit_cfg,
+            ProfileMeta::default(),
+        );
+        let (fb_tx, _fb_rx) = crossbeam_channel::unbounded();
+        let (append_tx, append_rx) = crossbeam_channel::unbounded();
+        live.attach(FeedbackSender::new(fb_tx), AppendSender::new(append_tx));
+        (live, append_rx)
+    }
+
+    #[test]
+    fn test_on_discard_refits_live_preview_immediately() {
+        let fit_cfg = FitConfig::default();
+        let (mut live, _append_rx) = attached_warmup_live(fit_cfg);
+        let timing = live.protocol.timing();
+        let screen = synthetic_rig().screen().clone();
+        let samples_per_target = fit_cfg.min_samples_per_target * 2;
+        let targets_px = FOUR_BY_FOUR_CENTRES[..fit_cfg.min_targets_offset + 1].to_vec();
+        let biases = vec![0.0; targets_px.len()];
+        drive_warmup_session(
+            &mut live,
+            &screen,
+            timing,
+            &targets_px,
+            &biases,
+            samples_per_target,
+        );
+        let before = live.last_preview().cloned().expect("refit ran");
+
+        live.on_discard(targets_px.len());
+
+        let after = live.last_preview().cloned().expect("refit ran");
+        assert_eq!(
+            after.samples,
+            before.samples - samples_per_target,
+            "discarding a presentation must refit the preview at once, without its samples"
+        );
+    }
+
+    #[test]
+    fn test_live_preview_targets_excludes_discarded_positions() {
+        let fit_cfg = FitConfig::default();
+        let (mut live, _append_rx) = attached_warmup_live(fit_cfg);
+        let timing = live.protocol.timing();
+        let screen = synthetic_rig().screen().clone();
+        let samples_per_target = fit_cfg.min_samples_per_target * 2;
+        let shown = fit_cfg.min_targets_offset + 2;
+        let targets_px = FOUR_BY_FOUR_CENTRES[..shown].to_vec();
+
+        present_warmup(&mut live, &screen, timing);
+        for (k, &px) in targets_px[..shown - 1].iter().enumerate() {
+            present_target(
+                &mut live,
+                &screen,
+                timing,
+                k + 1,
+                px,
+                0.0,
+                samples_per_target,
+            );
+        }
+        live.on_discard(1);
+        present_target(
+            &mut live,
+            &screen,
+            timing,
+            shown,
+            targets_px[shown - 1],
+            0.0,
+            samples_per_target,
+        );
+
+        assert_eq!(
+            live.last_preview().map(|p| p.targets),
+            Some(shown - 1),
+            "neither the skipped position nor the warm-up counts as a target"
+        );
+    }
+
+    #[test]
+    fn test_warmup_does_not_count_toward_min_targets_offset() {
+        let fit_cfg = FitConfig::default();
+        let (mut live, _append_rx) = attached_warmup_live(fit_cfg);
+        let timing = live.protocol.timing();
+        let screen = synthetic_rig().screen().clone();
+        let need = fit_cfg.min_targets_offset;
+        let targets_px = FOUR_BY_FOUR_CENTRES[..need].to_vec();
+        let samples_per_target = fit_cfg.min_samples_per_target * 2;
+
+        let (preview_before_last, records) =
+            eye_log::testing::capture_logs(tracing::Level::WARN, || {
+                present_warmup(&mut live, &screen, timing);
+                for (k, &px) in targets_px[..need - 1].iter().enumerate() {
+                    present_target(
+                        &mut live,
+                        &screen,
+                        timing,
+                        k + 1,
+                        px,
+                        0.0,
+                        samples_per_target,
+                    );
+                }
+                let before = live.last_preview().cloned();
+                present_target(
+                    &mut live,
+                    &screen,
+                    timing,
+                    need,
+                    targets_px[need - 1],
+                    0.0,
+                    samples_per_target,
+                );
+                before
+            });
+
+        assert!(
+            preview_before_last.is_none(),
+            "no refit before {need} real targets: {preview_before_last:?}"
+        );
+        assert_eq!(
+            live.last_preview().map(|p| p.targets),
+            Some(need),
+            "the first refit runs once {need} real targets have been hidden"
+        );
+        let failures: Vec<_> = records
+            .iter()
+            .filter(|r| r.message.contains("refit failed"))
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "the warm-up must not trigger a refit with too few real targets: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn test_manual_retake_defers_review_round_until_retake_is_hidden() {
+        let fit_cfg = FitConfig::default();
+        let (mut live, _append_rx) = attached_warmup_live(fit_cfg);
+        let timing = live.protocol.timing();
+        let screen = synthetic_rig().screen().clone();
+        let targets_px = FOUR_BY_FOUR_CENTRES[..9].to_vec();
+        let samples_per_target = fit_cfg.min_samples_per_target * 2;
+
+        present_warmup(&mut live, &screen, timing);
+        for (k, &px) in targets_px.iter().enumerate() {
+            present_target(
+                &mut live,
+                &screen,
+                timing,
+                k + 1,
+                px,
+                0.0,
+                samples_per_target,
+            );
+            if k + 1 == 3 {
+                live.on_discard(3);
+                live.on_retake_appended();
+            }
+        }
+        assert!(
+            !live.review_done,
+            "the manual retake of target 3 is still queued; the review round must wait for it"
+        );
+
+        present_target(
+            &mut live,
+            &screen,
+            timing,
+            10,
+            targets_px[2],
+            0.0,
+            samples_per_target,
+        );
+        assert!(
+            live.review_done,
+            "the queued retake has been hidden; the review round must run now"
+        );
+    }
+
+    #[test]
+    fn test_warmup_target_shown_first_and_excluded_from_fit() {
+        use eye_core::GazeRay;
+        use nalgebra::{Matrix2, Matrix3, Point3, Unit};
+
+        let targets_px = FOUR_BY_FOUR_CENTRES[..1].to_vec();
+        let config = kappa_ray_config(&targets_px, [0.0, 0.0], None);
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let protocol = warmup_protocol([3, 3]);
+        let timing = protocol.timing();
+        let mut live = LiveFeedback::with_pipeline(
+            pipeline,
+            protocol,
+            FitConfig::default(),
+            ProfileMeta::default(),
+        );
+
+        let centre_px = Point2::new(960.0, 540.0);
+        let eye = Point3::new(155.0, 85.0, -500.0);
+        let fake_ray = |ts_ns: u64, direction_point: Point3<f64>| GazeRay {
+            side: None,
+            timestamp: Timestamp::from_nanos(ts_ns),
+            origin: eye,
+            direction: Unit::new_normalize(direction_point - eye),
+            angular_cov: Matrix2::identity() * 1e-6,
+            origin_cov: Matrix3::zeros(),
+            head_rotation: None,
+        };
+
+        let onset_warmup = 0u64;
+        live.on_shown(&TargetShown {
+            index: 0,
+            output: OutputId::from("eDP-1"),
+            px_logical: centre_px,
+            shown_at: Timestamp::from_nanos(onset_warmup),
+            clock: TargetClock::Commit,
+        });
+        let mid_warmup =
+            onset_warmup + timing.settle.as_nanos() as u64 + timing.window.as_nanos() as u64 / 2;
+        live.batches.push(RayBatch {
+            timestamp: Timestamp::from_nanos(mid_warmup),
+            candidates: SourcedRay::tag(
+                RaySource::RgbOnly,
+                vec![fake_ray(mid_warmup, Point3::new(-500.0, 500.0, 0.0))],
+            ),
+        });
+        live.on_hidden(
+            0,
+            Timestamp::from_nanos(onset_warmup + timing.dwell.as_nanos() as u64),
+        );
+
+        assert!(
+            live.windows[0].discarded,
+            "the warm-up window must be marked discarded"
+        );
+
+        let onset_real = onset_warmup + timing.dwell.as_nanos() as u64;
+        live.on_shown(&TargetShown {
+            index: 1,
+            output: OutputId::from("eDP-1"),
+            px_logical: centre_px,
+            shown_at: Timestamp::from_nanos(onset_real),
+            clock: TargetClock::Commit,
+        });
+        let mid_real =
+            onset_real + timing.settle.as_nanos() as u64 + timing.window.as_nanos() as u64 / 2;
+        live.batches.push(RayBatch {
+            timestamp: Timestamp::from_nanos(mid_real),
+            candidates: SourcedRay::tag(
+                RaySource::RgbOnly,
+                vec![fake_ray(mid_real, Point3::new(155.0, 85.0, 0.0))],
+            ),
+        });
+        live.on_hidden(
+            1,
+            Timestamp::from_nanos(onset_real + timing.dwell.as_nanos() as u64),
+        );
+
+        let samples = live.fit_samples();
+        assert_eq!(
+            samples.len(),
+            1,
+            "the warm-up's sample at the same screen position must be excluded: {samples:?}"
+        );
+        assert_eq!(samples[0].ray.timestamp, Timestamp::from_nanos(mid_real));
+    }
+
+    /// Drives the warm-up biased-early-target scenario through the real `pump()` function
+    /// (rather than calling `on_shown`/`on_hidden` directly), so the review round's retry append
+    /// is observed at the exact point the production code reaches it: inside `on_hidden`,
+    /// before `pump` acks the `Hidden` with `settle()`. Rays are pre-seeded into `live.batches`
+    /// (as `drive_warmup_session` also does) since `pump` only carries `Shown`/`Hidden`/
+    /// `Finished` target events and raw capture frames, not already-detected rays.
+    #[test]
+    fn test_review_round_appends_before_last_settle_via_pump() {
+        use eye_core::GazeRay;
+        use nalgebra::{Unit, Vector2};
+
+        let config = kappa_ray_config(&[(0.0, 0.0)], [0.0, 0.0], None);
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let protocol = warmup_protocol([3, 3]);
+        let timing = protocol.timing();
+        let fit_cfg = FitConfig::default();
+        let mut live =
+            LiveFeedback::with_pipeline(pipeline, protocol, fit_cfg, ProfileMeta::default());
+
+        let (fb_tx, _fb_rx) = crossbeam_channel::unbounded();
+        let (append_tx, append_rx) = crossbeam_channel::unbounded();
+        live.attach(
+            FeedbackSender::new(fb_tx),
+            AppendSender::new(append_tx.clone()),
+        );
+        let settle = AppendSender::new(append_tx);
+
+        let screen = synthetic_rig().screen().clone();
+        let targets_px = FOUR_BY_FOUR_CENTRES[..9].to_vec();
+        let mut biases: Vec<f64> = vec![0.0; targets_px.len()];
+        biases[0] = 8.0;
+        let samples_per_target = fit_cfg.min_samples_per_target * 2;
+
+        let dwell_ns = timing.dwell.as_nanos() as u64;
+        let settle_ns = timing.settle.as_nanos() as u64;
+        let window_ns = timing.window.as_nanos() as u64;
+        let step_ns = (window_ns / samples_per_target.max(1) as u64).max(1);
+        let eye = Point3::new(155.0, 85.0, -500.0);
+
+        let warmup_px = Point2::new(
+            f64::from(screen.size_px.0) / screen.scale / 2.0,
+            f64::from(screen.size_px.1) / screen.scale / 2.0,
+        );
+        let mut target_events = vec![
+            shown_event(0, 0, (warmup_px.x, warmup_px.y)),
+            hidden_event(0, dwell_ns),
+        ];
+        for (k, (&px, &bias_deg)) in targets_px.iter().zip(&biases).enumerate() {
+            let index = k + 1;
+            let onset_ns = index as u64 * dwell_ns;
+            let target_px = Point2::new(px.0, px.1);
+            target_events.push(shown_event(index, onset_ns, px));
+            let target_mm = px_logical_to_mm(&screen, &target_px);
+            let true_dir = Unit::new_normalize(Point3::new(target_mm.x, target_mm.y, 0.0) - eye);
+            let angles = eye_geometry::angles::yaw_pitch_from_direction(&true_dir);
+            let biased = Vector2::new(angles.x + bias_deg.to_radians(), angles.y);
+            let direction = eye_geometry::angles::direction_from_yaw_pitch(&biased);
+            for i in 0..samples_per_target {
+                let t_ns = onset_ns + settle_ns + i as u64 * step_ns;
+                live.batches.push(RayBatch {
+                    timestamp: Timestamp::from_nanos(t_ns),
+                    candidates: SourcedRay::tag(
+                        RaySource::RgbOnly,
+                        vec![GazeRay {
+                            side: None,
+                            timestamp: Timestamp::from_nanos(t_ns),
+                            origin: eye,
+                            direction,
+                            angular_cov: Matrix2::identity() * 1e-6,
+                            origin_cov: Matrix3::zeros(),
+                            head_rotation: None,
+                        }],
+                    ),
+                });
+            }
+            target_events.push(hidden_event(index, onset_ns + dwell_ns));
+        }
+        target_events.push(TargetEvent::Finished);
+
+        let (_frames_tx, frames_rx) = crossbeam_channel::bounded::<CaptureMsg>(0);
+        let (targets_tx, targets_rx) = crossbeam_channel::bounded::<TargetEvent>(0);
+        let sender = std::thread::spawn(move || {
+            for event in target_events {
+                targets_tx.send(event).unwrap();
+            }
+        });
+
+        let mut sink = NullSink;
+        let to_record =
+            move |s: &TargetShown, hidden: Option<Timestamp>| target_record(s, hidden, &screen);
+        let end = pump(
+            &frames_rx,
+            &targets_rx,
+            Some(&settle),
+            &crossbeam_channel::never(),
+            &crossbeam_channel::never(),
+            None,
+            &to_record,
+            &mut sink,
+            &mut live,
+        )
+        .expect("pump finishes");
+        sender.join().unwrap();
+        assert_eq!(end, crate::commands::record::PumpEnd::Finished);
+
+        let messages: Vec<eye_overlay::targets::AppendMsg> = append_rx.try_iter().collect();
+        let last_settled_pos = messages
+            .iter()
+            .rposition(|m| matches!(m, eye_overlay::targets::AppendMsg::Settled))
+            .expect("pump acks every Hidden with a settle");
+        let early_px = Point2::new(targets_px[0].0, targets_px[0].1);
+        let append_pos = messages
+            .iter()
+            .position(|m| {
+                matches!(m, eye_overlay::targets::AppendMsg::Append(spec)
+                    if spec.retry && spec.px_logical == early_px)
+            })
+            .expect(
+                "the review round must append the early rejected target's retry: \
+                 it never got its own on-turn verdict (too few targets existed yet) and must \
+                 be caught by the final fit",
+            );
+        assert!(
+            append_pos < last_settled_pos,
+            "the review round's retry must be appended to the overlay's queue before the pump \
+             acks the final Hidden with settle() -- any later and the overlay (which only waits \
+             for settle before emitting Finished) could already have exited: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn test_review_round_retakes_early_target_rejected_by_final_fit() {
+        let config = kappa_ray_config(&[(0.0, 0.0)], [0.0, 0.0], None);
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let protocol = warmup_protocol([3, 3]);
+        let timing = protocol.timing();
+        let fit_cfg = FitConfig::default();
+        let mut live =
+            LiveFeedback::with_pipeline(pipeline, protocol, fit_cfg, ProfileMeta::default());
+
+        let (fb_tx, _fb_rx) = crossbeam_channel::unbounded();
+        let (append_tx, append_rx) = crossbeam_channel::unbounded();
+        live.attach(FeedbackSender::new(fb_tx), AppendSender::new(append_tx));
+
+        let screen = synthetic_rig().screen().clone();
+        let targets_px = FOUR_BY_FOUR_CENTRES[..9].to_vec();
+        let mut biases = vec![0.0; targets_px.len()];
+        biases[0] = 8.0;
+        let samples_per_target = fit_cfg.min_samples_per_target * 2;
+        drive_warmup_session(
+            &mut live,
+            &screen,
+            timing,
+            &targets_px,
+            &biases,
+            samples_per_target,
+        );
+
+        let appended = drain_appended(&append_rx);
+        let early_px = Point2::new(targets_px[0].0, targets_px[0].1);
+        assert!(
+            appended
+                .iter()
+                .any(|spec| spec.retry && spec.px_logical == early_px),
+            "the early (first-shown) target, biased 8 deg, was never judged on its own turn \
+             (too few targets existed yet) and must be re-presented by the review round once \
+             the final fit catches the bias: {appended:?}"
+        );
+    }
+
+    /// A `FitSample`/`TargetVerdict` pair for synthetic `run_review_round` tests: `index` is the
+    /// position's rank by first appearance (matching `target_mm_at_index`'s own numbering), and
+    /// `rejected`/`residual_deg` drive the verdict directly, without needing a real biased fit.
+    fn synthetic_rejection(
+        index: u32,
+        target_mm: Point2<f64>,
+        rejected: bool,
+        residual_deg: f64,
+    ) -> (FitSample, TargetVerdict) {
+        use eye_core::GazeRay;
+        use nalgebra::{Matrix2, Matrix3, Point3, Unit, Vector3};
+
+        let sample = FitSample {
+            ray: GazeRay {
+                side: None,
+                timestamp: Timestamp::from_nanos(u64::from(index)),
+                origin: Point3::new(155.0, 85.0, -500.0),
+                direction: Unit::new_normalize(Vector3::new(0.0, 0.0, 1.0)),
+                angular_cov: Matrix2::identity() * 1e-6,
+                origin_cov: Matrix3::zeros(),
+                head_rotation: None,
+            },
+            target_mm,
+            source: RaySource::RgbOnly,
+        };
+        let verdict = TargetVerdict {
+            index,
+            samples: 1,
+            residual_deg,
+            rejected,
+            reason: rejected.then_some(TargetReject::Residual {
+                deg: residual_deg,
+                limit: 3.0,
+            }),
+        };
+        (sample, verdict)
+    }
+
+    fn window_for(
+        index: u32,
+        target_mm: Point2<f64>,
+        target_px_logical: Point2<f64>,
+    ) -> FixationWindow {
+        FixationWindow {
+            index,
+            cell: (0, 0),
+            onset: Timestamp::from_nanos(0),
+            start: Timestamp::from_nanos(0),
+            end: Timestamp::from_nanos(0),
+            target_mm,
+            target_px_logical,
+            discarded: false,
+        }
+    }
+
+    #[test]
+    fn test_review_round_caps_at_four_worst_first() {
+        let config = kappa_ray_config(&[(0.0, 0.0)], [0.0, 0.0], None);
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let protocol = warmup_protocol([3, 3]);
+        let mut live = LiveFeedback::with_pipeline(
+            pipeline,
+            protocol,
+            FitConfig::default(),
+            ProfileMeta::default(),
+        );
+
+        let (fb_tx, _fb_rx) = crossbeam_channel::unbounded();
+        let (append_tx, append_rx) = crossbeam_channel::unbounded();
+        live.attach(FeedbackSender::new(fb_tx), AppendSender::new(append_tx));
+
+        // Residuals pushed out of ranking order: index 0 is the lowest, not the highest.
+        let residuals_by_index = [8.0, 16.0, 10.0, 14.0, 12.0];
+        let mut samples = Vec::new();
+        let mut verdicts = Vec::new();
+        for (k, &residual_deg) in residuals_by_index.iter().enumerate() {
+            let target_mm = Point2::new(100.0 * k as f64, 50.0);
+            let px = Point2::new(k as f64, 0.0);
+            live.windows.push(window_for(k as u32, target_mm, px));
+            let (sample, verdict) = synthetic_rejection(k as u32, target_mm, true, residual_deg);
+            samples.push(sample);
+            verdicts.push(verdict);
+        }
+        let clean_mm = Point2::new(999.0, 50.0);
+        live.windows
+            .push(window_for(5, clean_mm, Point2::new(5.0, 0.0)));
+        let (clean_sample, clean_verdict) = synthetic_rejection(5, clean_mm, false, 0.0);
+        samples.push(clean_sample);
+        verdicts.push(clean_verdict);
+
+        live.run_review_round(&samples, &verdicts);
+
+        let appended = drain_appended(&append_rx);
+        assert_eq!(
+            appended.len(),
+            4,
+            "the review round must cap at 4 positions even though 5 were rejected: {appended:?}"
+        );
+        let retaken: Vec<Point2<f64>> = appended.iter().map(|spec| spec.px_logical).collect();
+        assert!(
+            !retaken.contains(&Point2::new(0.0, 0.0)),
+            "the worst-first cap must drop the lowest-residual (8 deg, index 0) rejection, not \
+             an arbitrary one: {retaken:?}"
+        );
+        assert_eq!(
+            retaken,
+            vec![
+                Point2::new(1.0, 0.0),
+                Point2::new(3.0, 0.0),
+                Point2::new(4.0, 0.0),
+                Point2::new(2.0, 0.0),
+            ],
+            "the review round must append the 4 retaken positions worst-residual-first, exactly \
+             in descending residual order: {retaken:?}"
+        );
+    }
+
+    #[test]
+    fn test_review_round_respects_retry_cap() {
+        let config = kappa_ray_config(&[(0.0, 0.0)], [0.0, 0.0], None);
+        let cameras: Vec<CameraInfo> = config.cameras.iter().map(|c| c.to_info()).collect();
+        let pipeline =
+            Pipeline::from_config(&fake_registry(), &config, synthetic_rig(), &cameras, None)
+                .expect("builds without I/O");
+        let protocol = warmup_protocol([3, 3]);
+        let mut live = LiveFeedback::with_pipeline(
+            pipeline,
+            protocol,
+            FitConfig::default(),
+            ProfileMeta::default(),
+        );
+
+        let (fb_tx, _fb_rx) = crossbeam_channel::unbounded();
+        let (append_tx, append_rx) = crossbeam_channel::unbounded();
+        live.attach(FeedbackSender::new(fb_tx), AppendSender::new(append_tx));
+
+        // A and B each already used both of their MAX_RETRIES attempts during the main
+        // sequence (the online rejection path, exercised separately by
+        // `test_retries_stop_appending_at_max_retries`), so the shared `retries` cap is already
+        // exhausted by the time the review round runs.
+        let a_mm = Point2::new(100.0, 50.0);
+        let b_mm = Point2::new(200.0, 50.0);
+        live.windows
+            .push(window_for(0, a_mm, Point2::new(0.0, 0.0)));
+        live.windows
+            .push(window_for(1, b_mm, Point2::new(1.0, 0.0)));
+        live.retries.insert(target_mm_key(a_mm), MAX_RETRIES);
+        live.retries.insert(target_mm_key(b_mm), MAX_RETRIES);
+
+        let (a_sample, a_verdict) = synthetic_rejection(0, a_mm, true, 5.0);
+        let (b_sample, b_verdict) = synthetic_rejection(1, b_mm, true, 4.0);
+        live.run_review_round(&[a_sample, b_sample], &[a_verdict, b_verdict]);
+
+        let appended = drain_appended(&append_rx);
+        assert_eq!(
+            appended.len(),
+            0,
+            "both A and B are already at MAX_RETRIES; the review round must not re-present \
+             either even though its final fit still rejects both: {appended:?}"
         );
     }
 }

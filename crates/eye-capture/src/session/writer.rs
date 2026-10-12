@@ -204,7 +204,7 @@ impl SessionWriter {
             .write_all(b"\n")
             .map_err(io_err(&dir.join(DISCARDS_FILE)))?;
         discards.flush().map_err(io_err(&dir.join(DISCARDS_FILE)))?;
-        tracing::info!(seq = record.seq, reason = ?record.reason, "target discarded");
+        tracing::info!(seq = record.seq, reason = %record.reason, "target discarded");
         Ok(())
     }
 
@@ -383,6 +383,31 @@ mod tests {
                 r#"{"seq":2,"reason":"skip"}"#,
                 r#"{"seq":5,"reason":"retake"}"#
             ]
+        );
+    }
+
+    #[test]
+    fn test_write_discard_logs_reason_as_lowercase_string() {
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = SessionWriter::create(root.path(), &meta()).unwrap();
+
+        let (_, records) = eye_log::testing::capture_logs(tracing::Level::INFO, || {
+            writer
+                .write_discard(&DiscardRecord {
+                    seq: 2,
+                    reason: eye_core::session::DiscardReason::Retake,
+                })
+                .unwrap();
+        });
+
+        let rec = records
+            .iter()
+            .find(|r| r.message == "target discarded")
+            .expect("no 'target discarded' record");
+        assert_eq!(
+            rec.fields.get("reason"),
+            Some(&eye_log::Value::Str("retake".to_string())),
+            "reason must log as its lowercase name, not the Debug form"
         );
     }
 

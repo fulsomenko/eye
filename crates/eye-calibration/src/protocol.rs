@@ -314,6 +314,7 @@ mod tests {
                 settle_ms: 600,
                 window_ms: 800,
                 edge_margin: 0.04,
+                warmup: false,
             }
         );
         let parsed: ProtocolConfig = toml::from_str("").unwrap();

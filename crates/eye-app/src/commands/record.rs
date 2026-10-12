@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::Receiver;
 use eye::config::Config;
-use eye_calibration::protocol::{ProtocolConfig, TargetProtocol};
+use eye_calibration::protocol::{ProtocolConfig, Target, TargetProtocol};
 use eye_calibration::store::{ProfileStore, rig_to_table};
 use eye_capture::session::{
     EmitterState, FORMAT_VERSION, RecordedCamera, SessionId, SessionMeta, SessionWriter,
@@ -220,6 +220,16 @@ pub trait PumpObserver {
     /// Called when a manual `r`/`s` key discards the presentation at `index`: an observer
     /// tracking its own windows for that index (e.g. a live fit) must drop it too.
     fn on_discard(&mut self, _index: usize) {}
+
+    /// Called after a manual `r` retake has been queued on the overlay, so an observer counting
+    /// the presentations still to come (e.g. to know when the last one is hidden) includes it.
+    fn on_retake_appended(&mut self) {}
+
+    /// Called once the target overlay reports `Finished`, i.e. after it has already exited: an
+    /// observer that appends a retry here is too late for the overlay to ever show it. A final
+    /// pass (e.g. a review round) must instead run from `on_hidden`, before `pump` acks that
+    /// `Hidden` with `settle()`; this hook is only a defensive backstop in case that never ran.
+    fn on_finished(&mut self) {}
 }
 
 #[derive(Debug, Default)]
@@ -301,12 +311,16 @@ fn handle_review_key(
         return Ok(());
     }
     *count += 1;
-    if let Some(append) = &review.retake {
-        let _ = append.append(TargetSpec {
-            px_logical: target.px_logical,
-            timing: review.timing,
-            retry: true,
-        });
+    if let Some(append) = &review.retake
+        && append
+            .append(TargetSpec {
+                px_logical: target.px_logical,
+                timing: review.timing,
+                retry: true,
+            })
+            .is_ok()
+    {
+        observer.on_retake_appended();
     }
     Ok(())
 }
@@ -429,6 +443,47 @@ pub fn session_meta(
     })
 }
 
+/// The specs `record_targets` shows, in display order: the warm-up centre target (when
+/// `protocol` is configured for one) ahead of `protocol.display_sequence`.
+fn session_target_specs(
+    protocol: &TargetProtocol,
+    seed: u64,
+    screen: &ScreenModel,
+) -> Vec<TargetSpec> {
+    let mut specs: Vec<TargetSpec> = Vec::new();
+    if protocol.config().warmup {
+        let centre = Target {
+            index: 0,
+            cell: (0, 0),
+            norm: nalgebra::Point2::new(0.5, 0.5),
+        };
+        specs.push(TargetSpec {
+            px_logical: protocol.target_px_logical(&centre, screen),
+            timing: protocol.timing(),
+            retry: false,
+        });
+    }
+    specs.extend(
+        protocol
+            .display_sequence(seed, screen)
+            .into_iter()
+            .map(TargetSpec::from),
+    );
+    specs
+}
+
+/// Marks the warm-up presentation (`seq` 0) discarded so it is excluded from every fit, live,
+/// offline and bench alike. A no-op when `protocol` has no warm-up.
+fn discard_warmup(protocol: &TargetProtocol, sink: &mut dyn RecordSink) -> anyhow::Result<()> {
+    if protocol.config().warmup {
+        sink.discard(DiscardRecord {
+            seq: 0,
+            reason: DiscardReason::Warmup,
+        })?;
+    }
+    Ok(())
+}
+
 /// Shows the target sequence, pumping frames and targets into `sink` until it finishes.
 fn record_targets(
     protocol: &TargetProtocol,
@@ -440,11 +495,7 @@ fn record_targets(
     observer: &mut dyn PumpObserver,
 ) -> anyhow::Result<PumpEnd> {
     let output = active_rig.screen().output.clone();
-    let specs: Vec<TargetSpec> = protocol
-        .display_sequence(Timestamp::now().as_nanos(), active_rig.screen())
-        .into_iter()
-        .map(TargetSpec::from)
-        .collect();
+    let specs = session_target_specs(protocol, Timestamp::now().as_nanos(), active_rig.screen());
     let finish = observer.finish_policy();
     let (display, feedback) = TargetDisplay::spawn(&output, protocol.lead_in(), specs, finish)?;
     let settle = wire_observer(observer, finish, feedback, display.appender());
@@ -470,7 +521,9 @@ fn record_targets(
         sink,
         observer,
     )?;
+    discard_warmup(protocol, sink)?;
     if end == PumpEnd::Finished {
+        observer.on_finished();
         capture.write_for(Duration::from_millis(250), sink)?;
         display.wait()?;
     } else {
@@ -713,6 +766,79 @@ mod tests {
             parse_target_count("4"),
             Err("allowed: 16, 9, 0".to_string())
         );
+    }
+
+    fn protocol(warmup: bool) -> TargetProtocol {
+        TargetProtocol::new(ProtocolConfig {
+            grid: [3, 3],
+            warmup,
+            ..ProtocolConfig::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn test_session_target_specs_puts_warmup_centre_first_then_display_sequence() {
+        let screen = screen_fixture();
+        let protocol = protocol(true);
+        let seed = 42;
+
+        let specs = session_target_specs(&protocol, seed, &screen);
+
+        let sequence_specs: Vec<TargetSpec> = protocol
+            .display_sequence(seed, &screen)
+            .into_iter()
+            .map(TargetSpec::from)
+            .collect();
+        assert_eq!(specs.len(), sequence_specs.len() + 1);
+        let centre_px = protocol.target_px_logical(
+            &Target {
+                index: 0,
+                cell: (0, 0),
+                norm: Point2::new(0.5, 0.5),
+            },
+            &screen,
+        );
+        assert_eq!(specs[0].px_logical, centre_px);
+        assert_eq!(specs[0].timing, protocol.timing());
+        assert!(!specs[0].retry);
+        assert_eq!(specs[1..], sequence_specs[..]);
+    }
+
+    #[test]
+    fn test_session_target_specs_without_warmup_matches_display_sequence() {
+        let screen = screen_fixture();
+        let protocol = protocol(false);
+        let seed = 42;
+
+        let specs = session_target_specs(&protocol, seed, &screen);
+
+        let sequence_specs: Vec<TargetSpec> = protocol
+            .display_sequence(seed, &screen)
+            .into_iter()
+            .map(TargetSpec::from)
+            .collect();
+        assert_eq!(specs, sequence_specs);
+    }
+
+    #[test]
+    fn test_discard_warmup_writes_seq_zero_reason_warmup_when_configured() {
+        let mut sink = FakeSink::new();
+        discard_warmup(&protocol(true), &mut sink).unwrap();
+        assert_eq!(
+            sink.discards,
+            vec![DiscardRecord {
+                seq: 0,
+                reason: DiscardReason::Warmup,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_discard_warmup_is_noop_without_warmup() {
+        let mut sink = FakeSink::new();
+        discard_warmup(&protocol(false), &mut sink).unwrap();
+        assert!(sink.discards.is_empty());
     }
 
     #[test]
@@ -1306,6 +1432,85 @@ mod tests {
             append_rx.try_iter().count(),
             0,
             "cap reached; no further append"
+        );
+    }
+
+    #[derive(Default)]
+    struct RetakeCountingObserver {
+        retakes_appended: u32,
+    }
+
+    impl PumpObserver for RetakeCountingObserver {
+        fn on_retake_appended(&mut self) {
+            self.retakes_appended += 1;
+        }
+    }
+
+    #[test]
+    fn test_retake_key_notifies_observer_only_when_the_retake_is_appended() {
+        let target = shown(0, 10);
+        let (append_tx, _append_rx) = crossbeam_channel::unbounded();
+        let review = review_support(AppendSender::new(append_tx));
+        let mut manual_retakes = HashMap::new();
+        let mut sink = FakeSink::new();
+        let mut observer = RetakeCountingObserver::default();
+
+        for _ in 0..=MAX_MANUAL_RETAKES {
+            handle_review_key(
+                ReviewKey::Retake,
+                &Some(target.clone()),
+                &None,
+                Some(&review),
+                &mut manual_retakes,
+                &mut sink,
+                &mut observer,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            observer.retakes_appended,
+            u32::from(MAX_MANUAL_RETAKES),
+            "a retake blocked by the manual cap must not be reported as appended"
+        );
+
+        let mut no_overlay = RetakeCountingObserver::default();
+        handle_review_key(
+            ReviewKey::Retake,
+            &Some(target.clone()),
+            &None,
+            None,
+            &mut HashMap::new(),
+            &mut sink,
+            &mut no_overlay,
+        )
+        .unwrap();
+        let no_sender = ReviewSupport {
+            retake: None,
+            ..review.clone()
+        };
+        handle_review_key(
+            ReviewKey::Retake,
+            &Some(target.clone()),
+            &None,
+            Some(&no_sender),
+            &mut HashMap::new(),
+            &mut sink,
+            &mut no_overlay,
+        )
+        .unwrap();
+        handle_review_key(
+            ReviewKey::Skip,
+            &Some(target),
+            &None,
+            Some(&review),
+            &mut HashMap::new(),
+            &mut sink,
+            &mut no_overlay,
+        )
+        .unwrap();
+        assert_eq!(
+            no_overlay.retakes_appended, 0,
+            "without an overlay sender, or for a skip, nothing is appended"
         );
     }
 

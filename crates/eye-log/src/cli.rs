@@ -97,6 +97,29 @@ pub fn auto_path(run_id: &str) -> Result<PathBuf, LogError> {
     Ok(state_dir.join("eye/logs").join(format!("{run_id}.jsonl")))
 }
 
+/// Converts a bare `\n` into `\r\n`, working around raw mode (which clears OPOST) stair-stepping
+/// log lines printed while it is active.
+struct CrlfWriter<W>(W);
+
+impl<W: io::Write> io::Write for CrlfWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut start = 0;
+        for i in 0..buf.len() {
+            if buf[i] == b'\n' && (i == 0 || buf[i - 1] != b'\r') {
+                self.0.write_all(&buf[start..i])?;
+                self.0.write_all(b"\r\n")?;
+                start = i + 1;
+            }
+        }
+        self.0.write_all(&buf[start..])?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
 fn default_terminal_filter() -> String {
     let runtime_pins = DEFAULT_SINK_FILTER
         .split_once(',')
@@ -134,12 +157,12 @@ pub fn init(args: &LogArgs, command: &str) -> Result<LogGuard, LogError> {
 
     let terminal = match args.log_format {
         LogFormat::Text => fmt::layer()
-            .with_writer(io::stderr)
+            .with_writer(|| CrlfWriter(io::stderr()))
             .with_filter(filter)
             .boxed(),
         LogFormat::Json => fmt::layer()
             .json()
-            .with_writer(io::stderr)
+            .with_writer(|| CrlfWriter(io::stderr()))
             .with_filter(filter)
             .boxed(),
     };
@@ -198,6 +221,8 @@ pub fn init(args: &LogArgs, command: &str) -> Result<LogGuard, LogError> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     #[derive(Debug, clap::Parser)]
@@ -340,6 +365,20 @@ mod tests {
         assert_eq!(records.len(), 1, "expected the ort record, got {records:?}");
         assert_eq!(records[0].target, "ort::lifetime");
         assert_eq!(records[0].level, crate::Level::Trace);
+    }
+
+    #[test]
+    fn test_crlf_writer_converts_bare_newlines() {
+        let mut w = CrlfWriter(Vec::new());
+        w.write_all(b"line one\nline two\n").unwrap();
+        assert_eq!(w.0, b"line one\r\nline two\r\n");
+    }
+
+    #[test]
+    fn test_crlf_writer_does_not_double_an_existing_crlf() {
+        let mut w = CrlfWriter(Vec::new());
+        w.write_all(b"already\r\nfine\n").unwrap();
+        assert_eq!(w.0, b"already\r\nfine\r\n");
     }
 
     #[test]
