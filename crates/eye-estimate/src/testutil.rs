@@ -13,9 +13,12 @@ use nalgebra::{
     Isometry3, Matrix2, Point2, Point3, Translation3, UnitQuaternion, Vector2, Vector3,
 };
 
-use crate::landmark::{IrisResponse, LEFT_LOWER_LID, RIGHT_LOWER_LID};
+use crate::landmark::{
+    IrisResponse, LEFT_LOWER_LID, LEFT_UPPER_LID, RIGHT_LOWER_LID, RIGHT_UPPER_LID,
+};
 
 const LOWER_LID_BELOW_CORNERS_MM: f64 = 3.0;
+const UPPER_LID_ABOVE_CORNERS_MM: f64 = 5.0;
 
 pub(crate) fn test_rig() -> Rig {
     let ir = CameraModel {
@@ -346,10 +349,11 @@ pub(crate) fn synthetic_rgb_observation(
 
 /// Poses `MEDIAPIPE_RIGID` scaled by `scale` about the head origin at `screen_from_head`,
 /// projects into the "rgb" camera, fills 478 landmarks (template indices exact plus
-/// `N(0, landmark_noise_px)`; every other index at the projected head origin), and both eyes:
-/// corners at the projected template corners, iris at the pupil-sphere crossing towards
-/// `target_mm` plus `N(0, iris_noise_px)`. Scheme `LandmarkScheme::MEDIAPIPE_478`, camera "rgb",
-/// timestamp 0. Noise from `SplitMix64::new(seed)`.
+/// `N(0, landmark_noise_px)`; the lower-lid landmarks 3 mm below and the upper-lid landmarks
+/// 5 mm above the eye-corner midpoint, with the same noise; every other index at the projected
+/// head origin), and both eyes: corners at the projected template corners, iris where a detector
+/// with `response` reports the pupil-sphere crossing towards `target_mm`, plus
+/// `N(0, iris_noise_px)`. Scheme `LandmarkScheme::MEDIAPIPE_478`, camera "rgb", timestamp 0.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn synthetic_rgb_observation_with_response(
     rig: &Rig,
@@ -414,6 +418,36 @@ pub(crate) fn synthetic_rgb_observation_with_response(
         }
         pixel
     });
+    // A separate noise stream keeps every other landmark's noise what it was before the upper lid.
+    let mut upper_lid_rng = SplitMix64::new(seed ^ 0x9e37_79b9_7f4a_7c15);
+    for (medial, lateral, lid) in [
+        (
+            mediapipe478::RIGHT_EYE_MEDIAL,
+            mediapipe478::RIGHT_EYE_LATERAL,
+            RIGHT_UPPER_LID,
+        ),
+        (
+            mediapipe478::LEFT_EYE_MEDIAL,
+            mediapipe478::LEFT_EYE_LATERAL,
+            LEFT_UPPER_LID,
+        ),
+    ] {
+        let corner = |i| {
+            MEDIAPIPE_RIGID
+                .point(i)
+                .expect("corners are in the rigid template")
+        };
+        let mid = (corner(medial).coords + corner(lateral).coords) / 2.0;
+        let lid_head =
+            Point3::from((mid - Vector3::new(0.0, UPPER_LID_ABOVE_CORNERS_MM, 0.0)) * scale);
+        let pixel = project(&screen_from_head.transform_point(&lid_head));
+        for i in lid {
+            landmarks[i] = Point2::new(
+                pixel.x + landmark_noise_px * upper_lid_rng.gaussian(),
+                pixel.y + landmark_noise_px * upper_lid_rng.gaussian(),
+            );
+        }
+    }
 
     let target = Point3::new(target_mm.x, target_mm.y, 0.0);
     let centres = synthetic_eye_centres(screen_from_head, scale, &params);

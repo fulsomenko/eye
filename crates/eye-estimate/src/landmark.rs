@@ -64,6 +64,9 @@ impl IrisResponse {
 
 pub(crate) const RIGHT_LOWER_LID: [usize; 3] = [144, 145, 153];
 pub(crate) const LEFT_LOWER_LID: [usize; 3] = [373, 374, 380];
+/// Pairwise opposite the `*_LOWER_LID` landmarks.
+pub(crate) const RIGHT_UPPER_LID: [usize; 3] = [160, 159, 158];
+pub(crate) const LEFT_UPPER_LID: [usize; 3] = [387, 386, 385];
 
 /// One frame's eye geometry the [`IrisResponse`] is inverted about: points in the camera frame.
 struct EyeAnchors {
@@ -81,6 +84,11 @@ pub struct LandmarkOptions {
     pub max_iris_miss_mm: f64,
     pub apply_kappa: bool,
     pub iris_response: IrisResponse,
+    /// An eye whose aperture (lid gap over corner distance, image px) falls below this fraction
+    /// of its running reference is dropped as closed. 0 disables the gate.
+    pub min_aperture_ratio: f64,
+    /// Time constant of the running aperture reference, an exponential average over all frames.
+    pub aperture_time_constant_s: f64,
 }
 
 impl Default for LandmarkOptions {
@@ -91,6 +99,8 @@ impl Default for LandmarkOptions {
             max_iris_miss_mm: 2.0,
             apply_kappa: true,
             iris_response: IrisResponse::MEDIAPIPE_478,
+            min_aperture_ratio: 0.75,
+            aperture_time_constant_s: 2.0,
         }
     }
 }
@@ -100,6 +110,13 @@ pub struct LandmarkEstimator {
     options: LandmarkOptions,
     params: EyeParams,
     last_pose: HashMap<CameraId, Isometry3<f64>>,
+    aperture_reference: HashMap<(CameraId, Side), ApertureReference>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ApertureReference {
+    at: Timestamp,
+    aperture: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -132,6 +149,7 @@ impl LandmarkEstimator {
             options,
             params: EyeParams::default(),
             last_pose: HashMap::new(),
+            aperture_reference: HashMap::new(),
         }
     }
 
@@ -185,10 +203,14 @@ impl LandmarkEstimator {
             &cam.screen_from_camera.rotation,
             &pose.camera_from_object.rotation,
         );
-        let eyes: Vec<LandmarkEye> = [Side::Right, Side::Left]
-            .into_iter()
-            .filter_map(|side| self.eye(side, face, &pose, cam, &viewer, obs.timestamp))
-            .collect();
+        let mut eyes = Vec::new();
+        for side in [Side::Right, Side::Left] {
+            if self.eye_open(&obs.camera, side, face, obs.timestamp)
+                && let Some(eye) = self.eye(side, face, &pose, cam, &viewer, obs.timestamp)
+            {
+                eyes.push(eye);
+            }
+        }
         for eye in &eyes {
             trace_ray(Self::NAME, &eye.ray);
         }
@@ -244,6 +266,55 @@ impl LandmarkEstimator {
             return None;
         }
         Some(pose)
+    }
+
+    /// Updates `side`'s running aperture reference with this frame and reports whether the eye
+    /// was open relative to the reference before the update. A missing reference, or one later
+    /// than `at`, restarts from this frame.
+    fn eye_open(
+        &mut self,
+        camera: &CameraId,
+        side: Side,
+        face: &FaceObservation,
+        at: Timestamp,
+    ) -> bool {
+        let Some(aperture) = eye_aperture(face, side) else {
+            return true;
+        };
+        let key = (camera.clone(), side);
+        let previous = self
+            .aperture_reference
+            .get(&key)
+            .filter(|reference| at >= reference.at);
+        let (ratio, updated) = match previous {
+            Some(reference) => {
+                let dt_s = at.nanos_since(reference.at) as f64 / 1e9;
+                let alpha = 1.0 - (-dt_s / self.options.aperture_time_constant_s).exp();
+                (
+                    aperture / reference.aperture,
+                    reference.aperture + alpha * (aperture - reference.aperture),
+                )
+            }
+            None => (1.0, aperture),
+        };
+        self.aperture_reference.insert(
+            key,
+            ApertureReference {
+                at,
+                aperture: updated,
+            },
+        );
+        if ratio < self.options.min_aperture_ratio {
+            tracing::debug!(
+                { field::REASON } = "eye_closed",
+                side = side.as_str(),
+                aperture_ratio = ratio,
+                min_aperture_ratio = self.options.min_aperture_ratio,
+                "eye dropped"
+            );
+            return false;
+        }
+        true
     }
 
     fn eye(
@@ -459,6 +530,37 @@ impl LandmarkEstimator {
             ray,
         })
     }
+}
+
+/// Mean upper-to-lower lid distance over the eye-corner distance, in image px. `None` when a
+/// landmark is missing or the corners coincide.
+fn eye_aperture(face: &FaceObservation, side: Side) -> Option<f64> {
+    let (upper, lower, medial, lateral) = match side {
+        Side::Right => (
+            RIGHT_UPPER_LID,
+            RIGHT_LOWER_LID,
+            mediapipe478::RIGHT_EYE_MEDIAL,
+            mediapipe478::RIGHT_EYE_LATERAL,
+        ),
+        Side::Left => (
+            LEFT_UPPER_LID,
+            LEFT_LOWER_LID,
+            mediapipe478::LEFT_EYE_MEDIAL,
+            mediapipe478::LEFT_EYE_LATERAL,
+        ),
+    };
+    let landmark = |i: usize| face.landmarks.get(i);
+    let width = (landmark(medial)? - landmark(lateral)?).norm();
+    if width <= f64::EPSILON {
+        return None;
+    }
+    let gap = upper
+        .iter()
+        .zip(lower)
+        .map(|(&u, l)| Some((landmark(u)? - landmark(l)?).norm()))
+        .sum::<Option<f64>>()?
+        / upper.len() as f64;
+    Some(gap / width)
 }
 
 fn corner_midpoint(inner: &Point3<f64>, outer: &Point3<f64>) -> Point3<f64> {
@@ -1459,6 +1561,187 @@ mod tests {
             })
             .expect("no_iris logged");
         assert_eq!(rec2.fields["side"], Value::Str("right".into()));
+    }
+
+    const FRAME_NS: u64 = 133_000_000;
+
+    /// A frontal face at `frame` * 133 ms with each eye's upper lid at `apertures` [right, left]
+    /// times its rendered gap from the lower lid.
+    fn lidded_frame(rig: &Rig, frame: u64, apertures: [f64; 2]) -> Observations {
+        let mut obs = synthetic_rgb_observation(
+            rig,
+            &frontal_screen_from_head(),
+            1.0,
+            Point2::new(155.0, 85.0),
+            0.0,
+            0.0,
+            1,
+        );
+        obs.timestamp = Timestamp::from_nanos(frame * FRAME_NS);
+        let face = obs.face.as_mut().expect("face is present");
+        let lids = [
+            (RIGHT_UPPER_LID, RIGHT_LOWER_LID),
+            (LEFT_UPPER_LID, LEFT_LOWER_LID),
+        ];
+        for (aperture, (upper, lower)) in apertures.into_iter().zip(lids) {
+            for (u, l) in upper.into_iter().zip(lower) {
+                let lower_px = face.landmarks[l];
+                face.landmarks[u] = lower_px + (face.landmarks[u] - lower_px) * aperture;
+            }
+        }
+        obs
+    }
+
+    fn sides_kept(estimator: &mut LandmarkEstimator, obs: &Observations, rig: &Rig) -> Vec<Side> {
+        estimator
+            .estimate_frame(obs, rig)
+            .expect("estimate succeeds")
+            .expect("frame is recovered")
+            .eyes
+            .iter()
+            .map(|e| e.side)
+            .collect()
+    }
+
+    fn open_for(estimator: &mut LandmarkEstimator, rig: &Rig, frames: std::ops::Range<u64>) {
+        for frame in frames {
+            assert_eq!(
+                sides_kept(estimator, &lidded_frame(rig, frame, [1.0, 1.0]), rig),
+                [Side::Right, Side::Left],
+                "open frame {frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_blink_after_open_frames_drops_both_eyes() {
+        let rig = test_rig();
+        let mut estimator = LandmarkEstimator::new(LandmarkOptions::default());
+        open_for(&mut estimator, &rig, 0..8);
+
+        let kept = sides_kept(&mut estimator, &lidded_frame(&rig, 8, [0.4, 0.4]), &rig);
+
+        assert!(kept.is_empty(), "kept {kept:?}");
+    }
+
+    #[test]
+    fn test_open_eyes_after_blink_are_kept() {
+        let rig = test_rig();
+        let mut estimator = LandmarkEstimator::new(LandmarkOptions::default());
+        open_for(&mut estimator, &rig, 0..8);
+        sides_kept(&mut estimator, &lidded_frame(&rig, 8, [0.4, 0.4]), &rig);
+
+        let kept = sides_kept(&mut estimator, &lidded_frame(&rig, 9, [1.0, 1.0]), &rig);
+
+        assert_eq!(kept, [Side::Right, Side::Left]);
+    }
+
+    #[test]
+    fn test_wink_drops_only_the_closed_eye() {
+        let rig = test_rig();
+        let mut estimator = LandmarkEstimator::new(LandmarkOptions::default());
+        open_for(&mut estimator, &rig, 0..8);
+
+        let kept = sides_kept(&mut estimator, &lidded_frame(&rig, 8, [1.0, 0.4]), &rig);
+
+        assert_eq!(kept, [Side::Right]);
+    }
+
+    #[test]
+    fn test_slightly_narrowed_eyes_are_kept() {
+        let rig = test_rig();
+        let mut estimator = LandmarkEstimator::new(LandmarkOptions::default());
+        open_for(&mut estimator, &rig, 0..8);
+
+        let kept = sides_kept(&mut estimator, &lidded_frame(&rig, 8, [0.85, 0.85]), &rig);
+
+        assert_eq!(kept, [Side::Right, Side::Left]);
+    }
+
+    #[test]
+    fn test_narrow_first_frame_is_kept() {
+        let rig = test_rig();
+        let mut estimator = LandmarkEstimator::new(LandmarkOptions::default());
+
+        let kept = sides_kept(&mut estimator, &lidded_frame(&rig, 0, [0.4, 0.4]), &rig);
+
+        assert_eq!(kept, [Side::Right, Side::Left]);
+    }
+
+    #[test]
+    fn test_persistent_narrowing_is_readmitted_within_2_s() {
+        let rig = test_rig();
+        let mut estimator = LandmarkEstimator::new(LandmarkOptions::default());
+        open_for(&mut estimator, &rig, 0..15);
+        let narrowed = |estimator: &mut LandmarkEstimator, frame| {
+            sides_kept(estimator, &lidded_frame(&rig, frame, [0.6, 0.6]), &rig)
+        };
+
+        assert!(narrowed(&mut estimator, 15).is_empty());
+        let readmitted = (16..30).find(|&frame| narrowed(&mut estimator, frame).len() == 2);
+
+        assert!(
+            readmitted.is_some_and(|frame| (frame - 15) * FRAME_NS <= 2_000_000_000),
+            "readmitted at frame {readmitted:?}"
+        );
+    }
+
+    #[test]
+    fn test_zero_min_aperture_ratio_keeps_closed_eyes() {
+        let rig = test_rig();
+        let mut estimator = LandmarkEstimator::new(LandmarkOptions {
+            min_aperture_ratio: 0.0,
+            ..Default::default()
+        });
+        open_for(&mut estimator, &rig, 0..8);
+
+        let kept = sides_kept(&mut estimator, &lidded_frame(&rig, 8, [0.4, 0.4]), &rig);
+
+        assert_eq!(kept, [Side::Right, Side::Left]);
+    }
+
+    #[test]
+    fn test_earlier_timestamp_restarts_aperture_reference() {
+        let rig = test_rig();
+        let mut estimator = LandmarkEstimator::new(LandmarkOptions::default());
+        open_for(&mut estimator, &rig, 10..18);
+
+        let kept = sides_kept(&mut estimator, &lidded_frame(&rig, 0, [0.4, 0.4]), &rig);
+
+        assert_eq!(kept, [Side::Right, Side::Left]);
+    }
+
+    #[test]
+    fn test_aperture_gate_parses_from_config() {
+        let table: toml::Table =
+            toml::from_str("min_aperture_ratio = 0.6\naperture_time_constant_s = 4.0")
+                .expect("valid toml");
+        let options: LandmarkOptions =
+            parse_options(LandmarkEstimator::NAME, &table).expect("options parse");
+
+        assert_eq!(options.min_aperture_ratio, 0.6);
+        assert_eq!(options.aperture_time_constant_s, 4.0);
+    }
+
+    #[test]
+    fn test_logs_eye_closed_at_debug() {
+        let rig = test_rig();
+        let mut estimator = LandmarkEstimator::new(LandmarkOptions::default());
+        open_for(&mut estimator, &rig, 0..8);
+
+        let (_, logs) = capture_logs(tracing::Level::DEBUG, || {
+            sides_kept(&mut estimator, &lidded_frame(&rig, 8, [0.4, 1.0]), &rig)
+        });
+
+        let rec = logs
+            .iter()
+            .find(|r| {
+                r.message == "eye dropped"
+                    && r.fields[field::REASON] == Value::Str("eye_closed".into())
+            })
+            .expect("eye_closed logged");
+        assert_eq!(rec.fields["side"], Value::Str("right".into()));
+        assert!(matches!(rec.fields["aperture_ratio"], Value::F64(v) if v < 0.5));
     }
 
     #[test]
