@@ -438,13 +438,15 @@ fn evaluate(
                 .1
                 .as_mut()
                 .expect("replay checked ok by caller");
+            let windows: Vec<FixationWindow> = r
+                .run
+                .windows
+                .iter()
+                .filter(|w| !w.discarded)
+                .cloned()
+                .collect();
             Ok((
-                eval_input(
-                    &r.run.rig,
-                    &r.run.windows,
-                    r.run.samples(),
-                    r.run.processing(),
-                ),
+                eval_input(&r.run.rig, &windows, r.run.samples(), r.run.processing()),
                 Vec::new(),
             ))
         }
@@ -476,7 +478,13 @@ fn evaluate(
                     profile.rig_fingerprint, fingerprint
                 ));
             }
-            let windows = r.run.windows.clone();
+            let windows: Vec<FixationWindow> = r
+                .run
+                .windows
+                .iter()
+                .filter(|w| !w.discarded)
+                .cloned()
+                .collect();
             let input = crate::calibration::evaluate_with(r, &profile, &windows);
             Ok((input, warnings))
         }
@@ -900,6 +908,7 @@ mod tests {
             end: Timestamp::from_nanos(end_ms * 1_000_000),
             target_mm: mm,
             target_px_logical: Point2::new(0.0, 0.0),
+            discarded: false,
         }
     }
 
@@ -942,6 +951,7 @@ mod tests {
             end: Timestamp::from_nanos(1_000_000_000),
             target_mm: Point2::new(155.0, 85.0),
             target_px_logical: Point2::new(960.0, 540.0),
+            discarded: false,
         };
         let windows = vec![window];
         let rays = vec![
@@ -998,6 +1008,7 @@ mod tests {
             end: Timestamp::from_nanos(1_000_000_000),
             target_mm: Point2::new(155.0, 85.0),
             target_px_logical: Point2::new(960.0, 540.0),
+            discarded: false,
         };
         let windows = vec![window];
         let rays = vec![
@@ -1061,6 +1072,7 @@ mod tests {
             end: Timestamp::from_nanos(1_000_000_000),
             target_mm: Point2::new(155.0, 85.0),
             target_px_logical: Point2::new(960.0, 540.0),
+            discarded: false,
         };
         let windows = vec![window];
         let selected_origin = Point3::new(100.0, 0.0, -500.0);
@@ -1289,6 +1301,48 @@ mod tests {
         assert_eq!(rec.fields.get("dwell_ms"), Some(&eye_log::Value::U64(1500)));
         assert_eq!(rec.fields.get("settle_ms"), Some(&eye_log::Value::U64(600)));
         assert_eq!(rec.fields.get("window_ms"), Some(&eye_log::Value::U64(800)));
+    }
+
+    #[test]
+    fn test_none_mode_bench_excludes_discarded_presentation() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            discards: vec![(0, eye_core::session::DiscardReason::Skip)],
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let toml_path = dir.path().join("fixed.toml");
+        std::fs::write(
+            &toml_path,
+            fixed_ray_toml([155.0, 85.0, -500.0], [161.458333, 94.444444]),
+        )
+        .unwrap();
+        let matrix = BenchMatrix {
+            recordings: vec![session_dir],
+            pipelines: vec![crate::matrix::PipelineSpec {
+                name: "fixed".to_string(),
+                config: Some(toml_path),
+            }],
+            evaluation: crate::matrix::Evaluation {
+                calibration: vec![CalibrationMode::None],
+                ..Default::default()
+            },
+        };
+        let report = run_matrix(&matrix, &fake_registry());
+        let session_row = report
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Session)
+            .unwrap();
+        let RowOutcome::Ok { metrics } = &session_row.outcome else {
+            panic!("expected ok row: {session_row:?}");
+        };
+        assert_eq!(
+            metrics.windows,
+            FOUR_BY_FOUR_CENTRES.len() - 1,
+            "the discarded presentation must not become an eval window, even though it is the only presentation of its position"
+        );
     }
 
     #[test]

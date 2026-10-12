@@ -64,6 +64,7 @@ toml = "1"
 etcetera = "0.10"
 
 crossbeam-channel = "0.5"
+crossterm = "0.28"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"

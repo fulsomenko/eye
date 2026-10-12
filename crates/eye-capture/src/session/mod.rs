@@ -10,7 +10,9 @@ use eye_core::{CameraId, CameraInfo, Illumination, Timestamp};
 
 use crate::format::StoredFormat;
 
-pub use eye_core::session::{ProtocolConfig, TargetClock, TargetRecord};
+pub use eye_core::session::{
+    DiscardReason, DiscardRecord, ProtocolConfig, TargetClock, TargetRecord,
+};
 pub use id::SessionId;
 pub use reader::Recording;
 pub use replay::{Pacing, PacingOption, ReplayOptions, ReplaySource};
@@ -20,6 +22,7 @@ pub const FORMAT_VERSION: u32 = 1;
 pub const SESSION_FILE: &str = "session.toml";
 pub const INDEX_FILE: &str = "index.jsonl";
 pub const TARGETS_FILE: &str = "targets.jsonl";
+pub const DISCARDS_FILE: &str = "discards.jsonl";
 pub const FRAMES_DIR: &str = "frames";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -12,7 +12,7 @@ use eye::registry::Registry;
 use eye_calibration::protocol::ProtocolConfig;
 use eye_calibration::store::rig_to_table;
 use eye_capture::session::{FORMAT_VERSION, RecordedCamera, SessionId, SessionMeta, SessionWriter};
-use eye_core::session::{TargetClock, TargetRecord};
+use eye_core::session::{DiscardReason, DiscardRecord, TargetClock, TargetRecord};
 use eye_core::stage::{Detector, GazeEstimator, StageError};
 use eye_core::{
     CameraId, CameraInfo, CameraModel, FaceObservation, Frame, FrameHeader, FrameSet, GazeRay,
@@ -59,6 +59,8 @@ pub struct SyntheticSession {
     pub cameras: Vec<&'static str>,
     pub with_rig: bool,
     pub protocol: Option<ProtocolConfig>,
+    /// `(seq, reason)` pairs written to `discards.jsonl`.
+    pub discards: Vec<(u64, DiscardReason)>,
 }
 
 impl Default for SyntheticSession {
@@ -70,6 +72,7 @@ impl Default for SyntheticSession {
             cameras: vec!["ir"],
             with_rig: true,
             protocol: None,
+            discards: Vec::new(),
         }
     }
 }
@@ -201,8 +204,15 @@ pub fn write_synthetic_session(
             output: OutputId::from("eDP-1"),
             px_logical: [x, y],
             mm: [mm.x, mm.y],
+            discarded: false,
         };
         writer.write_target(&target).map_err(capture)?;
+    }
+
+    for &(seq, reason) in &spec.discards {
+        writer
+            .write_discard(&DiscardRecord { seq, reason })
+            .map_err(capture)?;
     }
 
     writer.finish().map_err(capture)

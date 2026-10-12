@@ -26,6 +26,27 @@ pub struct TargetRecord {
     pub output: OutputId,
     pub px_logical: [f64; 2],
     pub mm: [f64; 2],
+    /// Set by merging the session's `discards.jsonl` on load; never written into `targets.jsonl`
+    /// itself, so an old recording (no `discards.jsonl`) parses with this `false`.
+    #[serde(default, skip_serializing)]
+    pub discarded: bool,
+}
+
+/// Why a presentation was discarded. `Retake` and `Skip` are the operator's own call during a
+/// live session (`r`/`s`); `eye-calibration` may add further reasons (e.g. a warmup presentation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscardReason {
+    Retake,
+    Skip,
+}
+
+/// One line of a recording's append-only `discards.jsonl`: marks `seq`'s `TargetRecord` as
+/// discarded. Append-only so a crash mid-write cannot corrupt `targets.jsonl` itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscardRecord {
+    pub seq: u64,
+    pub reason: DiscardReason,
 }
 
 #[cfg(test)]
@@ -42,6 +63,7 @@ mod tests {
             output: OutputId::from("eDP-1"),
             px_logical: [960.0, 540.0],
             mm: [155.0, 85.0],
+            discarded: false,
         }
     }
 
@@ -73,6 +95,33 @@ mod tests {
         let json = r#"{"seq":1,"shown_ns":-5,"hidden_ns":null,"clock":"presentation","output":"eDP-1","px_logical":[960.0,540.0],"mm":[155.0,85.0]}"#;
         let parsed: Result<TargetRecord, _> = serde_json::from_str(json);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_target_record_without_discarded_parses_false() {
+        let json = r#"{"seq":1,"shown_ns":5,"hidden_ns":null,"clock":"presentation","output":"eDP-1","px_logical":[960.0,540.0],"mm":[155.0,85.0]}"#;
+        let parsed: TargetRecord = serde_json::from_str(json).unwrap();
+        assert!(!parsed.discarded);
+        assert_eq!(parsed, record());
+    }
+
+    #[test]
+    fn test_discard_record_jsonl_shape() {
+        let record = DiscardRecord {
+            seq: 3,
+            reason: DiscardReason::Retake,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert_eq!(json, r#"{"seq":3,"reason":"retake"}"#);
+        let parsed: DiscardRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, record);
+
+        let json = serde_json::to_string(&DiscardRecord {
+            seq: 4,
+            reason: DiscardReason::Skip,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"seq":4,"reason":"skip"}"#);
     }
 
     #[test]
@@ -189,6 +238,7 @@ mod protocol_config_from_target_records_tests {
             output: OutputId::from("eDP-1"),
             px_logical: [0.0, 0.0],
             mm,
+            discarded: false,
         }
     }
 

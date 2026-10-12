@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use eye_capture::session::{
     EmitterState, FORMAT_VERSION, RecordedCamera, SessionId, SessionMeta, SessionWriter,
 };
 use eye_core::log::{field, span};
-use eye_core::session::TargetRecord;
+use eye_core::session::{DiscardReason, DiscardRecord, TargetRecord, TargetTiming};
 use eye_core::{CameraInfo, Frame, Rig, ScreenModel, Timestamp};
 use eye_geometry::screen::px_logical_to_mm;
 use eye_overlay::targets::{
@@ -25,6 +25,7 @@ use crate::cli::GIT_REV;
 use crate::commands::emitter::emitter_guards;
 use crate::commands::probe::{ProbeReport, Probes, collect};
 use crate::ctx::Ctx;
+use crate::keys::{KeyWatcher, ReviewKey};
 use crate::rig;
 use crate::shutdown;
 
@@ -132,6 +133,9 @@ pub struct RecordSummary {
 pub trait RecordSink {
     fn frame(&mut self, frame: &Frame) -> anyhow::Result<()>;
     fn target(&mut self, record: &TargetRecord) -> anyhow::Result<()>;
+    fn discard(&mut self, _record: DiscardRecord) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -171,6 +175,11 @@ impl RecordSink for SessionSink {
         self.targets += 1;
         Ok(())
     }
+
+    fn discard(&mut self, record: DiscardRecord) -> anyhow::Result<()> {
+        self.writer.write_discard(&record)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -207,6 +216,10 @@ pub trait PumpObserver {
     fn on_shown(&mut self, _shown: &TargetShown) {}
 
     fn on_hidden(&mut self, _index: usize, _at: Timestamp) {}
+
+    /// Called when a manual `r`/`s` key discards the presentation at `index`: an observer
+    /// tracking its own windows for that index (e.g. a live fit) must drop it too.
+    fn on_discard(&mut self, _index: usize) {}
 }
 
 #[derive(Debug, Default)]
@@ -227,6 +240,77 @@ fn wire_observer(
     settle
 }
 
+/// What `pump` needs to act on a manual `r`/`s` key: where to read them from, and (for `r`) the
+/// sender and timing to re-present the discarded target with.
+#[derive(Debug, Clone)]
+pub struct ReviewSupport {
+    pub keys: Receiver<ReviewKey>,
+    pub retake: Option<AppendSender>,
+    pub timing: TargetTiming,
+}
+
+/// Manual retakes (`r`) have their own cap, independent of the automatic online-rejection
+/// retries in `LiveFeedback::handle_verdict`.
+const MAX_MANUAL_RETAKES: u8 = 3;
+
+fn px_key(p: nalgebra::Point2<f64>) -> (u64, u64) {
+    (p.x.to_bits(), p.y.to_bits())
+}
+
+/// Marks the most recently shown target (the current one if still showing, else the last one
+/// hidden) discarded, and for `Retake`, re-presents it (bypassing the automatic retry cap)
+/// unless this position has already been manually retaken `MAX_MANUAL_RETAKES` times.
+#[allow(clippy::too_many_arguments)]
+fn handle_review_key(
+    key: ReviewKey,
+    pending: &Option<TargetShown>,
+    last_hidden: &Option<TargetShown>,
+    review: Option<&ReviewSupport>,
+    manual_retakes: &mut HashMap<(u64, u64), u8>,
+    sink: &mut dyn RecordSink,
+    observer: &mut dyn PumpObserver,
+) -> anyhow::Result<()> {
+    let Some(target) = pending.clone().or_else(|| last_hidden.clone()) else {
+        return Ok(());
+    };
+    let reason = match key {
+        ReviewKey::Retake => DiscardReason::Retake,
+        ReviewKey::Skip => DiscardReason::Skip,
+    };
+    sink.discard(DiscardRecord {
+        seq: target.index as u64,
+        reason,
+    })?;
+    observer.on_discard(target.index);
+    if key != ReviewKey::Retake {
+        return Ok(());
+    }
+    let Some(review) = review else {
+        tracing::warn!(
+            index = target.index,
+            "no overlay to retake into; treated as a skip"
+        );
+        return Ok(());
+    };
+    let count = manual_retakes.entry(px_key(target.px_logical)).or_insert(0);
+    if *count >= MAX_MANUAL_RETAKES {
+        tracing::warn!(
+            index = target.index,
+            "manual retake cap reached; not re-presenting"
+        );
+        return Ok(());
+    }
+    *count += 1;
+    if let Some(append) = &review.retake {
+        let _ = append.append(TargetSpec {
+            px_logical: target.px_logical,
+            timing: review.timing,
+            retry: true,
+        });
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn pump(
     frames: &Receiver<CaptureMsg>,
@@ -234,11 +318,18 @@ pub fn pump(
     settle: Option<&AppendSender>,
     deadline: &Receiver<Instant>,
     shutdown: &Receiver<()>,
+    review: Option<ReviewSupport>,
     to_record: &dyn Fn(&TargetShown, Option<Timestamp>) -> TargetRecord,
     sink: &mut dyn RecordSink,
     observer: &mut dyn PumpObserver,
 ) -> anyhow::Result<PumpEnd> {
     let mut pending: Option<TargetShown> = None;
+    let mut last_hidden: Option<TargetShown> = None;
+    let mut manual_retakes: HashMap<(u64, u64), u8> = HashMap::new();
+    let mut keys_rx: Receiver<ReviewKey> = review
+        .as_ref()
+        .map(|r| r.keys.clone())
+        .unwrap_or_else(crossbeam_channel::never);
     let end = loop {
         crossbeam_channel::select! {
             recv(frames) -> msg => match msg {
@@ -264,6 +355,7 @@ pub fn pump(
                     if pending.as_ref().is_some_and(|s| s.index == index)
                         && let Some(shown) = pending.take()
                     {
+                        last_hidden = Some(shown.clone());
                         sink.target(&to_record(&shown, Some(at)))?;
                     }
                 }
@@ -272,6 +364,18 @@ pub fn pump(
             },
             recv(deadline) -> _ => break PumpEnd::Deadline,
             recv(shutdown) -> _ => break PumpEnd::Interrupted,
+            recv(keys_rx) -> key => match key {
+                Ok(key) => handle_review_key(
+                    key,
+                    &pending,
+                    &last_hidden,
+                    review.as_ref(),
+                    &mut manual_retakes,
+                    sink,
+                    observer,
+                )?,
+                Err(_) => keys_rx = crossbeam_channel::never(),
+            },
         }
     };
     if let Some(shown) = pending.take() {
@@ -294,6 +398,7 @@ pub fn target_record(
         output: shown.output.clone(),
         px_logical: [shown.px_logical.x, shown.px_logical.y],
         mm: [mm.x, mm.y],
+        discarded: false,
     }
 }
 
@@ -343,12 +448,24 @@ fn record_targets(
     let finish = observer.finish_policy();
     let (display, feedback) = TargetDisplay::spawn(&output, protocol.lead_in(), specs, finish)?;
     let settle = wire_observer(observer, finish, feedback, display.appender());
+    let watcher = KeyWatcher::spawn();
+    if watcher.is_active() {
+        use std::io::Write;
+        print!("r = retake last dot, s = skip last dot\r\n");
+        let _ = std::io::stdout().flush();
+    }
+    let review = Some(ReviewSupport {
+        keys: watcher.receiver(),
+        retake: Some(display.appender()),
+        timing: protocol.timing(),
+    });
     let end = pump(
         capture.frames(),
         display.events(),
         settle.as_ref(),
         &crossbeam_channel::never(),
         shutdown,
+        review,
         to_record,
         sink,
         observer,
@@ -430,6 +547,7 @@ pub fn record_session(
                 None,
                 &deadline,
                 shutdown,
+                None,
                 &to_record,
                 &mut sink,
                 observer,
@@ -516,6 +634,7 @@ mod tests {
     struct FakeSink {
         frames: Vec<(String, u64)>,
         targets: Vec<TargetRecord>,
+        discards: Vec<DiscardRecord>,
     }
 
     impl FakeSink {
@@ -523,6 +642,7 @@ mod tests {
             Self {
                 frames: Vec::new(),
                 targets: Vec::new(),
+                discards: Vec::new(),
             }
         }
     }
@@ -536,6 +656,11 @@ mod tests {
 
         fn target(&mut self, record: &TargetRecord) -> anyhow::Result<()> {
             self.targets.push(record.clone());
+            Ok(())
+        }
+
+        fn discard(&mut self, record: DiscardRecord) -> anyhow::Result<()> {
+            self.discards.push(record);
             Ok(())
         }
     }
@@ -696,6 +821,7 @@ mod tests {
             None,
             &crossbeam_channel::never(),
             &crossbeam_channel::never(),
+            None,
             &to_record,
             &mut sink,
             &mut NoopObserver,
@@ -733,6 +859,7 @@ mod tests {
             None,
             &deadline,
             &crossbeam_channel::never(),
+            None,
             &to_record,
             &mut sink,
             &mut NoopObserver,
@@ -759,6 +886,7 @@ mod tests {
             None,
             &crossbeam_channel::never(),
             &shutdown_rx,
+            None,
             &to_record,
             &mut sink,
             &mut NoopObserver,
@@ -782,6 +910,7 @@ mod tests {
             None,
             &crossbeam_channel::never(),
             &crossbeam_channel::never(),
+            None,
             &to_record,
             &mut sink,
             &mut NoopObserver,
@@ -807,6 +936,7 @@ mod tests {
             None,
             &deadline,
             &crossbeam_channel::never(),
+            None,
             &to_record,
             &mut sink,
             &mut NoopObserver,
@@ -838,6 +968,7 @@ mod tests {
             None,
             &crossbeam_channel::never(),
             &crossbeam_channel::never(),
+            None,
             &to_record,
             &mut sink,
             &mut NoopObserver,
@@ -879,6 +1010,7 @@ mod tests {
             None,
             &crossbeam_channel::never(),
             &crossbeam_channel::never(),
+            None,
             &to_record,
             &mut sink,
             &mut observer,
@@ -907,6 +1039,7 @@ mod tests {
             None,
             &crossbeam_channel::never(),
             &crossbeam_channel::never(),
+            None,
             &to_record,
             &mut sink,
             &mut NoopObserver,
@@ -948,6 +1081,7 @@ mod tests {
             Some(&settle),
             &crossbeam_channel::never(),
             &crossbeam_channel::never(),
+            None,
             &to_record,
             &mut sink,
             &mut NoopObserver,
@@ -983,6 +1117,7 @@ mod tests {
             None,
             &crossbeam_channel::never(),
             &crossbeam_channel::never(),
+            None,
             &to_record,
             &mut sink,
             &mut NoopObserver,
@@ -1040,6 +1175,7 @@ mod tests {
             Some(&settle),
             &crossbeam_channel::never(),
             &crossbeam_channel::never(),
+            None,
             &to_record,
             &mut sink,
             &mut observer,
@@ -1051,6 +1187,146 @@ mod tests {
         assert_eq!(acks.len(), 2);
         assert!(matches!(acks[0], AppendMsg::Append(_)));
         assert_eq!(acks[1], AppendMsg::Settled);
+    }
+
+    fn review_support(retake: AppendSender) -> ReviewSupport {
+        ReviewSupport {
+            keys: crossbeam_channel::never(),
+            retake: Some(retake),
+            timing: eye_core::session::TargetTiming {
+                settle: Duration::from_millis(100),
+                window: Duration::from_millis(150),
+                dwell: Duration::from_millis(250),
+            },
+        }
+    }
+
+    #[test]
+    fn test_retake_key_discards_and_reappends_last_target() {
+        let target = shown(2, 100);
+        let (append_tx, append_rx) = crossbeam_channel::unbounded();
+        let review = review_support(AppendSender::new(append_tx));
+        let mut manual_retakes = HashMap::new();
+        let mut sink = FakeSink::new();
+        let mut observer = NoopObserver;
+
+        handle_review_key(
+            ReviewKey::Retake,
+            &Some(target.clone()),
+            &None,
+            Some(&review),
+            &mut manual_retakes,
+            &mut sink,
+            &mut observer,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sink.discards,
+            vec![DiscardRecord {
+                seq: 2,
+                reason: DiscardReason::Retake,
+            }]
+        );
+        let appended: Vec<_> = append_rx.try_iter().collect();
+        assert_eq!(appended.len(), 1);
+        match &appended[0] {
+            AppendMsg::Append(spec) => {
+                assert_eq!(spec.px_logical, target.px_logical);
+                assert!(spec.retry);
+            }
+            other => panic!("expected Append, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_skip_key_discards_without_reappending() {
+        let target = shown(1, 50);
+        let (append_tx, append_rx) = crossbeam_channel::unbounded();
+        let review = review_support(AppendSender::new(append_tx));
+        let mut manual_retakes = HashMap::new();
+        let mut sink = FakeSink::new();
+        let mut observer = NoopObserver;
+
+        handle_review_key(
+            ReviewKey::Skip,
+            &None,
+            &Some(target),
+            Some(&review),
+            &mut manual_retakes,
+            &mut sink,
+            &mut observer,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sink.discards,
+            vec![DiscardRecord {
+                seq: 1,
+                reason: DiscardReason::Skip,
+            }]
+        );
+        assert_eq!(append_rx.try_iter().count(), 0);
+    }
+
+    #[test]
+    fn test_retake_key_respects_manual_retake_cap() {
+        let target = shown(0, 10);
+        let (append_tx, append_rx) = crossbeam_channel::unbounded();
+        let review = review_support(AppendSender::new(append_tx));
+        let mut manual_retakes = HashMap::new();
+        let mut sink = FakeSink::new();
+        let mut observer = NoopObserver;
+
+        for _ in 0..MAX_MANUAL_RETAKES {
+            handle_review_key(
+                ReviewKey::Retake,
+                &Some(target.clone()),
+                &None,
+                Some(&review),
+                &mut manual_retakes,
+                &mut sink,
+                &mut observer,
+            )
+            .unwrap();
+        }
+        assert_eq!(append_rx.try_iter().count() as u8, MAX_MANUAL_RETAKES);
+
+        handle_review_key(
+            ReviewKey::Retake,
+            &Some(target),
+            &None,
+            Some(&review),
+            &mut manual_retakes,
+            &mut sink,
+            &mut observer,
+        )
+        .unwrap();
+        assert_eq!(
+            append_rx.try_iter().count(),
+            0,
+            "cap reached; no further append"
+        );
+    }
+
+    #[test]
+    fn test_review_key_without_a_shown_or_hidden_target_is_a_no_op() {
+        let mut manual_retakes = HashMap::new();
+        let mut sink = FakeSink::new();
+        let mut observer = NoopObserver;
+
+        handle_review_key(
+            ReviewKey::Retake,
+            &None,
+            &None,
+            None,
+            &mut manual_retakes,
+            &mut sink,
+            &mut observer,
+        )
+        .unwrap();
+
+        assert!(sink.discards.is_empty());
     }
 
     #[derive(Default)]

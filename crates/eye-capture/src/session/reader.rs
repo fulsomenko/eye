@@ -9,8 +9,8 @@ use std::{
 use eye_core::{CameraId, Frame, FrameHeader, Timestamp, log::field};
 
 use super::{
-    FORMAT_VERSION, INDEX_FILE, IndexRecord, RecordedCamera, SESSION_FILE, SessionMeta,
-    TARGETS_FILE, TargetRecord, frame_path,
+    DISCARDS_FILE, DiscardRecord, FORMAT_VERSION, INDEX_FILE, IndexRecord, RecordedCamera,
+    SESSION_FILE, SessionMeta, TARGETS_FILE, TargetRecord, frame_path,
     pnm::decode_pgm,
     replay::{Pacing, ReplaySource},
 };
@@ -147,8 +147,21 @@ impl Recording {
         }
 
         let targets_path = dir.join(TARGETS_FILE);
-        let targets: Vec<TargetRecord> =
+        let mut targets: Vec<TargetRecord> =
             parse_jsonl(&targets_path, &read_to_string(&targets_path)?)?;
+
+        let discards_path = dir.join(DISCARDS_FILE);
+        if discards_path.is_file() {
+            let discards: Vec<DiscardRecord> =
+                parse_jsonl(&discards_path, &read_to_string(&discards_path)?)?;
+            let discarded_seqs: std::collections::HashSet<u64> =
+                discards.iter().map(|d| d.seq).collect();
+            for target in &mut targets {
+                if discarded_seqs.contains(&target.seq) {
+                    target.discarded = true;
+                }
+            }
+        }
 
         let out = Self {
             dir,
@@ -303,6 +316,7 @@ mod tests {
             output: OutputId::from("eDP-1"),
             px_logical: [960.0, 540.0],
             mm: [155.0, 85.0],
+            discarded: false,
         }
     }
 
@@ -395,6 +409,32 @@ mod tests {
             serde_json::to_string(&recording.targets()[1]).unwrap(),
             serde_json::to_string(&target(1, 3_000_000_000)).unwrap()
         );
+    }
+
+    #[test]
+    fn test_open_merges_discards_into_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, _) = write_session(root.path(), 3);
+
+        fs::write(
+            dir.join("discards.jsonl"),
+            "{\"seq\":0,\"reason\":\"retake\"}\n",
+        )
+        .unwrap();
+
+        let recording = Recording::open(&dir).unwrap();
+        assert!(recording.targets()[0].discarded);
+        assert!(!recording.targets()[1].discarded);
+    }
+
+    #[test]
+    fn test_open_without_discards_file_leaves_targets_unmarked() {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, _) = write_session(root.path(), 3);
+        assert!(!dir.join("discards.jsonl").exists());
+
+        let recording = Recording::open(&dir).unwrap();
+        assert!(recording.targets().iter().all(|t| !t.discarded));
     }
 
     #[test]

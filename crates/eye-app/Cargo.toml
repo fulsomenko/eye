@@ -24,6 +24,7 @@ doc = false
 anyhow.workspace = true
 clap.workspace = true
 crossbeam-channel.workspace = true
+crossterm.workspace = true
 eye.workspace = true
 eye-bench.workspace = true
 eye-calibration.workspace = true

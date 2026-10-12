@@ -32,6 +32,10 @@ pub struct FixationWindow {
     pub end: Timestamp,
     pub target_mm: Point2<f64>,
     pub target_px_logical: Point2<f64>,
+    /// Mirrors the source `TargetRecord.discarded` (offline) or a live `r`/`s` key (live
+    /// preview). `latest_presentation` must drop this window even when it is the newest, rather
+    /// than falling back to an earlier, already-superseded one.
+    pub discarded: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -225,7 +229,7 @@ impl TargetProtocol {
             let start = Timestamp(onset.0 + settle);
             let end = Timestamp(start.0 + window);
             tracing::trace!(
-                index = k as u64,
+                index = r.seq,
                 cell_col = u64::from(cell.0),
                 cell_row = u64::from(cell.1),
                 onset_ns = onset.as_nanos(),
@@ -233,16 +237,18 @@ impl TargetProtocol {
                 end_ns = end.as_nanos(),
                 target_x_mm = mm.x,
                 target_y_mm = mm.y,
+                discarded = r.discarded,
                 "fixation window"
             );
             out.push(FixationWindow {
-                index: k as u32,
+                index: r.seq as u32,
                 cell,
                 onset,
                 start,
                 end,
                 target_mm: mm,
                 target_px_logical: Point2::from(r.px_logical),
+                discarded: r.discarded,
             });
         }
         tracing::info!(
@@ -292,6 +298,7 @@ mod tests {
             output: OutputId::from("eDP-1"),
             px_logical: [0.0, 0.0],
             mm,
+            discarded: false,
         }
     }
 
@@ -535,6 +542,18 @@ mod tests {
     }
 
     #[test]
+    fn test_fixation_windows_marks_discarded_records() {
+        let proto = TargetProtocol::new(ProtocolConfig::default()).unwrap();
+        let screen = screen();
+        let mut records = vec![rec(0, 10.0, [155.0, 87.1875]), rec(1, 11.5, [51.0, 29.0])];
+        records[0].discarded = true;
+        let windows = proto.fixation_windows(&records, &screen).unwrap();
+        assert_eq!(windows.len(), 2);
+        assert!(windows[0].discarded);
+        assert!(!windows[1].discarded);
+    }
+
+    #[test]
     fn test_logs_fixation_windows_at_info() {
         let proto = TargetProtocol::new(ProtocolConfig::default()).unwrap();
         let screen = screen();
@@ -666,6 +685,7 @@ mod tests {
             end: Timestamp::from_nanos(11_400_000_000),
             target_mm: Point2::new(0.0, 0.0),
             target_px_logical: Point2::new(0.0, 0.0),
+            discarded: false,
         };
         let items: Vec<Timestamp> = [10.59_f64, 10.60, 11.39, 11.40]
             .iter()

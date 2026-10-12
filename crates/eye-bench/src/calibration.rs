@@ -18,7 +18,10 @@ pub fn position_key(window: &FixationWindow) -> (u64, u64) {
     (window.target_mm.x.to_bits(), window.target_mm.y.to_bits())
 }
 
-/// A `fit_samples` include predicate for a recording that may carry online retries: a live
+/// A `fit_samples` include predicate for a recording that may carry online retries or manual
+/// `r`/`s` discards. A discarded window is always dropped, even when it is the latest (or only)
+/// presentation of its position: there is no earlier, non-discarded presentation to fall back to,
+/// since any earlier one at that position was itself already superseded. Otherwise: a live
 /// retry is appended after the base protocol's full sequence, so its window's `index` is
 /// `>= base_len`. For a position with such a window, only the LATEST one (replacing the
 /// rejected presentation and any earlier retries) is kept; a position never retried (including
@@ -29,6 +32,9 @@ pub fn latest_presentation(
     base_len: u32,
 ) -> impl Fn(&FixationWindow) -> bool + '_ {
     move |w| {
+        if w.discarded {
+            return false;
+        }
         let key = position_key(w);
         let latest_retry = windows
             .iter()
@@ -143,13 +149,24 @@ pub fn cross(
     }
 
     let profile = fitter(&train, &held_out.run.rig)?;
-    let windows = held_out.run.windows.clone();
+    let windows: Vec<FixationWindow> = held_out
+        .run
+        .windows
+        .iter()
+        .filter(|w| !w.discarded)
+        .cloned()
+        .collect();
     Ok(evaluate_with(held_out, &profile, &windows))
 }
 
 /// Err when there is no window or every fold failed. Leaves the pipeline uncorrected.
+///
+/// Excludes only `discarded` windows, not retries: unlike `cross` and the live path, this
+/// default has no caller-supplied `base_len` to tell a retry apart from a position the base
+/// protocol itself legitimately repeats, so it leaves retry-superseding to callers that pass
+/// their own `latest_presentation` through `loto_with`.
 pub fn loto(replayed: &mut Replayed, fitter: Fitter<'_>) -> Result<LotoOutcome, String> {
-    loto_with(replayed, fitter, &|_| true)
+    loto_with(replayed, fitter, &|w| !w.discarded)
 }
 
 /// LOTO over the windows that `include` admits: folds, training sets and held-out sets all use
@@ -290,6 +307,48 @@ mod tests {
         Point3::new(155.0, 85.0, -500.0)
     }
 
+    fn window(index: u32, target_mm: Point2<f64>, discarded: bool) -> FixationWindow {
+        FixationWindow {
+            index,
+            cell: (0, 0),
+            onset: eye_core::Timestamp::from_nanos(0),
+            start: eye_core::Timestamp::from_nanos(0),
+            end: eye_core::Timestamp::from_nanos(1_000_000_000),
+            target_mm,
+            target_px_logical: Point2::new(0.0, 0.0),
+            discarded,
+        }
+    }
+
+    #[test]
+    fn test_discarded_presentation_excluded_from_fit_samples() {
+        let pos_a = Point2::new(10.0, 10.0);
+        let pos_b = Point2::new(20.0, 20.0);
+        let base_len = 2;
+
+        // A manually skipped presentation that was never retried: the only window at its
+        // position, discarded, must drop out even though nothing else covers that position.
+        let only_discarded = vec![window(0, pos_a, true), window(1, pos_b, false)];
+        let include = latest_presentation(&only_discarded, base_len);
+        assert!(!include(&only_discarded[0]));
+        assert!(include(&only_discarded[1]));
+
+        // A retry (index >= base_len) that itself gets discarded: the original it superseded
+        // must stay excluded too, not fall back into the fit.
+        let retried_then_discarded = vec![
+            window(0, pos_a, false),
+            window(2, pos_a, true),
+            window(1, pos_b, false),
+        ];
+        let include = latest_presentation(&retried_then_discarded, base_len);
+        assert!(
+            !include(&retried_then_discarded[0]),
+            "the superseded original"
+        );
+        assert!(!include(&retried_then_discarded[1]), "the discarded retry");
+        assert!(include(&retried_then_discarded[2]));
+    }
+
     #[test]
     fn test_fit_samples_excludes_held_out_target() {
         let dir = tempfile::tempdir().unwrap();
@@ -367,6 +426,7 @@ mod tests {
             end: eye_core::Timestamp::from_nanos(1_000_000_000),
             target_mm: Point2::new(155.0, 85.0),
             target_px_logical: Point2::new(960.0, 540.0),
+            discarded: false,
         };
         let ray = eye_core::GazeRay {
             side: None,
@@ -396,6 +456,7 @@ mod tests {
             end: eye_core::Timestamp::from_nanos(1_000_000_000),
             target_mm: Point2::new(155.0, 85.0),
             target_px_logical: Point2::new(960.0, 540.0),
+            discarded: false,
         };
         let ray = eye_core::GazeRay {
             side: None,
@@ -438,6 +499,7 @@ mod tests {
             end: eye_core::Timestamp::from_nanos(800_000_000),
             target_mm: Point2::new(10.0, 10.0),
             target_px_logical: Point2::new(0.0, 0.0),
+            discarded: false,
         };
         let window_b = FixationWindow {
             index: 1,
@@ -447,6 +509,7 @@ mod tests {
             end: eye_core::Timestamp::from_nanos(2_300_000_000),
             target_mm: Point2::new(200.0, 10.0),
             target_px_logical: Point2::new(100.0, 0.0),
+            discarded: false,
         };
         let ray = |nanos: u64| eye_core::GazeRay {
             side: None,
@@ -567,6 +630,51 @@ mod tests {
         assert!(
             metrics.angular_error_deg.unwrap().mean < 0.1,
             "pooled mean should drop once the 10 deg presentation is excluded"
+        );
+    }
+
+    #[test]
+    fn test_loto_default_excludes_manually_discarded_presentation() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSession {
+            targets: FOUR_BY_FOUR_CENTRES.to_vec(),
+            code_frames: true,
+            discards: vec![(5, eye_core::session::DiscardReason::Skip)],
+            ..Default::default()
+        };
+        let session_dir = write_synthetic_session(dir.path(), "s1", &spec).unwrap();
+        let config = kappa_ray_config(&FOUR_BY_FOUR_CENTRES, [3.0, -1.0], None);
+        let mut replayed = replay_session(
+            &session_dir,
+            &config,
+            &fake_registry(),
+            &ProtocolConfig::default(),
+        )
+        .unwrap();
+        assert!(replayed.run.windows[5].discarded);
+        let discarded_key = position_key(&replayed.run.windows[5]);
+
+        let (result, calls) = spy_loto(&mut replayed);
+        let outcome = result.unwrap();
+
+        assert_eq!(
+            calls.len(),
+            15,
+            "the discarded presentation's position must get no fold at all"
+        );
+        for keys in &calls {
+            assert!(
+                !keys.contains(&discarded_key),
+                "no fold may train on the discarded presentation"
+            );
+        }
+        assert!(
+            outcome
+                .input
+                .windows
+                .iter()
+                .all(|w| (w.target_mm.x.to_bits(), w.target_mm.y.to_bits()) != discarded_key),
+            "the discarded presentation must never be scored"
         );
     }
 

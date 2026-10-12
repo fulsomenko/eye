@@ -438,6 +438,7 @@ impl PumpObserver for LiveFeedback {
             end,
             target_mm,
             target_px_logical: shown.px_logical,
+            discarded: false,
         });
     }
 
@@ -448,6 +449,12 @@ impl PumpObserver for LiveFeedback {
             .map(|w| (w.target_mm, w.target_px_logical));
         self.completed += 1;
         self.refit(index, last_target);
+    }
+
+    fn on_discard(&mut self, index: usize) {
+        if let Some(w) = self.windows.iter_mut().find(|w| w.index == index as u32) {
+            w.discarded = true;
+        }
     }
 }
 
@@ -1337,6 +1344,7 @@ mod tests {
             Some(&settle),
             &crossbeam_channel::never(),
             &crossbeam_channel::never(),
+            None,
             &to_record,
             sink,
             live,

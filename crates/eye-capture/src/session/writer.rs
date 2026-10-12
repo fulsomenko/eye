@@ -9,8 +9,9 @@ use std::{
 use eye_core::{CameraId, Frame, log::field};
 
 use super::{
-    FRAMES_DIR, INDEX_FILE, IndexRecord, RecordedCamera, SESSION_FILE, SessionMeta, TARGETS_FILE,
-    TargetRecord, frame_path, id::valid_component, timestamp_ns,
+    DISCARDS_FILE, DiscardRecord, FRAMES_DIR, INDEX_FILE, IndexRecord, RecordedCamera,
+    SESSION_FILE, SessionMeta, TARGETS_FILE, TargetRecord, frame_path, id::valid_component,
+    timestamp_ns,
 };
 use crate::{CaptureError, format::StoredFormat};
 
@@ -20,6 +21,7 @@ pub struct SessionWriter {
     cameras: HashMap<CameraId, RecordedCamera>,
     index: BufWriter<File>,
     targets: BufWriter<File>,
+    discards: Option<BufWriter<File>>,
     frame_count: u64,
     target_count: u64,
 }
@@ -94,6 +96,7 @@ impl SessionWriter {
             cameras,
             index,
             targets,
+            discards: None,
             frame_count: 0,
             target_count: 0,
         })
@@ -176,6 +179,35 @@ impl SessionWriter {
         Ok(())
     }
 
+    /// Opens `discards.jsonl` only when the first discard arrives, so a session with no manual
+    /// retake/skip never creates the file.
+    pub fn write_discard(&mut self, record: &DiscardRecord) -> Result<(), CaptureError> {
+        if self.discards.is_none() {
+            let path = self.dir.join(DISCARDS_FILE);
+            self.discards = Some(BufWriter::new(
+                OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&path)
+                    .map_err(io_err(&path))?,
+            ));
+        }
+        let dir = self.dir.clone();
+        let discards = self.discards.as_mut().expect("just set above");
+        serde_json::to_writer(&mut *discards, record).map_err(|e| {
+            CaptureError::RecordingFormat {
+                path: dir.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+        discards
+            .write_all(b"\n")
+            .map_err(io_err(&dir.join(DISCARDS_FILE)))?;
+        discards.flush().map_err(io_err(&dir.join(DISCARDS_FILE)))?;
+        tracing::info!(seq = record.seq, reason = ?record.reason, "target discarded");
+        Ok(())
+    }
+
     pub fn finish(mut self) -> Result<PathBuf, CaptureError> {
         self.index
             .flush()
@@ -191,6 +223,15 @@ impl SessionWriter {
             .get_ref()
             .sync_all()
             .map_err(io_err(&self.dir.join(TARGETS_FILE)))?;
+        if let Some(mut discards) = self.discards.take() {
+            discards
+                .flush()
+                .map_err(io_err(&self.dir.join(DISCARDS_FILE)))?;
+            discards
+                .get_ref()
+                .sync_all()
+                .map_err(io_err(&self.dir.join(DISCARDS_FILE)))?;
+        }
         tracing::info!(
             dir = %self.dir.display(),
             frames = self.frame_count,
@@ -258,6 +299,7 @@ mod tests {
             output: eye_core::OutputId::from("eDP-1"),
             px_logical: px,
             mm,
+            discarded: false,
         }
     }
 
@@ -311,6 +353,45 @@ mod tests {
             lines[1],
             r#"{"seq":3,"camera":"rgb","timestamp_ns":2000,"illumination":"ambient"}"#
         );
+    }
+
+    #[test]
+    fn test_write_discard_creates_file_only_on_first_call() {
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = SessionWriter::create(root.path(), &meta()).unwrap();
+        assert!(!writer.dir.join(DISCARDS_FILE).exists());
+
+        writer
+            .write_discard(&DiscardRecord {
+                seq: 2,
+                reason: eye_core::session::DiscardReason::Skip,
+            })
+            .unwrap();
+        writer
+            .write_discard(&DiscardRecord {
+                seq: 5,
+                reason: eye_core::session::DiscardReason::Retake,
+            })
+            .unwrap();
+
+        let dir = writer.finish().unwrap();
+        let text = fs::read_to_string(dir.join(DISCARDS_FILE)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                r#"{"seq":2,"reason":"skip"}"#,
+                r#"{"seq":5,"reason":"retake"}"#
+            ]
+        );
+    }
+
+    #[test]
+    fn test_no_discards_leaves_no_discards_file() {
+        let root = tempfile::tempdir().unwrap();
+        let writer = SessionWriter::create(root.path(), &meta()).unwrap();
+        let dir = writer.finish().unwrap();
+        assert!(!dir.join(DISCARDS_FILE).exists());
     }
 
     #[test]
